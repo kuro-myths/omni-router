@@ -3,8 +3,6 @@ name: Import and sync upstream OmniRoute
 on:
   push:
     branches: [main]
-    paths:
-      - .github/workflows/import-omniroute.yml
   workflow_dispatch:
 
 permissions:
