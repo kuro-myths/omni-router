@@ -34,6 +34,9 @@ jobs:
             --exclude='docs/i18n/id/README.md' \
             --exclude='package.json' \
             --exclude='scripts/build-next-isolated.mjs' \
+            --exclude='src/app/layout.tsx' \
+            --exclude='src/shared/components/layouts/DashboardLayout.tsx' \
+            --exclude='src/i18n/messages/id.json' \
             /tmp/omniroute-upstream/ ./
 
       - name: Remove credential-like values from upstream fixtures
