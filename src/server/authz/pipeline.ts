@@ -1,5 +1,4 @@
 import { NextResponse, type NextRequest } from "next/server";
-import { getCachedBodySizeSettings } from "../../lib/db/readCache";
 import { isDraining } from "../../lib/gracefulShutdown";
 import { checkBodySize, getBodySizeLimit } from "../../shared/middleware/bodySizeGuard";
 import {
@@ -25,9 +24,7 @@ import { validateDashboardCsrfToken } from "./csrf";
 import {
   classifyStampedPeerLocality,
   resolveStampedPeer,
-  resolveStampedViaProxy,
 } from "./peerStamp";
-import { checkRequestIP } from "@omniroute/open-sse/services/ipFilter.ts";
 import { clientApiPolicy } from "./policies/clientApi";
 import { managementPolicy } from "./policies/management";
 import { publicPolicy } from "./policies/public";
@@ -246,18 +243,6 @@ function stampRouteResponse(
   return response;
 }
 
-async function getBodySizeSettings(): Promise<Record<string, unknown> | undefined> {
-  try {
-    return await getCachedBodySizeSettings();
-  } catch (error) {
-    console.warn(
-      "[Authz] Failed to load request body limit settings:",
-      error instanceof Error ? error.message : error
-    );
-    return undefined;
-  }
-}
-
 export async function runAuthzPipeline(
   request: NextRequest,
   options: AuthzPipelineOptions = {}
@@ -316,11 +301,9 @@ export async function runAuthzPipeline(
   }
 
   if (guardedPathname.startsWith("/api/") && method !== "GET" && method !== "OPTIONS") {
-    const bodySizeSettings = await getBodySizeSettings();
-    const bodySizeRejection = checkBodySize(
-      request,
-      getBodySizeLimit(guardedPathname, bodySizeSettings)
-    );
+    // Keep the Vercel proxy independent from the SQLite settings store.
+    // Per-route safe defaults remain enforced; persisted overrides are not applied here.
+    const bodySizeRejection = checkBodySize(request, getBodySizeLimit(guardedPathname));
     if (bodySizeRejection) {
       stampRouteResponse(bodySizeRejection, requestId, classification.routeClass);
       applyCorsHeaders(bodySizeRejection, request, corsRelaxOrigin);
@@ -350,12 +333,14 @@ export async function runAuthzPipeline(
   // to "remote" so the LOCAL_ONLY gate is not bypassed by a request arriving
   // through an external reverse proxy (nginx / Caddy / Cloudflare Tunnel).
   // See peerStamp.ts and the upstream da667836 reference for the full rationale.
-  const peerLocality = classifyStampedPeerLocality(
-    request.headers.get(PEER_IP_HEADER),
-    request.headers.get(VIA_PROXY_HEADER),
-    process.env.OMNIROUTE_PEER_STAMP_TOKEN
+  requestHeaders.set(
+    AUTHZ_HEADER_PEER_LOCALITY,
+    classifyStampedPeerLocality(
+      request.headers.get(PEER_IP_HEADER),
+      request.headers.get(VIA_PROXY_HEADER),
+      process.env.OMNIROUTE_PEER_STAMP_TOKEN
+    )
   );
-  requestHeaders.set(AUTHZ_HEADER_PEER_LOCALITY, peerLocality);
   // Stamp the resolved, non-spoofable peer IP for route handlers that need
   // the real client IP (e.g. login rate-limit key). Only set when the stamp
   // token is configured and the HMAC signature validates; absent otherwise.
@@ -400,39 +385,8 @@ export async function runAuthzPipeline(
     return response;
   }
 
-  // IP filter (#6131): enforce the operator's IP blacklist/whitelist on the
-  // external surface. Loopback is exempt so the local operator can never lock
-  // themselves out of the dashboard (they can always fix the list from
-  // localhost). checkIP is a no-op when the filter is disabled.
-  //
-  // D1 (#9033): on a direct connection the proxy runtime has no socket, so
-  // checkRequestIP reads only forwarding headers + undefined request.ip and
-  // falls to "unknown", never blocking the blacklisted client. Resolve the
-  // trusted peer IP from the authenticated stamp and pass it to checkRequestIP,
-  // but only when NOT behind a reverse proxy (the via-proxy marker means the
-  // peer IP is the proxy hop, e.g. 127.0.0.1, and the real client is in XFF).
-  if (peerLocality !== "loopback") {
-    const trustedPeerIp = resolveStampedPeer(
-      request.headers.get(PEER_IP_HEADER),
-      process.env.OMNIROUTE_PEER_STAMP_TOKEN
-    );
-    const viaProxy = resolveStampedViaProxy(
-      request.headers.get(VIA_PROXY_HEADER),
-      process.env.OMNIROUTE_PEER_STAMP_TOKEN
-    );
-    // The stamped client address (resolved above) is judged; requests without that stamp
-    // keep the earlier rule.
-    const ipVerdict = checkRequestIP(request, stampedClientIp ?? (viaProxy ? null : trustedPeerIp));
-    if (!ipVerdict.allowed) {
-      const blocked = NextResponse.json(
-        { error: ipVerdict.reason || "Access denied" },
-        { status: 403 }
-      );
-      stampRouteResponse(blocked, requestId, classification.routeClass);
-      applyCorsHeaders(blocked, request, corsRelaxOrigin);
-      return blocked;
-    }
-  }
+  // IP blacklist/whitelist checks are omitted from the Vercel proxy runtime.
+  // The self-hosted Node server continues to provide the full IP-filter middleware.
 
   const policy = POLICIES[classification.routeClass];
   const outcome = await policy.evaluate({ request, classification, requestId });
