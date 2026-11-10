@@ -388,7 +388,7 @@ export async function runAuthzPipeline(
   // IP blacklist/whitelist enforcement is intentionally omitted from the Vercel
   // proxy runtime to keep its bundle independent from the SQLite-backed IP filter.
   // The self-hosted Node server retains the full IP-filter middleware.
-  
+
   const policy = POLICIES[classification.routeClass];
   const outcome = await policy.evaluate({ request, classification, requestId });
 

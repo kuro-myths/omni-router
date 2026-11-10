@@ -34,7 +34,7 @@ export {
   buildModelSyncInternalHeaders,
   isModelSyncInternalRequest,
   isModelSyncLocalSpawnDenied,
-} from "@/server/authz/modelSyncInternalAuth";
+} from "@/shared/utils/modelSyncInternalAuth";
 
 /** Providers whose connections are created with `autoSync: true` (#488). */
 const AUTO_SYNC_DEFAULT_PROVIDERS = new Set(["antigravity", "agy"]);
