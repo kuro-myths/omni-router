@@ -8,12 +8,10 @@
  * Pattern mirrors cloudSyncScheduler.ts for consistency.
  */
 
-import { randomUUID } from "node:crypto";
 import { Agent, buildConnector, fetch as undiciFetch, type Dispatcher } from "undici";
 import { getSettings, updateSettings } from "@/lib/db/settings";
 import { isConnectionUnavailableToAuxiliaryActivity } from "@/lib/exclusiveLeaseIsolation";
 import { getRuntimePorts } from "@/lib/runtime/ports";
-import { timingSafeCompare } from "@/shared/utils/timingSafeCompare";
 
 export const DEFAULT_INTERVAL_MS = 6 * 60 * 60 * 1000; // 6 hours
 /** Cycle-wide in-flight cap. Heap cost is total catalog JSON, not one upstream. */
@@ -30,150 +28,13 @@ export const MODEL_SYNC_STARTUP_DELAY_MS = 90_000;
  */
 export const MODEL_SYNC_STAGGER_OFFSET_MS = 45 * 60 * 1000; // 45 minutes
 const MODEL_SYNC_SETTING_KEY = "model_sync_last_run";
-const MODEL_SYNC_INTERNAL_AUTH_HEADER = "x-model-sync-internal-auth";
-export const MODEL_SYNC_LOCAL_SPAWN_DENIED_HEADER = "x-model-sync-local-spawn-denied";
-
-function normalizeInternalBasePath(value: string | undefined): string {
-  const trimmed = value?.trim();
-  if (!trimmed || trimmed === "/") return "";
-  if (!trimmed.startsWith("/") || /[?#\\]/.test(trimmed)) return "";
-
-  const segments = trimmed.split("/").filter(Boolean);
-  if (segments.some((segment) => segment === "." || segment === "..")) return "";
-  return `/${segments.join("/")}`;
-}
-
-/**
- * Trusted origin for server-internal self-fetches (model sync, auto-discovery).
- *
- * SECURITY: never derive this from the incoming request (`request.url` /
- * `Host` header) — that is client-controlled and lets a caller redirect an
- * internal, credential-bearing self-fetch to an arbitrary host (SSRF +
- * internal-auth-header exfiltration; CodeQL js/request-forgery). Always use
- * this loopback/env-pinned origin instead.
- */
-export function getModelSyncInternalBaseUrl(): string {
-  return resolveModelSyncInternalBaseUrl();
-}
-
-export function resolveModelSyncInternalBaseUrl(_candidate?: string): string {
-  const { dashboardPort } = getRuntimePorts();
-  const nativeTls = process.env.OMNIROUTE_INTERNAL_SCHEME === "https";
-  const origin = nativeTls
-    ? `https://localhost:${dashboardPort}`
-    : `http://127.0.0.1:${dashboardPort}`;
-  return `${origin}${normalizeInternalBasePath(process.env.OMNIROUTE_BASE_PATH)}`;
-}
-
-export function createPinnedModelSyncTlsConnector(
-  connect: buildConnector.connector = buildConnector({ servername: "localhost" })
-): buildConnector.connector {
-  return (options, callback) =>
-    connect(
-      {
-        ...options,
-        host: "localhost",
-        hostname: "127.0.0.1",
-        servername: "localhost",
-      },
-      callback
-    );
-}
-
-let pinnedModelSyncTlsDispatcher: Dispatcher | null = null;
-
-function getPinnedModelSyncTlsDispatcher(): Dispatcher {
-  if (!pinnedModelSyncTlsDispatcher) {
-    pinnedModelSyncTlsDispatcher = new Agent({
-      connect: createPinnedModelSyncTlsConnector(),
-      connections: 8,
-      pipelining: 0,
-    });
-  }
-  return pinnedModelSyncTlsDispatcher;
-}
-
-const fetchWithDispatcher = undiciFetch as unknown as (
-  input: RequestInfo | URL,
-  init: RequestInit & { dispatcher: Dispatcher }
-) => Promise<Response>;
-
-export const fetchModelSyncInternal: typeof fetch = async (input, init = {}) => {
-  const inputUrl =
-    typeof input === "string" || input instanceof URL ? new URL(input) : new URL(input.url);
-  const expectedBase = new URL(getModelSyncInternalBaseUrl());
-  if (
-    inputUrl.protocol !== expectedBase.protocol ||
-    inputUrl.hostname !== expectedBase.hostname ||
-    inputUrl.port !== expectedBase.port ||
-    inputUrl.username ||
-    inputUrl.password
-  ) {
-    throw new TypeError("model sync internal fetch must target the active dashboard listener");
-  }
-
-  const basePath = expectedBase.pathname === "/" ? "" : expectedBase.pathname;
-  if (basePath && inputUrl.pathname !== basePath && !inputUrl.pathname.startsWith(`${basePath}/`)) {
-    throw new TypeError("model sync internal fetch must stay under the configured base path");
-  }
-
-  const requestInit = { ...init, redirect: "error" as const };
-  if (inputUrl.protocol === "https:") {
-    return fetchWithDispatcher(inputUrl, {
-      ...requestInit,
-      dispatcher: getPinnedModelSyncTlsDispatcher(),
-    });
-  }
-  return globalThis.fetch(inputUrl.href, requestInit);
-};
-
-const globalState = globalThis as typeof globalThis & {
-  __omnirouteModelSyncInternalAuthToken?: string;
-};
-
-let schedulerTimer: NodeJS.Timeout | null = null;
-/** Pending one-shot that arms `schedulerTimer` after the phase offset. */
-let phaseTimer: NodeJS.Timeout | null = null;
-let isRunning = false;
-let internalAuthToken: string | null = null;
-
-function getInternalAuthToken(): string {
-  if (!internalAuthToken) {
-    internalAuthToken = globalState.__omnirouteModelSyncInternalAuthToken || randomUUID();
-    globalState.__omnirouteModelSyncInternalAuthToken = internalAuthToken;
-  }
-  return internalAuthToken;
-}
-
-export function getModelSyncInternalAuthHeaderName(): string {
-  return MODEL_SYNC_INTERNAL_AUTH_HEADER;
-}
-
-export function buildModelSyncInternalHeaders(
-  options: { denyLocalSpawn?: boolean } = {}
-): Record<string, string> {
-  return {
-    [MODEL_SYNC_INTERNAL_AUTH_HEADER]: getInternalAuthToken(),
-    ...(options.denyLocalSpawn ? { [MODEL_SYNC_LOCAL_SPAWN_DENIED_HEADER]: "1" } : {}),
-  };
-}
-
-export function isModelSyncInternalRequest(request: { headers: Headers }): boolean {
-  if (!internalAuthToken && globalState.__omnirouteModelSyncInternalAuthToken) {
-    internalAuthToken = globalState.__omnirouteModelSyncInternalAuthToken;
-  }
-  const headerToken = request.headers.get(MODEL_SYNC_INTERNAL_AUTH_HEADER);
-  return Boolean(
-    headerToken && internalAuthToken && timingSafeCompare(headerToken, internalAuthToken)
-  );
-}
-
-export function isModelSyncLocalSpawnDenied(request: { headers: Headers }): boolean {
-  return (
-    isModelSyncInternalRequest(request) &&
-    request.headers.get(MODEL_SYNC_LOCAL_SPAWN_DENIED_HEADER) === "1"
-  );
-}
+export {
+  MODEL_SYNC_LOCAL_SPAWN_DENIED_HEADER,
+  getModelSyncInternalAuthHeaderName,
+  buildModelSyncInternalHeaders,
+  isModelSyncInternalRequest,
+  isModelSyncLocalSpawnDenied,
+} from "@/server/authz/modelSyncInternalAuth";
 
 /** Providers whose connections are created with `autoSync: true` (#488). */
 const AUTO_SYNC_DEFAULT_PROVIDERS = new Set(["antigravity", "agy"]);
