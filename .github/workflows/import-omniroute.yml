@@ -1,8 +1,6 @@
 name: Import and sync upstream OmniRoute
 
 on:
-  push:
-    branches: [main]
   workflow_dispatch:
 
 permissions:
