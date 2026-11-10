@@ -30,7 +30,7 @@ jobs:
         run: |
           rsync -a --delete \
             --exclude='.git' \
-            --exclude='.github/workflows/import-omniroute.yml' \
+            --exclude='.github/workflows/***' \
             /tmp/omniroute-upstream/ ./
 
       - name: Remove credential-like values from upstream fixtures
