@@ -33,6 +33,29 @@ jobs:
             --exclude='.github/workflows/import-omniroute.yml' \
             /tmp/omniroute-upstream/ ./
 
+      - name: Remove credential-like values from upstream fixtures
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+          root = Path(".")
+          skipped = {".git", "node_modules", ".next", "dist", "build"}
+          for path in root.rglob("*"):
+              if not path.is_file() or any(part in skipped for part in path.parts):
+                  continue
+              try:
+                  raw = path.read_bytes()
+                  if len(raw) > 2_000_000 or b"\\x00" in raw:
+                      continue
+                  text = raw.decode("utf-8")
+              except (UnicodeDecodeError, OSError):
+                  continue
+              clean = re.sub(r"GOCSPX-[A-Za-z0-9_-]+", "YOUR_GOOGLE_OAUTH_CLIENT_SECRET", text)
+              clean = re.sub(r"[0-9]{10,}-[a-z0-9]{20,}\\.apps\\.googleusercontent\\.com", "YOUR_GOOGLE_OAUTH_CLIENT_ID.apps.googleusercontent.com", clean)
+              if clean != text:
+                  path.write_text(clean, encoding="utf-8")
+          PY
+
       - name: Commit imported source
         run: |
           git config user.name "github-actions[bot]"
