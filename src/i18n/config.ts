@@ -77,4 +77,14 @@ export const LANGUAGES: readonly {
 
 export const RTL_LOCALES = ["ar", "he"] as const;
 
+/**
+ * Legacy browser-language tags accepted by the upstream locale resolver.
+ * Keep this aligned with config/i18n.json aliases without replacing the
+ * Indonesian-first locale catalog maintained by this deployment.
+ */
+export const LOCALE_ALIASES: Readonly<Record<string, readonly string[]>> = Object.freeze({
+  id: ["in"],
+  phi: ["fil", "tl"],
+});
+
 export const LOCALE_COOKIE = "NEXT_LOCALE";
