@@ -2,6 +2,8 @@ name: Import and sync upstream OmniRoute
 
 on:
   workflow_dispatch:
+  push:
+    branches: [main]
 
 permissions:
   contents: write
@@ -22,20 +24,15 @@ jobs:
 
       - name: Clone upstream OmniRoute
         run: |
-          git clone --depth 1 https://github.com/ChrisCompton/omniroute.git /tmp/omniroute-upstream
+          git clone --depth 1 --branch release/v3.8.54 https://github.com/cheaper-inference/OmniRoute.git /tmp/omniroute-upstream
 
       - name: Import upstream source
         run: |
           rsync -a --delete \
             --exclude='.git' \
             --exclude='.github/workflows/***' \
-            --exclude='src/app/globals.css' \
             --exclude='src/i18n/config.ts' \
             --exclude='docs/i18n/id/README.md' \
-            --exclude='package.json' \
-            --exclude='scripts/build-next-isolated.mjs' \
-            --exclude='src/app/layout.tsx' \
-            --exclude='src/shared/components/layouts/DashboardLayout.tsx' \
             --exclude='src/i18n/messages/id.json' \
             /tmp/omniroute-upstream/ ./
 
@@ -71,5 +68,5 @@ jobs:
             echo "No upstream changes to import."
             exit 0
           fi
-          git commit -m "[upstream-sync] Import ChrisCompton/omniroute"
+          git commit -m "[upstream-sync] Import cheaper-inference/OmniRoute release/v3.8.54"
           git push origin HEAD:main
