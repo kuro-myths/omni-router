@@ -1,7 +1,10 @@
 "use client";
 
 import { useState, useEffect, useCallback } from "react";
-import { Card, Button, Input, Toggle } from "@/shared/components";
+import Link from "next/link";
+import { useTranslations } from "next-intl";
+import { Card, Button, Input, Toggle, Spinner } from "@/shared/components";
+import Icon from "@/shared/components/Icon";
 
 interface Settings {
   cliproxyapi_fallback_enabled?: boolean;
@@ -28,12 +31,40 @@ function isValidUrl(value: string): boolean {
 }
 
 export default function CliproxyapiSettingsTab() {
+  const t = useTranslations("settings");
   const [settings, setSettings] = useState<Settings>({});
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [message, setMessage] = useState<{ type: string; text: string } | null>(null);
   const [toolState, setToolState] = useState<VersionManagerEntry | null>(null);
   const [toolStateError, setToolStateError] = useState<string | null>(null);
+  // #1934: import CLIProxyAPI auth files (~/.cli-proxy-api/) as OmniRoute connections.
+  const [importing, setImporting] = useState(false);
+  const [importResult, setImportResult] = useState<string | null>(null);
+
+  const handleImportAuth = useCallback(async () => {
+    setImporting(true);
+    setImportResult(null);
+    try {
+      const res = await fetch("/api/oauth/cliproxy-import", { method: "POST" });
+      const data = await res.json();
+      if (res.ok) {
+        setImportResult(
+          t("cliproxyapiImportResult", {
+            imported: data.imported ?? 0,
+            scanned: data.scanned ?? 0,
+            skipped: data.skipped ?? 0,
+          })
+        );
+      } else {
+        setImportResult(data.error || t("cliproxyapiImportFailed"));
+      }
+    } catch {
+      setImportResult(t("cliproxyapiImportFailed"));
+    } finally {
+      setImporting(false);
+    }
+  }, [t]);
 
   useEffect(() => {
     fetch("/api/settings")
@@ -69,34 +100,37 @@ export default function CliproxyapiSettingsTab() {
       });
   }, []);
 
-  const updateSetting = useCallback(async (key: string, value: boolean | string) => {
-    if (key === "cliproxyapi_url" && typeof value === "string" && value.trim() !== "") {
-      if (!isValidUrl(value)) {
-        setMessage({ type: "error", text: "Invalid URL format. Use http:// or https://" });
-        return;
+  const updateSetting = useCallback(
+    async (key: string, value: boolean | string) => {
+      if (key === "cliproxyapi_url" && typeof value === "string" && value.trim() !== "") {
+        if (!isValidUrl(value)) {
+          setMessage({ type: "error", text: t("cliproxyapiInvalidUrl") });
+          return;
+        }
       }
-    }
 
-    setSaving(true);
-    setMessage(null);
-    try {
-      const res = await fetch("/api/settings", {
-        method: "PATCH",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ [key]: value }),
-      });
-      if (!res.ok) {
-        throw new Error(`Server returned ${res.status}`);
+      setSaving(true);
+      setMessage(null);
+      try {
+        const res = await fetch("/api/settings", {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ [key]: value }),
+        });
+        if (!res.ok) {
+          throw new Error(`Server returned ${res.status}`);
+        }
+        await res.json();
+        setSettings((prev) => ({ ...prev, [key]: value }));
+        setMessage({ type: "success", text: t("settingSaved") });
+      } catch {
+        setMessage({ type: "error", text: t("settingSaveFailed") });
+      } finally {
+        setSaving(false);
       }
-      await res.json();
-      setSettings((prev) => ({ ...prev, [key]: value }));
-      setMessage({ type: "success", text: "Setting saved" });
-    } catch {
-      setMessage({ type: "error", text: "Failed to save setting" });
-    } finally {
-      setSaving(false);
-    }
-  }, []);
+    },
+    [t]
+  );
 
   const cpaEnabled = settings.cliproxyapi_fallback_enabled === true;
   const cpaUrl = settings.cliproxyapi_url || "http://127.0.0.1:8317";
@@ -104,9 +138,9 @@ export default function CliproxyapiSettingsTab() {
 
   const statusColor =
     toolState?.status === "running"
-      ? "text-green-600 dark:text-green-400"
+      ? "text-success"
       : toolState?.status === "error"
-        ? "text-red-600 dark:text-red-400"
+        ? "text-error"
         : "text-text-muted";
 
   const statusIcon =
@@ -118,38 +152,44 @@ export default function CliproxyapiSettingsTab() {
 
   return (
     <div className="space-y-4">
+      {/* Migration banner — new lifecycle management lives in the Services page */}
+      <div className="flex items-start gap-2 px-3 py-2.5 rounded-lg border border-info/30 bg-info-bg text-text-main text-xs">
+        <Icon name="info" size={14} className="mt-0.5 text-info" />
+        <span>
+          {t("cliproxyapiLifecycleNoticeBefore")}{" "}
+          <Link
+            href="/dashboard/providers/services"
+            className="underline underline-offset-2 hover:opacity-80"
+          >
+            {t("cliproxyapiLifecycleNoticeLink")}
+          </Link>
+          {t("cliproxyapiLifecycleNoticeAfter")}
+        </span>
+      </div>
+
       {message && (
         <div
+          role={message.type === "success" ? "status" : "alert"}
           className={`flex items-center gap-2 px-3 py-2 rounded-lg text-xs ${
-            message.type === "success"
-              ? "bg-green-500/10 text-green-600 dark:text-green-400"
-              : "bg-red-500/10 text-red-600 dark:text-red-400"
+            message.type === "success" ? "bg-success-bg text-success" : "bg-error-bg text-error"
           }`}
         >
-          <span className="material-symbols-outlined text-[14px]">
-            {message.type === "success" ? "check_circle" : "error"}
-          </span>
+          <Icon name={message.type === "success" ? "check_circle" : "error"} size={14} />
           {message.text}
         </div>
       )}
 
-      <Card padding="md">
-        <div className="flex items-center gap-3 mb-4">
-          <div className="size-8 rounded-lg flex items-center justify-center bg-indigo-500/10">
-            <span className="material-symbols-outlined text-indigo-500 text-xl">swap_horiz</span>
-          </div>
-          <div>
-            <h3 className="font-medium text-sm">CLIProxyAPI Fallback</h3>
-            <p className="text-xs text-text-muted">
-              When enabled, failed requests are retried through CLIProxyAPI (localhost:8317)
-            </p>
-          </div>
-        </div>
-
+      <Card
+        padding="md"
+        icon="swap_horiz"
+        title={t("cliproxyapiFallback")}
+        subtitle={t("cliproxyapiFallbackDescription")}
+      >
         <div className="space-y-4">
-          <div className="flex items-center justify-between">
-            <label className="text-sm text-text-main">Enable CLIProxyAPI Fallback</label>
+          <div className="flex items-center justify-between gap-4">
+            <span className="text-sm text-text-main">{t("cliproxyapiEnableFallback")}</span>
             <Toggle
+              ariaLabel={t("cliproxyapiEnableFallback")}
               checked={cpaEnabled}
               onChange={(checked) => updateSetting("cliproxyapi_fallback_enabled", checked)}
             />
@@ -157,88 +197,92 @@ export default function CliproxyapiSettingsTab() {
 
           {cpaEnabled && (
             <>
-              <div>
-                <label className="text-xs text-text-muted mb-1.5 block">CLIProxyAPI URL</label>
-                <Input
-                  value={cpaUrl}
-                  onChange={(e) => updateSetting("cliproxyapi_url", e.target.value)}
-                  placeholder="http://127.0.0.1:8317"
-                  className="w-full"
-                />
-              </div>
+              <Input
+                label={t("cliproxyapiUrl")}
+                value={cpaUrl}
+                onChange={(e) => updateSetting("cliproxyapi_url", e.target.value)}
+                placeholder="http://127.0.0.1:8317"
+                className="w-full"
+              />
 
-              <div>
-                <label className="text-xs text-text-muted mb-1.5 block">
-                  Fallback Status Codes (comma-separated)
-                </label>
-                <Input
-                  value={cpaCodes}
-                  onChange={(e) => updateSetting("cliproxyapi_fallback_codes", e.target.value)}
-                  placeholder="502,401,403,429,503"
-                  className="w-full"
-                />
-              </div>
+              <Input
+                label={t("cliproxyapiFallbackCodes")}
+                value={cpaCodes}
+                onChange={(e) => updateSetting("cliproxyapi_fallback_codes", e.target.value)}
+                placeholder="502,401,403,429,503"
+                className="w-full"
+              />
             </>
           )}
         </div>
       </Card>
 
-      <Card padding="md">
-        <h3 className="font-medium text-sm mb-4">CLIProxyAPI Status</h3>
+      <Card padding="md" title={t("cliproxyapiStatus")}>
         {loading ? (
           <div className="flex items-center gap-2 text-text-muted text-sm">
-            <span className="material-symbols-outlined animate-spin text-base">
-              progress_activity
-            </span>
-            Loading...
+            <Spinner size="sm" />
+            {t("loading")}
           </div>
         ) : toolStateError ? (
           <p className="text-sm text-text-muted">{toolStateError}</p>
         ) : toolState ? (
-          <div className="grid grid-cols-2 gap-3">
-            <div className="p-3 rounded-lg bg-bg-secondary">
-              <p className="text-xs text-text-muted mb-1">Status</p>
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+            <div className="p-3 rounded-lg bg-bg-subtle">
+              <p className="text-xs text-text-muted mb-1">{t("cliproxyapiStatusLabel")}</p>
               <div className="flex items-center gap-1.5">
-                <span className={`material-symbols-outlined text-sm ${statusColor}`}>
-                  {statusIcon}
-                </span>
+                <Icon name={statusIcon} size={14} className={statusColor} />
                 <p className={`text-sm font-medium capitalize ${statusColor}`}>
-                  {toolState.status?.replace("_", " ") || "Unknown"}
+                  {toolState.status?.replace("_", " ") || t("cliproxyapiUnknown")}
                 </p>
               </div>
             </div>
-            <div className="p-3 rounded-lg bg-bg-secondary">
-              <p className="text-xs text-text-muted mb-1">Version</p>
+            <div className="p-3 rounded-lg bg-bg-subtle">
+              <p className="text-xs text-text-muted mb-1">{t("cliproxyapiVersion")}</p>
               <p className="text-sm font-medium">
-                {toolState.installedVersion ? `v${toolState.installedVersion}` : "Not installed"}
+                {toolState.installedVersion ? `v${toolState.installedVersion}` : t("notInstalled")}
               </p>
             </div>
-            <div className="p-3 rounded-lg bg-bg-secondary">
-              <p className="text-xs text-text-muted mb-1">Health</p>
+            <div className="p-3 rounded-lg bg-bg-subtle">
+              <p className="text-xs text-text-muted mb-1">{t("cliproxyapiHealth")}</p>
               <p
                 className={`text-sm font-medium ${
                   toolState.healthStatus === "healthy"
-                    ? "text-green-600 dark:text-green-400"
+                    ? "text-success"
                     : toolState.healthStatus === "unhealthy"
-                      ? "text-red-600 dark:text-red-400"
+                      ? "text-error"
                       : "text-text-muted"
                 }`}
               >
                 {toolState.healthStatus === "healthy"
-                  ? "Healthy"
+                  ? t("healthy")
                   : toolState.healthStatus === "unhealthy"
-                    ? "Unhealthy"
-                    : "Unknown"}
+                    ? t("unhealthy")
+                    : t("unknown")}
               </p>
             </div>
-            <div className="p-3 rounded-lg bg-bg-secondary">
-              <p className="text-xs text-text-muted mb-1">Port</p>
+            <div className="p-3 rounded-lg bg-bg-subtle">
+              <p className="text-xs text-text-muted mb-1">{t("cliproxyapiPort")}</p>
               <p className="text-sm font-mono">{toolState.port || 8317}</p>
             </div>
           </div>
         ) : (
-          <p className="text-sm text-text-muted">CLIProxyAPI not detected</p>
+          <p className="text-sm text-text-muted">{t("cliproxyapiNotDetected")}</p>
         )}
+      </Card>
+
+      <Card
+        padding="md"
+        title={t("cliproxyapiImportAuthTitle")}
+        subtitle={t("cliproxyapiImportAuthDesc")}
+      >
+        <Button onClick={handleImportAuth} loading={importing} disabled={importing}>
+          {t("cliproxyapiImportAuthButton")}
+        </Button>
+        {importResult ? (
+          <p className="text-sm text-text-muted mt-3" role="status">
+            {importResult}
+          </p>
+        ) : null}
       </Card>
     </div>
   );

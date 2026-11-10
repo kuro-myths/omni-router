@@ -1,3 +1,4 @@
+// @ts-nocheck
 /**
  * Usage Migrations — extracted from usageDb.js (T-15)
  *
@@ -12,12 +13,21 @@ import path from "path";
 import { ZipFile } from "yazl";
 import { getDbInstance, isCloud, isBuildPhase, DATA_DIR } from "../db/core";
 import { getLegacyDotDataDir, isSamePath } from "../dataPaths";
+import { getAppLogFilePath } from "../logEnv";
+import { protectPayloadForLog } from "../logPayloads";
+import { sanitizePII } from "../piiSanitizer";
+import { resolveProviderId } from "@/shared/constants/providers";
+import { writeCallArtifact, getCallLogsDir, type CallLogArtifact } from "./callLogArtifacts";
+import {
+  resolveImportedUsageAccountIdentity,
+  resolveOrphanedUsageAccountIdentity,
+  resolveUsageAccountIdentity,
+} from "./accountIdentity";
 
 export const shouldPersistToDisk = !isCloud && !isBuildPhase;
 
 const LEGACY_DATA_DIR = isCloud ? null : getLegacyDotDataDir();
 
-export const CALL_LOGS_DIR = isCloud ? null : path.join(DATA_DIR, "call_logs");
 export const LOG_ARCHIVES_DIR = isCloud ? null : path.join(DATA_DIR, "log_archives");
 
 const LEGACY_LAYOUT_MARKER =
@@ -40,6 +50,25 @@ type ArchiveTarget = {
   archiveRoot: string;
   deleteAfterArchive: boolean;
 };
+
+function buildLegacyRequestSummary(requestType: unknown, requestBody: unknown) {
+  if (requestType !== "search" || !requestBody || typeof requestBody !== "object") return null;
+
+  const record = requestBody as Record<string, unknown>;
+  const summary: Record<string, unknown> = {};
+  if (typeof record.query === "string" && record.query.trim().length > 0) {
+    summary.query = sanitizePII(record.query).text;
+  }
+
+  const filters = Object.fromEntries(
+    Object.entries(record).filter(([key]) => key !== "query" && key !== "provider")
+  );
+  if (Object.keys(filters).length > 0) {
+    summary.filters = filters;
+  }
+
+  return Object.keys(summary).length > 0 ? JSON.stringify(summary) : null;
+}
 
 function copyIfMissing(fromPath: string | null, toPath: string | null, label: string) {
   if (!fromPath || !toPath) return;
@@ -82,21 +111,69 @@ function containsLegacyCallLogLayout(dirPath: string | null): boolean {
   return false;
 }
 
+// Archives zip whole request-log trees (prompts, responses): owner-only, like call-log
+// artifacts, regardless of the process umask.
+const PRIVATE_ARCHIVE_DIR_MODE = 0o700;
+const PRIVATE_ARCHIVE_FILE_MODE = 0o600;
+
 function ensureArchiveDir() {
   if (!LOG_ARCHIVES_DIR) return;
-  fs.mkdirSync(LOG_ARCHIVES_DIR, { recursive: true });
+  fs.mkdirSync(LOG_ARCHIVES_DIR, { recursive: true, mode: PRIVATE_ARCHIVE_DIR_MODE });
+  try {
+    fs.chmodSync(LOG_ARCHIVES_DIR, PRIVATE_ARCHIVE_DIR_MODE);
+  } catch {
+    // Best effort (e.g. a directory owned by another UID); archive files stay 0600.
+  }
 }
 
-function listArchiveTargets(): ArchiveTarget[] {
+/**
+ * File the live logger writes to (`buildLoggerResource()` in
+ * `src/shared/utils/logger.ts`), so the legacy-log sweep below never zips-then-deletes
+ * that file or its containing subtree. Since PR #6234 (fix for #6197) the default app log path
+ * moved from a `process.cwd()`-anchored location to `DATA_DIR/logs/application/app.log`,
+ * landing it inside the same `DATA_DIR/logs` tree this "legacy" migration sweeps (#6799).
+ */
+function getLiveAppLogPath(): string | null {
+  try {
+    return path.resolve(getAppLogFilePath());
+  } catch {
+    return null;
+  }
+}
+
+function listRequestLogArchiveEntries(): ArchiveTarget[] {
+  if (!CURRENT_REQUEST_LOGS_DIR || !fs.existsSync(CURRENT_REQUEST_LOGS_DIR)) return [];
+
+  const liveAppLogPath = getLiveAppLogPath();
+  const entries = fs.readdirSync(CURRENT_REQUEST_LOGS_DIR);
   const targets: ArchiveTarget[] = [];
 
-  if (CURRENT_REQUEST_LOGS_DIR && fs.existsSync(CURRENT_REQUEST_LOGS_DIR)) {
+  for (const entry of entries) {
+    const entryPath = path.join(CURRENT_REQUEST_LOGS_DIR, entry);
+    if (liveAppLogPath) {
+      const relativeLogPath = path.relative(entryPath, liveAppLogPath);
+      if (
+        relativeLogPath === "" ||
+        (relativeLogPath !== ".." &&
+          !relativeLogPath.startsWith(`..${path.sep}`) &&
+          !path.isAbsolute(relativeLogPath))
+      ) {
+        continue;
+      }
+    }
+
     targets.push({
-      sourcePath: CURRENT_REQUEST_LOGS_DIR,
-      archiveRoot: "data/logs",
+      sourcePath: entryPath,
+      archiveRoot: path.posix.join("data/logs", entry),
       deleteAfterArchive: true,
     });
   }
+
+  return targets;
+}
+
+function listArchiveTargets(): ArchiveTarget[] {
+  const targets: ArchiveTarget[] = listRequestLogArchiveEntries();
 
   if (CURRENT_REQUEST_SUMMARY_FILE && fs.existsSync(CURRENT_REQUEST_SUMMARY_FILE)) {
     targets.push({
@@ -106,9 +183,10 @@ function listArchiveTargets(): ArchiveTarget[] {
     });
   }
 
-  if (CALL_LOGS_DIR && containsLegacyCallLogLayout(CALL_LOGS_DIR)) {
+  const callLogsDir = getCallLogsDir();
+  if (callLogsDir && containsLegacyCallLogLayout(callLogsDir)) {
     targets.push({
-      sourcePath: CALL_LOGS_DIR,
+      sourcePath: callLogsDir,
       archiveRoot: "data/call_logs",
       deleteAfterArchive: true,
     });
@@ -148,13 +226,29 @@ function createLegacyArchive(targets: ArchiveTarget[]): Promise<string> {
     const archiveFilename = `${timestamp}_legacy-request-logs.zip`;
     const archivePath = path.join(LOG_ARCHIVES_DIR, archiveFilename);
     const zipFile = new ZipFile();
-    const output = fs.createWriteStream(archivePath);
+    const output = fs.createWriteStream(archivePath, { mode: PRIVATE_ARCHIVE_FILE_MODE });
 
-    output.on("close", () => resolve(archiveFilename));
-    output.on("error", (error) => {
+    let settled = false;
+    // yazl detects a stat->stream size mismatch (a file growing while being zipped, e.g.
+    // an actively-written log — #6401) by emitting "error" on the ZipFile instance itself,
+    // not on `output`. Left unwired, that "error" event has no listener and Node re-throws
+    // it as an uncaughtException that crashes the process. Wiring it here converts that
+    // crash into a normal rejection the caller's try/catch already handles.
+    const fail = (error: Error) => {
+      if (settled) return;
+      settled = true;
+      output.destroy();
       fs.rmSync(archivePath, { force: true });
       reject(error);
+    };
+
+    output.on("close", () => {
+      if (settled) return;
+      settled = true;
+      resolve(archiveFilename);
     });
+    output.on("error", fail);
+    zipFile.on("error", fail);
     zipFile.outputStream.pipe(output);
 
     try {
@@ -163,9 +257,7 @@ function createLegacyArchive(targets: ArchiveTarget[]): Promise<string> {
       }
       zipFile.end();
     } catch (error) {
-      fs.rmSync(archivePath, { force: true });
-      zipFile.end();
-      reject(error);
+      fail(error as Error);
     }
   });
 }
@@ -182,7 +274,8 @@ function writeLegacyLayoutMarker(archiveFilename: string) {
       },
       null,
       2
-    )
+    ),
+    { mode: PRIVATE_ARCHIVE_FILE_MODE }
   );
 }
 
@@ -242,24 +335,38 @@ export function migrateUsageJsonToSqlite() {
         console.log(`[usageDb] Migrating ${history.length} usage entries from JSON → SQLite...`);
 
         const insert = db.prepare(`
-          INSERT INTO usage_history (provider, model, connection_id, api_key_id, api_key_name,
-            tokens_input, tokens_output, tokens_cache_read, tokens_cache_creation, tokens_reasoning,
-            status, success, latency_ms, ttft_ms, error_code, timestamp)
-          VALUES (@provider, @model, @connectionId, @apiKeyId, @apiKeyName,
-            @tokensInput, @tokensOutput, @tokensCacheRead, @tokensCacheCreation, @tokensReasoning,
-            @status, @success, @latencyMs, @ttftMs, @errorCode, @timestamp)
+          INSERT INTO usage_history (provider, model, connection_id, account_key, account_label,
+            account_label_priority, api_key_id, api_key_name, tokens_input, tokens_output,
+            tokens_cache_read, tokens_cache_creation, tokens_reasoning, status, success, latency_ms,
+            ttft_ms, error_code, combo_strategy, timestamp)
+          VALUES (@provider, @model, @connectionId, @accountKey, @accountLabel,
+            @accountLabelPriority, @apiKeyId, @apiKeyName, @tokensInput, @tokensOutput,
+            @tokensCacheRead, @tokensCacheCreation, @tokensReasoning, @status, @success,
+            @latencyMs, @ttftMs, @errorCode, @comboStrategy, @timestamp)
         `);
+        const findConnection = db.prepare("SELECT * FROM provider_connections WHERE id = ?");
 
         const tx = db.transaction(() => {
           for (const entry of history) {
+            const connectionId = entry.connectionId || entry.connection_id || null;
+            const connection = connectionId ? findConnection.get(connectionId) : null;
+            const fallbackIdentity = connection
+              ? resolveUsageAccountIdentity(connection)
+              : resolveOrphanedUsageAccountIdentity(entry.provider, connectionId);
+            const identity = resolveImportedUsageAccountIdentity(entry, fallbackIdentity);
             insert.run({
-              provider: entry.provider || null,
+              provider: entry.provider ? resolveProviderId(entry.provider) : null,
               model: entry.model || null,
-              connectionId: entry.connectionId || null,
+              connectionId,
+              accountKey: identity.accountKey,
+              accountLabel: identity.accountLabel,
+              accountLabelPriority: identity.accountLabelPriority,
               apiKeyId: entry.apiKeyId || null,
               apiKeyName: entry.apiKeyName || null,
-              tokensInput: entry.tokens?.input ?? entry.tokens?.prompt_tokens ?? 0,
-              tokensOutput: entry.tokens?.output ?? entry.tokens?.completion_tokens ?? 0,
+              tokensInput:
+                entry.tokens?.input ?? entry.tokens?.prompt_tokens ?? entry.tokens?.in ?? 0,
+              tokensOutput:
+                entry.tokens?.output ?? entry.tokens?.completion_tokens ?? entry.tokens?.out ?? 0,
               tokensCacheRead: entry.tokens?.cacheRead ?? entry.tokens?.cached_tokens ?? 0,
               tokensCacheCreation:
                 entry.tokens?.cacheCreation ?? entry.tokens?.cache_creation_input_tokens ?? 0,
@@ -273,6 +380,7 @@ export function migrateUsageJsonToSqlite() {
                   ? Number(entry.latencyMs)
                   : 0,
               errorCode: entry.errorCode || null,
+              comboStrategy: entry.comboStrategy || entry.combo_strategy || "direct",
               timestamp: entry.timestamp || new Date().toISOString(),
             });
           }
@@ -297,25 +405,97 @@ export function migrateUsageJsonToSqlite() {
         console.log(`[usageDb] Migrating ${logs.length} call log entries from JSON → SQLite...`);
 
         const insert = db.prepare(`
-          INSERT OR IGNORE INTO call_logs (id, timestamp, method, path, status, model, provider,
+          INSERT OR IGNORE INTO call_logs (id, timestamp, method, path, status, model, requested_model, provider,
             account, connection_id, duration, tokens_in, tokens_out, source_format, target_format,
-            api_key_id, api_key_name, combo_name, request_body, response_body, error,
-            artifact_relpath, has_pipeline_details)
-          VALUES (@id, @timestamp, @method, @path, @status, @model, @provider,
+            api_key_id, api_key_name, combo_name, combo_step_id, combo_execution_key, error_summary,
+            detail_state, artifact_relpath, artifact_size_bytes, artifact_sha256,
+            has_request_body, has_response_body, has_pipeline_details, request_summary)
+          VALUES (@id, @timestamp, @method, @path, @status, @model, @requestedModel, @provider,
             @account, @connectionId, @duration, @tokensIn, @tokensOut, @sourceFormat, @targetFormat,
-            @apiKeyId, @apiKeyName, @comboName, @requestBody, @responseBody, @error,
-            NULL, 0)
+            @apiKeyId, @apiKeyName, @comboName, @comboStepId, @comboExecutionKey, @errorSummary,
+            @detailState, @artifactRelPath, @artifactSizeBytes, @artifactSha256,
+            @hasRequestBody, @hasResponseBody, @hasPipelineDetails, @requestSummary)
         `);
 
         const tx = db.transaction(() => {
           for (const log of logs) {
+            const id = log.id || `${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+            const timestamp = log.timestamp || new Date().toISOString();
+            const protectedRequestBody = log.requestBody
+              ? protectPayloadForLog(log.requestBody)
+              : null;
+            const protectedResponseBody = log.responseBody
+              ? protectPayloadForLog(log.responseBody)
+              : null;
+            const protectedError =
+              log.error && typeof log.error === "object"
+                ? protectPayloadForLog(log.error)
+                : log.error || null;
+            const detailExpected =
+              protectedRequestBody !== null ||
+              protectedResponseBody !== null ||
+              protectedError !== null;
+
+            let detailState: "none" | "ready" | "missing" = "none";
+            let artifactRelPath: string | null = null;
+            let artifactSizeBytes: number | null = null;
+            let artifactSha256: string | null = null;
+
+            if (detailExpected) {
+              const artifact: CallLogArtifact = {
+                schemaVersion: 5,
+                summary: {
+                  id,
+                  timestamp,
+                  method: log.method || "POST",
+                  path: log.path || "/v1/chat/completions",
+                  status: log.status || 0,
+                  model: log.model || "-",
+                  requestedModel: log.requestedModel || null,
+                  provider: log.provider || "-",
+                  account: log.account || "-",
+                  connectionId: log.connectionId || null,
+                  duration: log.duration || 0,
+                  tokens: {
+                    in: log.tokens?.in ?? 0,
+                    out: log.tokens?.out ?? 0,
+                    cacheRead: null,
+                    cacheWrite: null,
+                    compressed: 0,
+                    reasoning: null,
+                  },
+                  requestType: log.requestType || null,
+                  sourceFormat: log.sourceFormat || null,
+                  targetFormat: log.targetFormat || null,
+                  apiKeyId: log.apiKeyId || null,
+                  apiKeyName: log.apiKeyName || null,
+                  comboName: log.comboName || null,
+                  comboStepId: log.comboStepId || null,
+                  comboExecutionKey: log.comboExecutionKey || null,
+                },
+                requestBody: protectedRequestBody,
+                responseBody: protectedResponseBody,
+                error: protectedError,
+              };
+              const artifactResult = writeCallArtifact(artifact);
+              if (artifactResult) {
+                detailState = "ready";
+                artifactRelPath = artifactResult.relPath;
+                artifactSizeBytes = artifactResult.sizeBytes;
+                artifactSha256 = artifactResult.sha256;
+              } else {
+                detailState = "missing";
+              }
+            }
+
             insert.run({
-              id: log.id || `${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
-              timestamp: log.timestamp || new Date().toISOString(),
+              id,
+              timestamp,
               method: log.method || "POST",
               path: log.path || null,
               status: log.status || 0,
               model: log.model || null,
+              requestedModel: log.requestedModel || null,
               provider: log.provider || null,
               account: log.account || null,
               connectionId: log.connectionId || null,
@@ -327,9 +507,22 @@ export function migrateUsageJsonToSqlite() {
               apiKeyId: log.apiKeyId || null,
               apiKeyName: log.apiKeyName || null,
               comboName: log.comboName || null,
-              requestBody: log.requestBody ? JSON.stringify(log.requestBody) : null,
-              responseBody: log.responseBody ? JSON.stringify(log.responseBody) : null,
-              error: log.error || null,
+              comboStepId: log.comboStepId || null,
+              comboExecutionKey: log.comboExecutionKey || log.comboStepId || null,
+              errorSummary:
+                typeof protectedError === "string"
+                  ? protectedError.slice(0, 4000)
+                  : protectedError
+                    ? JSON.stringify(protectedError).slice(0, 4000)
+                    : null,
+              detailState,
+              artifactRelPath,
+              artifactSizeBytes,
+              artifactSha256,
+              hasRequestBody: protectedRequestBody ? 1 : 0,
+              hasResponseBody: protectedResponseBody ? 1 : 0,
+              hasPipelineDetails: 0,
+              requestSummary: buildLegacyRequestSummary(log.requestType, protectedRequestBody),
             });
           }
         });

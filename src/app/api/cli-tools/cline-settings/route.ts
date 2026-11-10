@@ -4,38 +4,33 @@ import { NextResponse } from "next/server";
 import fs from "fs/promises";
 import path from "path";
 import os from "os";
+import { requireCliToolsAuth } from "@/lib/api/requireCliToolsAuth";
 import { ensureCliConfigWriteAllowed, getCliRuntimeStatus } from "@/shared/services/cliRuntime";
 import { createBackup } from "@/shared/services/backupService";
 import { saveCliToolLastConfigured, deleteCliToolLastConfigured } from "@/lib/db/cliToolState";
 import { cliModelConfigSchema } from "@/shared/validation/schemas";
 import { isValidationFailure, validateBody } from "@/shared/validation/helpers";
-import { getApiKeyById } from "@/lib/localDb";
+import { resolveApiKey } from "@/shared/services/apiKeyResolver";
+import { readJsoncConfig } from "../_lib/jsoncConfig";
+import {
+  configClobberRefusalResponse,
+  parseJsoncObject,
+  readExistingConfig,
+} from "../_lib/readExistingConfig";
 
 const CLINE_DATA_DIR = path.join(os.homedir(), ".cline", "data");
 const GLOBAL_STATE_PATH = path.join(CLINE_DATA_DIR, "globalState.json");
 const SECRETS_PATH = path.join(CLINE_DATA_DIR, "secrets.json");
 
-// Read globalState.json
-const readGlobalState = async () => {
-  try {
-    const content = await fs.readFile(GLOBAL_STATE_PATH, "utf-8");
-    return JSON.parse(content);
-  } catch (error: any) {
-    if (error.code === "ENOENT") return null;
-    throw error;
-  }
-};
+// Read globalState.json.
+// Ported from upstream decolua/9router@6c10edf8: tolerate JSONC (trailing
+// commas) and return null on any parse error so the dashboard renders
+// "installed but not configured" instead of a 500 misread as "not installed".
+const readGlobalState = async () =>
+  readJsoncConfig<Record<string, unknown>>(GLOBAL_STATE_PATH);
 
-// Read secrets.json
-const readSecrets = async () => {
-  try {
-    const content = await fs.readFile(SECRETS_PATH, "utf-8");
-    return JSON.parse(content);
-  } catch (error: any) {
-    if (error.code === "ENOENT") return {};
-    throw error;
-  }
-};
+// Read secrets.json (same JSONC-tolerant behaviour; defaults to {} for compat).
+const readSecrets = async () => readJsoncConfig<Record<string, unknown>>(SECRETS_PATH, {});
 
 // Check if OmniRoute is configured as OpenAI-compatible provider
 const hasOmniRouteConfig = (globalState: any) => {
@@ -52,7 +47,10 @@ const hasOmniRouteConfig = (globalState: any) => {
 };
 
 // GET - Check cline CLI and read current settings
-export async function GET() {
+export async function GET(request: Request) {
+  const authError = await requireCliToolsAuth(request);
+  if (authError) return authError;
+
   try {
     const runtime = await getCliRuntimeStatus("cline");
 
@@ -101,6 +99,9 @@ export async function GET() {
 
 // POST - Configure Cline to use OmniRoute as OpenAI-compatible provider
 export async function POST(request: Request) {
+  const authError = await requireCliToolsAuth(request);
+  if (authError) return authError;
+
   let rawBody;
   try {
     rawBody = await request.json();
@@ -122,22 +123,15 @@ export async function POST(request: Request) {
       return NextResponse.json({ error: writeGuard }, { status: 403 });
     }
 
+    // (#526) Extract keyId BEFORE validation — Zod strips unknown fields!
+    const keyId = typeof rawBody?.keyId === "string" ? rawBody.keyId.trim() : null;
+
     const validation = validateBody(cliModelConfigSchema, rawBody);
     if (isValidationFailure(validation)) {
       return NextResponse.json({ error: validation.error }, { status: 400 });
     }
-    let { baseUrl, apiKey, model } = validation.data;
-
-    // (#526) Resolve real key from DB if keyId was provided
-    const keyId = typeof rawBody?.keyId === "string" ? rawBody.keyId.trim() : null;
-    if (keyId) {
-      try {
-        const keyRecord = await getApiKeyById(keyId);
-        if (keyRecord?.key) apiKey = keyRecord.key as string;
-      } catch {
-        /* non-critical */
-      }
-    }
+    const { baseUrl, model } = validation.data;
+    const apiKey = await resolveApiKey(keyId, validation.data.apiKey);
 
     // Ensure directory exists
     await fs.mkdir(CLINE_DATA_DIR, { recursive: true });
@@ -146,14 +140,12 @@ export async function POST(request: Request) {
     await createBackup("cline", GLOBAL_STATE_PATH);
     await createBackup("cline", SECRETS_PATH);
 
-    // Read existing globalState or create new
-    let globalState: Record<string, any> = {};
-    try {
-      const existing = await fs.readFile(GLOBAL_STATE_PATH, "utf-8");
-      globalState = JSON.parse(existing);
-    } catch {
-      /* No existing config */
-    }
+    // Read BOTH files before writing either one; only a missing file starts
+    // fresh — an unreadable/unparsable one is refused (409), not replaced.
+    const globalState: Record<string, any> =
+      (await readExistingConfig(GLOBAL_STATE_PATH, parseJsoncObject)) ?? {};
+    const secrets: Record<string, any> =
+      (await readExistingConfig(SECRETS_PATH, parseJsoncObject)) ?? {};
 
     // Normalize baseUrl - Cline expects the base without /v1
     const normalizedBaseUrl = baseUrl.endsWith("/v1") ? baseUrl.slice(0, -3) : baseUrl;
@@ -169,14 +161,6 @@ export async function POST(request: Request) {
     await fs.writeFile(GLOBAL_STATE_PATH, JSON.stringify(globalState, null, 2));
 
     // Write API key to secrets
-    let secrets: Record<string, any> = {};
-    try {
-      const existing = await fs.readFile(SECRETS_PATH, "utf-8");
-      secrets = JSON.parse(existing);
-    } catch {
-      /* No existing secrets */
-    }
-
     secrets.openAiApiKey = apiKey || "sk_omniroute";
 
     await fs.writeFile(SECRETS_PATH, JSON.stringify(secrets, null, 2));
@@ -194,13 +178,18 @@ export async function POST(request: Request) {
       globalStatePath: GLOBAL_STATE_PATH,
     });
   } catch (error) {
+    const refusal = configClobberRefusalResponse(error);
+    if (refusal) return refusal;
     console.log("Error updating cline settings:", error);
     return NextResponse.json({ error: "Failed to update cline settings" }, { status: 500 });
   }
 }
 
 // DELETE - Remove OmniRoute OpenAI-compatible provider config
-export async function DELETE() {
+export async function DELETE(request: Request) {
+  const authError = await requireCliToolsAuth(request);
+  if (authError) return authError;
+
   try {
     const writeGuard = ensureCliConfigWriteAllowed();
     if (writeGuard) {
@@ -233,17 +222,14 @@ export async function DELETE() {
       globalState.planModeApiProvider = "cline";
     }
 
+    // Read secrets before the first write so an unparsable file aborts the reset
+    // instead of being replaced by `{}`.
+    const secrets: Record<string, any> =
+      (await readExistingConfig(SECRETS_PATH, parseJsoncObject)) ?? {};
+
     await fs.writeFile(GLOBAL_STATE_PATH, JSON.stringify(globalState, null, 2));
 
     // Remove API key from secrets
-    let secrets: Record<string, any> = {};
-    try {
-      const existing = await fs.readFile(SECRETS_PATH, "utf-8");
-      secrets = JSON.parse(existing);
-    } catch {
-      /* ignore */
-    }
-
     delete secrets.openAiApiKey;
     await fs.writeFile(SECRETS_PATH, JSON.stringify(secrets, null, 2));
 
@@ -259,6 +245,8 @@ export async function DELETE() {
       message: "OmniRoute settings removed from Cline",
     });
   } catch (error) {
+    const refusal = configClobberRefusalResponse(error);
+    if (refusal) return refusal;
     console.log("Error resetting cline settings:", error);
     return NextResponse.json({ error: "Failed to reset cline settings" }, { status: 500 });
   }

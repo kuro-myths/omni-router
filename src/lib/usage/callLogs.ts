@@ -1,151 +1,177 @@
+import {
+  parseUpstreamHttp,
+  UPSTREAM_HTTP_ATTEMPT,
+  type UpstreamHttpSummary,
+} from "@/shared/utils/upstreamHttp";
 /**
- * Call Logs — extracted from usageDb.js (T-15)
+ * Structured call log management.
  *
- * Structured call log management: save, query, rotate, and
- * unified single-artifact disk storage for the Logger UI.
- *
- * @module lib/usage/callLogs
+ * SQLite stores only summary metadata. Detailed request/response payloads live in
+ * filesystem artifacts and are loaded only for explicit detail/export flows.
  */
 
-import fs from "fs";
-import path from "path";
 import type { RequestPipelinePayloads } from "@omniroute/open-sse/utils/requestLogger.ts";
+import { sanitizeErrorMessage } from "@omniroute/open-sse/utils/errorSanitization.ts";
 import { getDbInstance } from "../db/core";
-import { getRequestDetailLogByCallLogId } from "../db/detailedLogs";
-import { shouldPersistToDisk, CALL_LOGS_DIR } from "./migrations";
+import { getPricingForModel } from "../db/settings/pricing";
+import {
+  readCacheWriteUsage,
+  storedCacheWriteUsage,
+} from "@omniroute/open-sse/utils/cacheWriteUsage.ts";
+import { estimateApiEquivalentCacheWrite } from "./cacheWriteEstimate";
+import { failPendingCallLogDetail, publishPendingCallLogDetail } from "../db/callLogDetails";
+import { applyNodePrefix, resolveProviderDisplay } from "./callLogDisplay";
+export { applyNodePrefix, resolveProviderDisplay } from "./callLogDisplay";
+import { dashboardDetailIo, resolveCallLogDetail } from "./callLogDetailResolver";
+import { shouldPersistToDisk } from "./migrations";
+import { markRequestPersistedById, updateRequestTokensById } from "./usageHistory";
+import { getCallLogApiKeyContext } from "./callLogApiKeyContext";
+import { serializeResilienceActions, resetResilienceActions } from "./resilienceActionsContext";
+import { parseResilienceActions } from "./resilienceActionsParse";
+import {
+  seedPendingContinuationState,
+  clearPendingContinuationState,
+  type ContinuationPipeline,
+} from "../db/responsesContinuationStore";
 import {
   getLoggedInputTokens,
   getLoggedOutputTokens,
   getPromptCacheReadTokensOrNull,
-  getPromptCacheCreationTokensOrNull,
   getReasoningTokensOrNull,
+  getObservedReasoning,
 } from "./tokenAccounting";
-import { isNoLog } from "../compliance";
-import { sanitizePII } from "../piiSanitizer";
 import {
-  protectPayloadForLog,
+  hasRenderedContent,
+  isNonTextRequest,
+  resolveUsageProvenance,
+} from "./callContentProvenance";
+import { isNoLog } from "../compliance/noLog";
+import {
   parseStoredPayload,
-  serializePayloadForStorage,
+  protectErrorPayloadForLog,
+  protectPayloadForLog,
 } from "../logPayloads";
-import { getCallLogMaxEntries, getCallLogRetentionDays } from "../logEnv";
-import { pickMaskedDisplayValue } from "@/shared/utils/maskEmail";
+import { pickDisplayValue } from "@/shared/utils/maskEmail";
+import { getCallLogsDir, type CallLogArtifact, type CallLogDetailState } from "./callLogArtifacts";
+import { closeCallLogArtifactWriter, writeCallArtifactAsync } from "./callLogArtifactWriter";
+import { isWriteLockError, scheduleWriteRetry } from "./usageWriteRetry";
+import {
+  toNumber,
+  toStringOrNull,
+  normalizeDetailState,
+  sanitizeErrorForLog,
+  toStoredErrorSummary,
+  protectPipelinePayloads,
+  buildRequestSummary,
+  classifyCallLogError,
+  toStoredErrorType,
+} from "./callLogs/format";
+import {
+  clearArtifactReference,
+  cleanupOrphanCallLogFiles,
+  cleanupOverflowCallLogFiles,
+  deleteCallLogsBefore,
+  trimCallLogsToMaxRows,
+  rotateCallLogs,
+  scheduleCallLogRotation,
+} from "./callLogRotation";
+
+// Re-exported for existing importers (usageDb.ts, compliance/index.ts, purge-logs route,
+// and the call-log rotation/cap test suite) — the implementation now lives in
+// ./callLogRotation.ts (extracted to satisfy the file-size gate, #10125).
+export {
+  cleanupOrphanCallLogFiles,
+  cleanupOverflowCallLogFiles,
+  deleteCallLogsBefore,
+  trimCallLogsToMaxRows,
+  rotateCallLogs,
+  scheduleCallLogRotation,
+};
 
 type JsonRecord = Record<string, unknown>;
 
-type CallLogArtifact = {
-  schemaVersion: 3;
-  summary: {
-    id: string;
-    timestamp: string;
-    method: string;
-    path: string;
-    status: number;
-    model: string;
-    requestedModel: string | null;
-    provider: string;
-    account: string;
-    connectionId: string | null;
-    duration: number;
-    tokens: {
-      in: number;
-      out: number;
-      cacheRead: number | null;
-      cacheWrite: number | null;
-      reasoning: number | null;
-    };
-    requestType: string | null;
-    sourceFormat: string | null;
-    targetFormat: string | null;
-    apiKeyId: string | null;
-    apiKeyName: string | null;
-    comboName: string | null;
-  };
-  requestBody: unknown;
-  responseBody: unknown;
-  error: unknown;
-  pipeline?: RequestPipelinePayloads;
+const pendingCallLogSaves = new Set<Promise<void>>();
+let callLogSavesClosing = false;
+
+type CallLogSummaryRow = {
+  id: string;
+  timestamp: string | null;
+  method: string | null;
+  path: string | null;
+  status: number | null;
+  model: string | null;
+  requested_model: string | null;
+  provider: string | null;
+  account: string | null;
+  connection_id: string | null;
+  duration: number | null;
+  ttft_ms: number | null;
+  tokens_in: number | null;
+  tokens_out: number | null;
+  tokens_cache_read: number | null;
+  tokens_cache_creation: number | null;
+  tokens_cache_creation_5m?: number | null;
+  tokens_cache_creation_1h?: number | null;
+  cache_creation_tier_status?: string | null;
+  cache_write_cost_usd?: number | null;
+  cache_write_priced_tokens?: number | null;
+  tokens_reasoning: number | null;
+  tokens_compressed: number | null;
+  reasoning_source?: string | null;
+  reasoning_chars?: number | null;
+  cache_source: string | null;
+  request_type: string | null;
+  source_format: string | null;
+  target_format: string | null;
+  api_key_id: string | null;
+  api_key_name: string | null;
+  combo_name: string | null;
+  combo_step_id: string | null;
+  combo_execution_key: string | null;
+  error_summary: string | null;
+  detail_state: string | null;
+  artifact_relpath: string | null;
+  artifact_size_bytes: number | null;
+  artifact_sha256: string | null;
+  has_request_body: number | null;
+  has_response_body: number | null;
+  has_pipeline_details: number | null;
+  request_summary: string | null;
+  provider_node_name?: string | null;
+  provider_node_prefix?: string | null;
+  resolved_account?: string | null;
+  correlation_id?: string | null;
+  model_pinned?: number | null;
+  session_tag?: string | null;
+  client_session_id?: string | null;
+  resilience_actions?: string | null;
+  has_content?: number | null;
+  usage_provenance?: string | null;
 };
 
-function asRecord(value: unknown): JsonRecord {
-  return value && typeof value === "object" && !Array.isArray(value) ? (value as JsonRecord) : {};
-}
+export const RESOLVED_ACCOUNT_SQL =
+  "COALESCE(NULLIF(pc.name, ''), NULLIF(pc.email, ''), cl.account)";
 
-function toNumber(value: unknown): number {
-  if (typeof value === "number" && Number.isFinite(value)) return value;
-  if (typeof value === "string" && value.trim().length > 0) {
-    const parsed = Number(value);
-    return Number.isFinite(parsed) ? parsed : 0;
-  }
-  return 0;
-}
+const CALL_LOG_ID_RETRY_LIMIT = 3;
 
-function toStringOrNull(value: unknown): string | null {
-  return typeof value === "string" && value.trim().length > 0 ? value : null;
-}
-
-function hasTruncatedFlag(value: unknown): boolean {
-  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
-  return (value as Record<string, unknown>)._truncated === true;
-}
-
-function sanitizeErrorForLog(error: unknown): unknown {
-  if (error === null || error === undefined) return null;
-  if (typeof error === "string") return sanitizePII(error).text;
-  if (error instanceof Error) {
-    return {
-      message: sanitizePII(error.message).text,
-      stack: sanitizePII(error.stack || "").text || undefined,
-      name: error.name,
-    };
-  }
-  return protectPayloadForLog(error);
-}
-
-function toStoredErrorString(error: unknown): string | null {
-  const sanitized = sanitizeErrorForLog(error);
-  if (sanitized === null || sanitized === undefined) return null;
-  if (typeof sanitized === "string") return sanitized;
-  try {
-    return JSON.stringify(sanitized);
-  } catch {
-    return String(sanitized);
-  }
-}
-
-function protectPipelinePayloads(payloads: unknown): RequestPipelinePayloads | null {
-  if (!payloads || typeof payloads !== "object") return null;
-
-  const protectedPayloads: RequestPipelinePayloads = {};
-  for (const [key, value] of Object.entries(payloads as JsonRecord)) {
-    if (value === null || value === undefined) {
-      continue;
-    }
-
-    if (key === "streamChunks" && value && typeof value === "object") {
-      const chunks = value as Record<string, unknown>;
-      const compacted = Object.fromEntries(
-        Object.entries(chunks).filter(
-          ([, chunkValue]) => Array.isArray(chunkValue) && chunkValue.length > 0
-        )
-      );
-      if (Object.keys(compacted).length > 0) {
-        protectedPayloads.streamChunks = protectPayloadForLog(
-          compacted
-        ) as RequestPipelinePayloads["streamChunks"];
-      }
-      continue;
-    }
-
-    protectedPayloads[key as keyof RequestPipelinePayloads] = protectPayloadForLog(value) as never;
-  }
-
-  return Object.keys(protectedPayloads).length > 0 ? protectedPayloads : null;
-}
-
-let logIdCounter = 0;
 function generateLogId() {
-  logIdCounter++;
-  return `${Date.now()}-${logIdCounter}`;
+  return globalThis.crypto.randomUUID();
+}
+
+function isCallLogIdCollision(error: unknown): boolean {
+  if (!error || typeof error !== "object") return false;
+  const code = String((error as { code?: unknown }).code ?? "");
+  const msg = String((error as { message?: unknown }).message ?? "");
+  if (/SQLITE_CONSTRAINT_PRIMARYKEY/i.test(code)) return true;
+  if (/SQLITE_CONSTRAINT_UNIQUE/i.test(code) && /call_logs\.id/i.test(msg)) return true;
+  return /UNIQUE constraint failed: call_logs\.id/i.test(msg);
+}
+
+// TTFT is only meaningful when measured and non-negative; normalize anything
+// else (undefined/NaN/negative) to the column's "not tracked" state.
+function toNullableTtftMs(value: unknown): number | null {
+  const n = Number(value);
+  return Number.isFinite(n) && n >= 0 ? Math.round(n) : null;
 }
 
 async function resolveAccountName(connectionId: string | null | undefined) {
@@ -156,11 +182,15 @@ async function resolveAccountName(connectionId: string | null | undefined) {
   }
 
   try {
-    const { getProviderConnections } = await import("@/lib/localDb");
+    const { getProviderConnections } = await import("@/lib/db/providers");
     const connections = await getProviderConnections();
     const conn = connections.find((item) => item.id === connectionId);
     if (conn) {
-      account = pickMaskedDisplayValue([conn.name, conn.email], account);
+      account = pickDisplayValue(
+        [toStringOrNull(conn.name), toStringOrNull(conn.email)],
+        true,
+        account
+      );
     }
   } catch {
     // Best-effort lookup only.
@@ -169,13 +199,25 @@ async function resolveAccountName(connectionId: string | null | undefined) {
   return account;
 }
 
-function buildArtifactRelativePath(timestamp: string, id: string) {
-  const parsed = new Date(timestamp);
-  const safeTimestamp = (
-    Number.isNaN(parsed.getTime()) ? new Date().toISOString() : parsed.toISOString()
-  ).replace(/[:]/g, "-");
-  const dateFolder = safeTimestamp.slice(0, 10);
-  return path.posix.join(dateFolder, `${safeTimestamp}_${id}.json`);
+async function resolveProviderPrefix(providerId: string): Promise<string | null> {
+  if (!providerId) return null;
+  try {
+    const { getProviderNodeById } = await import("@/lib/db/providers");
+    const node = await getProviderNodeById(providerId);
+    if (node && typeof node.prefix === "string" && node.prefix.trim().length > 0) {
+      return node.prefix.trim();
+    }
+  } catch {
+    // Best-effort lookup only.
+  }
+  return null;
+}
+
+function isCompatibleProviderId(providerId: string | null): boolean {
+  if (!providerId) return false;
+  return (
+    providerId.startsWith("openai-compatible-") || providerId.startsWith("anthropic-compatible-")
+  );
 }
 
 function buildArtifact(
@@ -196,12 +238,15 @@ function buildArtifact(
     tokensCacheRead: number | null;
     tokensCacheCreation: number | null;
     tokensReasoning: number | null;
+    tokensCompressed: number | null;
     requestType: string | null;
     sourceFormat: string | null;
     targetFormat: string | null;
     apiKeyId: string | null;
     apiKeyName: string | null;
     comboName: string | null;
+    comboStepId: string | null;
+    comboExecutionKey: string | null;
   },
   requestBody: unknown,
   responseBody: unknown,
@@ -209,7 +254,7 @@ function buildArtifact(
   pipelinePayloads: RequestPipelinePayloads | null
 ): CallLogArtifact {
   return {
-    schemaVersion: 3,
+    schemaVersion: 5,
     summary: {
       id: logEntry.id,
       timestamp: logEntry.timestamp,
@@ -228,6 +273,7 @@ function buildArtifact(
         cacheRead: logEntry.tokensCacheRead,
         cacheWrite: logEntry.tokensCacheCreation,
         reasoning: logEntry.tokensReasoning,
+        compressed: logEntry.tokensCompressed,
       },
       requestType: logEntry.requestType,
       sourceFormat: logEntry.sourceFormat,
@@ -235,6 +281,8 @@ function buildArtifact(
       apiKeyId: logEntry.apiKeyId,
       apiKeyName: logEntry.apiKeyName,
       comboName: logEntry.comboName,
+      comboStepId: logEntry.comboStepId,
+      comboExecutionKey: logEntry.comboExecutionKey,
     },
     requestBody: requestBody ?? null,
     responseBody: responseBody ?? null,
@@ -243,307 +291,818 @@ function buildArtifact(
   };
 }
 
-function writeCallArtifact(artifact: CallLogArtifact): string | null {
-  if (!CALL_LOGS_DIR) return null;
-
-  const relPath = buildArtifactRelativePath(artifact.summary.timestamp, artifact.summary.id);
-  const absPath = path.join(CALL_LOGS_DIR, relPath);
-
-  try {
-    fs.mkdirSync(path.dirname(absPath), { recursive: true });
-    fs.writeFileSync(absPath, JSON.stringify(artifact, null, 2));
-    rotateCallLogs();
-    return relPath;
-  } catch (error) {
-    console.error("[callLogs] Failed to write request artifact:", (error as Error).message);
-    return null;
+// #6187: extract the assistant message from a chat-completion-shaped response
+// body so we can inspect its reasoning_content / <think> content.
+function extractAssistantMessage(responseBody: unknown): unknown {
+  if (!responseBody || typeof responseBody !== "object") return responseBody;
+  const choices = (responseBody as JsonRecord).choices;
+  if (Array.isArray(choices) && choices.length > 0) {
+    const first = choices[0] as JsonRecord;
+    return first?.message ?? first?.delta ?? first;
   }
+  return responseBody;
 }
 
-function readArtifactFromDisk(relativePath: string | null) {
-  if (!CALL_LOGS_DIR || !relativePath) return null;
-
-  try {
-    const absPath = path.join(CALL_LOGS_DIR, relativePath);
-    if (!fs.existsSync(absPath)) return null;
-    return JSON.parse(fs.readFileSync(absPath, "utf8")) as CallLogArtifact;
-  } catch (error) {
-    console.error("[callLogs] Failed to read request artifact:", (error as Error).message);
-    return null;
-  }
+// #6187: decide the reasoning SOURCE and (char-only) count recorded alongside
+// the usage-derived tokens_reasoning. Usage is authoritative when it reports
+// non-zero reasoning tokens; otherwise we fall back to observed reasoning
+// content so "reasoned but metered 0" stays distinguishable. reasoning_chars is
+// a CHARACTER count, never a token count — it must not touch cost math.
+//
+// Encrypted-reasoning observability: an opaque Responses `reasoning` item
+// (`encrypted_content` / signature / format, no readable summary) overrides
+// every other source with 'encrypted'. The sink-side scan covers non-streaming
+// snapshots and batch-completed-without-added payloads; the streaming path
+// threads the same signal via `entry.reasoningMeta` (flag + wall-clock delta).
+// NEVER inspect or persist the opaque blob itself — presence only.
+function snapshotHasOpaqueReasoningItem(body: unknown): boolean {
+  const record =
+    body !== null && typeof body === "object" && !Array.isArray(body) ? (body as JsonRecord) : null;
+  if (!record) return false;
+  const nested =
+    record.response !== null &&
+    typeof record.response === "object" &&
+    !Array.isArray(record.response)
+      ? (record.response as JsonRecord)
+      : null;
+  // Array literals, not push(...): no-log attempts pass the live body, and a spread
+  // into call arguments overflows the stack past roughly 125k items.
+  const outputs: unknown[] = [
+    ...(Array.isArray(record.output) ? record.output : []),
+    ...(nested && Array.isArray(nested.output) ? nested.output : []),
+  ];
+  return outputs.some((item) => {
+    const itemRecord =
+      item !== null && typeof item === "object" && !Array.isArray(item)
+        ? (item as JsonRecord)
+        : null;
+    if (!itemRecord || itemRecord.type !== "reasoning") return false;
+    return (
+      (typeof itemRecord.encrypted_content === "string" &&
+        itemRecord.encrypted_content.length > 0) ||
+      itemRecord.signature !== undefined ||
+      itemRecord.format !== undefined
+    );
+  });
 }
 
-function readLegacyLogFromDisk(entry: {
-  timestamp: string | null;
-  model: string | null;
-  status: number;
-}) {
-  if (!CALL_LOGS_DIR || !entry.timestamp) return null;
-
-  try {
-    const date = new Date(entry.timestamp);
-    if (Number.isNaN(date.getTime())) return null;
-
-    const dateFolder = `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(
-      2,
-      "0"
-    )}-${String(date.getDate()).padStart(2, "0")}`;
-    const dir = path.join(CALL_LOGS_DIR, dateFolder);
-    if (!fs.existsSync(dir)) return null;
-
-    const time = `${String(date.getHours()).padStart(2, "0")}${String(date.getMinutes()).padStart(
-      2,
-      "0"
-    )}${String(date.getSeconds()).padStart(2, "0")}`;
-    const safeModel = (entry.model || "unknown").replace(/[/:]/g, "-");
-    const expectedName = `${time}_${safeModel}_${entry.status}.json`;
-
-    const exactPath = path.join(dir, expectedName);
-    if (fs.existsSync(exactPath)) {
-      return JSON.parse(fs.readFileSync(exactPath, "utf8"));
-    }
-
-    const files = fs
-      .readdirSync(dir)
-      .filter((file) => file.startsWith(time) && file.endsWith(`_${entry.status}.json`));
-    if (files.length > 0) {
-      return JSON.parse(fs.readFileSync(path.join(dir, files[0]), "utf8"));
-    }
-  } catch (error) {
-    console.error("[callLogs] Failed to read legacy disk log:", (error as Error).message);
+function resolveReasoningObservation(
+  usageReasoning: number | null,
+  responseBody: unknown,
+  streamMeta?: {
+    encryptedSeen?: boolean;
+    snapshotSource?: string | null;
+    snapshotChars?: number | null;
+  } | null
+): { source: string | null; chars: number | null } {
+  if (
+    streamMeta?.encryptedSeen === true ||
+    streamMeta?.snapshotSource === "encrypted" ||
+    snapshotHasOpaqueReasoningItem(responseBody)
+  ) {
+    return { source: "encrypted", chars: null };
   }
-
-  return null;
+  if (usageReasoning != null && usageReasoning > 0) {
+    return { source: "usage", chars: null };
+  }
+  // A no-log request keeps only scalars from its live response, not a cloned body.
+  if (
+    (streamMeta?.snapshotSource === "content" || streamMeta?.snapshotSource === "think") &&
+    typeof streamMeta.snapshotChars === "number" &&
+    streamMeta.snapshotChars > 0
+  ) {
+    return { source: streamMeta.snapshotSource, chars: streamMeta.snapshotChars };
+  }
+  const observed = getObservedReasoning(extractAssistantMessage(responseBody));
+  if (observed.chars > 0) {
+    return { source: observed.source, chars: observed.chars };
+  }
+  return { source: null, chars: null };
 }
 
-function cleanupEmptyCallLogDirs() {
-  if (!CALL_LOGS_DIR || !fs.existsSync(CALL_LOGS_DIR)) return;
+/**
+ * Read numerical reasoning observations from the live response before a no-log
+ * attempt drops its payload. Never retain content or encrypted reasoning blobs.
+ */
+export function captureReasoningSnapshotMeta(responseBody: unknown): {
+  snapshotSource: string | null;
+  snapshotChars: number | null;
+} {
+  const { source, chars } = resolveReasoningObservation(null, responseBody);
+  return { snapshotSource: source, snapshotChars: chars };
+}
 
+function hasCallLogsColumn(columnName: string): boolean {
+  // One PRAGMA per INSERT is wasteful; the cached answer is invalidated only
+  // when a write fails with "no such column" (concurrent migration race).
+  const cached = (hasCallLogsColumn as { cache?: Map<string, boolean> }).cache;
+  if (cached?.has(columnName)) return cached.get(columnName) as boolean;
   try {
-    for (const entry of fs.readdirSync(CALL_LOGS_DIR)) {
-      const entryPath = path.join(CALL_LOGS_DIR, entry);
-      const stat = fs.statSync(entryPath);
-      if (!stat.isDirectory()) continue;
-      if (fs.readdirSync(entryPath).length === 0) {
-        fs.rmSync(entryPath, { recursive: true, force: true });
-      }
-    }
+    const db = getDbInstance();
+    const rows = db.prepare("PRAGMA table_info(call_logs)").all() as Array<{ name?: string }>;
+    const found = rows.some((row) => row.name === columnName);
+    const map = cached ?? new Map<string, boolean>();
+    map.set(columnName, found);
+    (hasCallLogsColumn as { cache?: Map<string, boolean> }).cache = map;
+    return found;
   } catch {
-    // Best effort only.
+    return false;
   }
 }
 
-export function cleanupOverflowCallLogFiles(baseDir = CALL_LOGS_DIR, maxEntries?: number) {
-  if (!baseDir || !fs.existsSync(baseDir)) return;
+export function invalidateCallLogsColumnCache(): void {
+  (hasCallLogsColumn as { cache?: Map<string, boolean> }).cache = undefined;
+}
 
-  const limit = maxEntries ?? getCallLogMaxEntries();
-  if (!Number.isInteger(limit) || limit < 1) return;
+export { parseResilienceActions };
 
+function mapSummaryRow(row: CallLogSummaryRow) {
+  const detailState = normalizeDetailState(row.detail_state);
+  const provider = row.provider;
+  const nodeName = row.provider_node_name ?? null;
+  const nodePrefix = row.provider_node_prefix ?? null;
+  const requestSummary = row.request_summary ? parseStoredPayload(row.request_summary) : null;
+  const upstreamHttp = parseUpstreamHttp(
+    requestSummary && typeof requestSummary === "object"
+      ? (requestSummary as Record<string, unknown>).upstreamHttp
+      : null
+  );
+  return {
+    id: row.id,
+    timestamp: row.timestamp,
+    method: row.method,
+    path: row.path,
+    status: toNumber(row.status),
+    model: row.model,
+    requestedModel: applyNodePrefix(row.requested_model, provider, nodePrefix),
+    provider,
+    providerDisplay: resolveProviderDisplay(provider, nodeName, nodePrefix),
+    account: row.resolved_account || row.account,
+    connectionId: row.connection_id,
+    duration: toNumber(row.duration),
+    ttft: row.ttft_ms != null ? toNumber(row.ttft_ms) : null,
+    tokens: {
+      in: toNumber(row.tokens_in),
+      out: toNumber(row.tokens_out),
+      cacheRead: row.tokens_cache_read != null ? toNumber(row.tokens_cache_read) : null,
+      cacheWrite: row.tokens_cache_creation != null ? toNumber(row.tokens_cache_creation) : null,
+      reasoning: row.tokens_reasoning != null ? toNumber(row.tokens_reasoning) : null,
+      compressed: row.tokens_compressed != null ? toNumber(row.tokens_compressed) : null,
+    },
+    cacheSource: row.cache_source || "upstream",
+    cacheWriteUsage: storedCacheWriteUsage(
+      row.tokens_cache_creation,
+      row.tokens_cache_creation_5m,
+      row.tokens_cache_creation_1h,
+      row.cache_creation_tier_status
+    ),
+    cacheWriteEstimate: {
+      knownTierCostUsd: row.cache_write_cost_usd ?? null,
+      pricedTokens: row.cache_write_priced_tokens ?? 0,
+      source: "api-equivalent-estimate" as const,
+    },
+    // #6187/#13965: observed reasoning (source + CHARACTER count, never tokens) so the
+    // detail view can tell "reasoned but not metered" apart from "did not reason".
+    reasoningSource: row.reasoning_source ?? null,
+    reasoningChars: row.reasoning_chars != null ? toNumber(row.reasoning_chars) : null,
+    hasContent: row.has_content ?? null,
+    usageProvenance: row.usage_provenance ?? null,
+    requestType: row.request_type,
+    sourceFormat: row.source_format,
+    targetFormat: row.target_format,
+    apiKeyId: row.api_key_id,
+    apiKeyName: row.api_key_name,
+    comboName: row.combo_name,
+    comboStepId: row.combo_step_id,
+    comboExecutionKey: row.combo_execution_key,
+    error: row.error_summary,
+    detailState,
+    artifactRelPath: row.artifact_relpath,
+    artifactSizeBytes: row.artifact_size_bytes,
+    artifactSha256: row.artifact_sha256,
+    requestSummary,
+    upstreamHttp,
+    hasRequestBody: toNumber(row.has_request_body) === 1,
+    hasResponseBody: toNumber(row.has_response_body) === 1,
+    hasPipelineDetails: toNumber(row.has_pipeline_details) === 1,
+    correlationId: row.correlation_id || null,
+    modelPinned: toNumber(row.model_pinned) === 1,
+    sessionTag: row.session_tag || null,
+    clientSessionId: row.client_session_id || null,
+    resilienceActions: parseResilienceActions(row.resilience_actions ?? null),
+  };
+}
+
+async function saveCallLogOperation(entry: any, metadataOnly = false): Promise<void> {
   try {
-    const files = fs
-      .readdirSync(baseDir)
-      .flatMap((entry) => {
-        const entryPath = path.join(baseDir, entry);
-        try {
-          const stat = fs.statSync(entryPath);
-          if (!stat.isDirectory()) return [];
-
-          return fs
-            .readdirSync(entryPath)
-            .filter((file) => file.endsWith(".json"))
-            .map((file) => {
-              const filePath = path.join(entryPath, file);
-              const fileStat = fs.statSync(filePath);
-              return { filePath, mtimeMs: fileStat.mtimeMs };
-            });
-        } catch {
-          return [];
-        }
-      })
-      .sort((a, b) => b.mtimeMs - a.mtimeMs);
-
-    for (const file of files.slice(limit)) {
+    let prepared: PreparedCallLogRow;
+    try {
+      prepared = await buildCallLogRow(entry, metadataOnly);
+    } catch (error) {
+      logCallLogSaveFailure(error);
+      return;
+    }
+    let inserted = false;
+    try {
+      insertCallLogRow(prepared);
+      inserted = true;
+    } catch (error) {
+      if (!isWriteLockError(error)) {
+        logCallLogSaveFailure(error);
+        return;
+      }
+      const retry = scheduleWriteRetry(() => {
+        insertCallLogRow(prepared);
+        inserted = true;
+      }, logCallLogSaveFailure);
+      pendingCallLogSaves.add(retry);
       try {
-        fs.rmSync(file.filePath, { force: true });
-      } catch {
-        // Best effort only.
+        await retry;
+      } finally {
+        pendingCallLogSaves.delete(retry);
       }
     }
+    if (!inserted) return;
+    markRequestPersistedById(
+      entry.pendingRequestId,
+      entry.pendingRequestGeneration,
+      String(prepared.logEntry.id)
+    );
+    try {
+      await publishCallLogDetail(prepared);
+    } catch (error) {
+      logCallLogSaveFailure(error);
+    }
+  } finally {
+    // Clear a temporary continuation even if the row or artifact cannot be written.
+    // Metadata-only summaries must not invalidate a full response's bridge.
+    if (!metadataOnly && typeof entry?.responseId === "string" && entry.responseId.length > 0) {
+      clearPendingContinuationState(entry.responseId);
+    }
+  }
+}
 
-    cleanupEmptyCallLogDirs();
-  } catch (error) {
-    console.error(
-      "[callLogs] Failed to prune overflow request artifacts:",
-      (error as Error).message
+type PreparedCallLogRow = {
+  metadataOnly: boolean;
+  db: ReturnType<typeof getDbInstance>;
+  logEntry: Record<string, unknown>;
+  insertParams: Record<string, unknown>;
+  hasResilienceColumn: boolean;
+  /** Builds the artifact from the row's FINAL id; null when no detail is expected. */
+  buildDetailArtifact: (() => ReturnType<typeof buildArtifact>) | null;
+};
+
+function logCallLogSaveFailure(error: unknown): void {
+  if (String((error as Error)?.message ?? error).includes("no such column")) {
+    invalidateCallLogsColumnCache();
+  }
+  console.error(
+    "[callLogs] Failed to save call log:",
+    sanitizeErrorMessage(error) || "Call log persistence failed"
+  );
+}
+
+async function buildCallLogRow(entry: any, metadataOnly = false): Promise<PreparedCallLogRow> {
+  // Bind before any await: a reset must never redirect this request or its retry
+  // into a replacement database (#12780). Closed handles fail normally.
+  const db = getDbInstance();
+  const apiKeyContext = getCallLogApiKeyContext();
+  // `||` (not `??`): an empty-string apiKeyId/apiKeyName is "unattributed",
+  // same as before this fallback existed — it must not be persisted verbatim
+  // nor block the request-scoped context.
+  const apiKeyId = entry.apiKeyId || apiKeyContext?.apiKeyId || null;
+  const apiKeyName = entry.apiKeyName || apiKeyContext?.apiKeyName || null;
+  const connectionId = metadataOnly
+    ? (entry.connectionId ?? null)
+    : entry.connectionId || apiKeyContext?.connectionId || null;
+  const noLogEnabled = Boolean(entry.noLog) || (apiKeyId ? isNoLog(apiKeyId) : false);
+
+  const protectedRequestBody = noLogEnabled ? null : protectPayloadForLog(entry.requestBody);
+  const responseStatus = Number(entry.status);
+  const failedResponse = Number.isFinite(responseStatus) && responseStatus >= 400;
+  const protectedResponseBody = noLogEnabled
+    ? null
+    : failedResponse
+      ? protectErrorPayloadForLog(entry.responseBody)
+      : protectPayloadForLog(entry.responseBody);
+  const protectedPipelinePayloads = noLogEnabled
+    ? null
+    : protectPipelinePayloads(
+        entry.pipelinePayloads ?? entry.pipeline ?? null,
+        failedResponse ? responseStatus : undefined
+      );
+  const protectedError = sanitizeErrorForLog(entry.error);
+
+  // Bridges the window before this row's own artifact write (queued below,
+  // async) lands with detail_state = 'ready': a client that fires its next
+  // turn immediately -- normal in a tight tool-calling loop -- can reach
+  // resolvePreviousResponseState before that write exists at all. Seeded
+  // synchronously, before any await, from the same protected pipeline
+  // payload the artifact will eventually hold (and the same
+  // videoContentRemoved/fail-closed rules), so it is available the instant
+  // this function is called. See responsesContinuationStore.ts.
+  if (!metadataOnly && typeof entry.responseId === "string" && entry.responseId.length > 0) {
+    seedPendingContinuationState(
+      entry.responseId,
+      apiKeyId,
+      // The store's own contract, not a looser restatement of it: the inline shape
+      // widened both fields to `unknown`, which does not assign to
+      // ContinuationPipeline's typed members (TS2345 under typecheck:core).
+      protectedPipelinePayloads as ContinuationPipeline | null,
+      Boolean(entry.videoContentRemoved)
     );
   }
+
+  // resilience resilience summary for this attempt (implicit ALS store opened
+  // around the attempt; null outside a store or when nothing was noted).
+  // Read BEFORE any await: the ALS context is synchronous and later awaits
+  // (resolveAccountName, artifact write) may cross async boundaries.
+  const resilienceActions = metadataOnly ? null : serializeResilienceActions();
+  const hasResilienceColumn = hasCallLogsColumn("resilience_actions");
+
+  const account = await resolveAccountName(connectionId);
+  const rawProvider: string = entry.provider || "-";
+  const rawRequestedModel: string | null = entry.requestedModel || null;
+  let resolvedRequestedModel = rawRequestedModel;
+  if (rawRequestedModel && isCompatibleProviderId(rawProvider)) {
+    const nodePrefix = await resolveProviderPrefix(rawProvider);
+    resolvedRequestedModel = applyNodePrefix(rawRequestedModel, rawProvider, nodePrefix);
+  }
+  // #6187: usage-derived reasoning tokens stay UNCHANGED (cost math reads this),
+  // while reasoning source/char-count are recorded separately for observability.
+  const tokensReasoning = getReasoningTokensOrNull(entry.tokens);
+  const streamReasoningMeta =
+    entry.reasoningMeta !== null && typeof entry.reasoningMeta === "object"
+      ? (entry.reasoningMeta as { encryptedSeen?: boolean; durationMs?: unknown })
+      : null;
+  const reasoningObservation = metadataOnly
+    ? { source: null, chars: null }
+    : resolveReasoningObservation(tokensReasoning, entry.responseBody, streamReasoningMeta);
+  // Encrypted-reasoning observability (nullable, additive): stream-side
+  // flag+duration win when present; the sink scan above already forced
+  // source='encrypted' for opaque snapshots (duration NULL there).
+  const streamDurationRaw = streamReasoningMeta?.durationMs;
+  const streamDurationMs =
+    typeof streamDurationRaw === "number" &&
+    Number.isFinite(streamDurationRaw) &&
+    streamDurationRaw >= 0 &&
+    streamDurationRaw <= 86_400_000
+      ? Math.round(streamDurationRaw)
+      : null;
+  const reasoningEncrypted =
+    streamReasoningMeta?.encryptedSeen === true || reasoningObservation.source === "encrypted"
+      ? 1
+      : null;
+  const reasoningDurationMs = reasoningObservation.source === "encrypted" ? streamDurationMs : null;
+  const readEffortValue = (body: unknown): string | null => {
+    if (body === null || typeof body !== "object" || Array.isArray(body)) return null;
+    const record = body as Record<string, unknown>;
+    const direct = record.reasoning_effort;
+    if (typeof direct === "string" && direct.trim().length > 0) return direct;
+    const nested = record.reasoning;
+    if (nested !== null && typeof nested === "object" && !Array.isArray(nested)) {
+      const effort = (nested as Record<string, unknown>).effort;
+      if (typeof effort === "string" && effort.trim().length > 0) return effort;
+    }
+    return null;
+  };
+  const reasoningEffortRequested =
+    reasoningObservation.source === "encrypted"
+      ? readEffortValue(entry.clientRequestBody ?? entry.requestBody)
+      : null;
+  const reasoningEffortUpstream =
+    reasoningObservation.source === "encrypted" ? readEffortValue(entry.upstreamRequestBody) : null;
+  const errorType = toStoredErrorType(
+    classifyCallLogError(entry.status, entry.error, entry.provider)
+  );
+  // Rendered-content presence plus usage provenance: success-only, additive,
+  // nullable. A 2xx is a success even with token counts at zero, so the
+  // success bound is 200-299 (not <400).
+  const numericStatus = Number(entry.status);
+  const isSuccess = Number.isFinite(numericStatus) && numericStatus >= 200 && numericStatus < 300;
+  const clientVisibleBody =
+    entry.clientResponse ??
+    (entry.pipelinePayloads as { clientResponse?: unknown } | null | undefined)?.clientResponse ??
+    (entry.pipeline as { clientResponse?: unknown } | null | undefined)?.clientResponse ??
+    entry.responseBody;
+  const measurableContent =
+    isSuccess && !noLogEnabled && !isNonTextRequest(entry.requestType, entry.path ?? entry.method);
+  const renderedContent = measurableContent ? hasRenderedContent(clientVisibleBody) : null;
+  const hasContent = renderedContent === null ? null : renderedContent ? 1 : 0;
+  const usageProvenance = metadataOnly
+    ? null
+    : resolveUsageProvenance({
+        usageEstimated: entry.usageEstimated === true,
+        tokens: entry.tokens,
+        isSuccess,
+      });
+  const cacheWriteUsage = readCacheWriteUsage(entry.tokens);
+  let cacheWriteEstimate = estimateApiEquivalentCacheWrite(null, cacheWriteUsage, {
+    provider: rawProvider,
+    model: entry.model || "",
+  });
+  if (cacheWriteUsage.fiveMinute !== null || cacheWriteUsage.oneHour !== null) {
+    try {
+      cacheWriteEstimate = estimateApiEquivalentCacheWrite(
+        await getPricingForModel(rawProvider, entry.model || ""),
+        cacheWriteUsage,
+        {
+          provider: rawProvider,
+          model: entry.model || "",
+          inputTokens: getLoggedInputTokens(entry.tokens),
+        }
+      );
+    } catch {
+      // Diagnostic pricing is optional; a lookup failure must not discard usage.
+    }
+  }
+  const logEntry = {
+    id: typeof entry.id === "string" && entry.id.length > 0 ? entry.id : generateLogId(),
+    timestamp: typeof entry.timestamp === "string" ? entry.timestamp : new Date().toISOString(),
+    method: entry.method || "POST",
+    path: entry.path || "/v1/chat/completions",
+    status: entry.status || 0,
+    errorType,
+    model: entry.model || "-",
+    requestedModel: resolvedRequestedModel,
+    provider: rawProvider,
+    account,
+    connectionId,
+    duration: entry.duration || 0,
+    // #13130: TTFT (ms to first forwarded stream chunk) when the streaming
+    // pipeline measured it; null for non-streaming rows. The dashboard TPS
+    // divides by duration - ttft so queueing/prefill wait does not drag the
+    // reported generation rate down.
+    ttftMs: toNullableTtftMs(entry.ttftMs ?? entry.ttft),
+    tokensIn: toNumber(getLoggedInputTokens(entry.tokens)),
+    tokensOut: toNumber(getLoggedOutputTokens(entry.tokens)),
+    tokensCacheRead: getPromptCacheReadTokensOrNull(entry.tokens),
+    tokensCacheCreation: cacheWriteUsage.total,
+    tokensCacheCreation5m: cacheWriteUsage.fiveMinute,
+    tokensCacheCreation1h: cacheWriteUsage.oneHour,
+    cacheCreationTierStatus: cacheWriteUsage.status,
+    cacheWriteCostUsd: cacheWriteEstimate.knownTierCostUsd,
+    cacheWritePricedTokens: cacheWriteEstimate.pricedTokens,
+    tokensReasoning,
+    reasoningSource: reasoningObservation.source,
+    reasoningChars: reasoningObservation.chars,
+    reasoningDurationMs,
+    reasoningEffortRequested,
+    reasoningEffortUpstream,
+    reasoningEncrypted,
+    tokensCompressed: entry.tokensCompressed != null ? toNumber(entry.tokensCompressed) : null,
+    cacheSource: entry.cacheSource === "semantic" ? "semantic" : "upstream",
+    requestType: entry.requestType || null,
+    sourceFormat: entry.sourceFormat || null,
+    targetFormat: entry.targetFormat || null,
+    apiKeyId,
+    apiKeyName,
+    comboName: entry.comboName || null,
+    comboStepId: toStringOrNull(entry.comboStepId),
+    comboExecutionKey: toStringOrNull(entry.comboExecutionKey) || toStringOrNull(entry.comboStepId),
+    correlationId: entry.correlationId || null,
+    // Ms of pacing/park wait imposed before dispatch (null = none).
+    addedWaitMs:
+      typeof entry.addedWaitMs === "number" && Number.isFinite(entry.addedWaitMs)
+        ? entry.addedWaitMs
+        : null,
+    addedWaitCause: toStringOrNull(entry.addedWaitCause),
+    // Ms this execution waited from start to the first upstream dispatch
+    // (migration 224). Null when nothing was dispatched (rejected before egress).
+    queueWaitMs:
+      typeof entry.queueWaitMs === "number" &&
+      Number.isFinite(entry.queueWaitMs) &&
+      entry.queueWaitMs >= 0
+        ? entry.queueWaitMs
+        : null,
+    modelPinned: entry.modelPinned ? 1 : 0,
+    sessionTag: entry.sessionTag || null,
+    // The client's own session id (call_logs.client_session_id, migration 214); NULL for
+    // writers that have no client request to read it from.
+    clientSessionId: toStringOrNull(entry.clientSessionId)?.slice(0, 128) || null,
+    // OpenAI Responses API response id, when this attempt produced one --
+    // indexed so a later request's `previous_response_id` can resolve
+    // this row's artifact for OmniRoute-native continuation. See
+    // src/lib/db/responsesContinuationStore.ts.
+    responseId: typeof entry.responseId === "string" ? entry.responseId : null,
+    // Second redaction surface for #12150: 1 when this request's persisted client snapshot had
+    // its video transcript cues structurally redacted, so
+    // resolvePreviousResponseState refuses to rehydrate it as continuation
+    // history. See src/lib/db/responsesContinuationStore.ts.
+    videoContentRemoved: entry.videoContentRemoved ? 1 : 0,
+    hasContent,
+    usageProvenance,
+  };
+
+  const legacySummary = buildRequestSummary(logEntry.requestType, protectedRequestBody);
+  const upstreamHttp = parseUpstreamHttp(entry.upstreamHttp);
+  const requestSummary = noLogEnabled
+    ? null
+    : upstreamHttp
+      ? JSON.stringify({ ...(legacySummary ? JSON.parse(legacySummary) : {}), upstreamHttp })
+      : legacySummary;
+  const detailExpected =
+    !metadataOnly &&
+    !noLogEnabled &&
+    (protectedRequestBody !== null ||
+      protectedResponseBody !== null ||
+      protectedError !== null ||
+      protectedPipelinePayloads !== null);
+
+  // The row is inserted BEFORE its artifact is written: the artifact path is
+  // derived from (timestamp, id), so the id must be final — i.e. accepted by
+  // the UNIQUE primary key — before any file is published. Writing first and
+  // regenerating the id afterwards let a repeated explicit id + timestamp
+  // overwrite an earlier row's artifact. Pending is a durable export barrier;
+  // a failed or abandoned write becomes terminal missing instead.
+  const detailState: CallLogDetailState = detailExpected ? "pending" : "none";
+  const detailPendingUntil = detailExpected ? Date.now() + 5 * 60_000 : null;
+
+  const insertParams = {
+    ...logEntry,
+    errorSummary: toStoredErrorSummary(protectedError),
+    detailState,
+    detailPendingUntil,
+    artifactRelPath: null,
+    artifactSizeBytes: null,
+    artifactSha256: null,
+    hasRequestBody: protectedRequestBody !== null ? 1 : 0,
+    hasResponseBody: protectedResponseBody !== null ? 1 : 0,
+    resilienceActions,
+    hasPipelineDetails: protectedPipelinePayloads ? 1 : 0,
+    requestSummary,
+  };
+  return {
+    metadataOnly,
+    db,
+    logEntry,
+    insertParams,
+    hasResilienceColumn,
+    buildDetailArtifact: detailExpected
+      ? () =>
+          buildArtifact(
+            logEntry,
+            protectedRequestBody,
+            protectedResponseBody,
+            protectedError,
+            protectedPipelinePayloads
+          )
+      : null,
+  };
 }
 
-export async function saveCallLog(entry: any) {
-  if (!shouldPersistToDisk) return;
-
-  try {
-    const apiKeyId = entry.apiKeyId || null;
-    const noLogEnabled = Boolean(entry.noLog) || (apiKeyId ? isNoLog(apiKeyId) : false);
-
-    const protectedRequestBody = noLogEnabled ? null : protectPayloadForLog(entry.requestBody);
-    const protectedResponseBody = noLogEnabled ? null : protectPayloadForLog(entry.responseBody);
-    const protectedPipelinePayloads = noLogEnabled
-      ? null
-      : protectPipelinePayloads(entry.pipelinePayloads ?? entry.pipeline ?? null);
-    const protectedError = sanitizeErrorForLog(entry.error);
-
-    const account = await resolveAccountName(entry.connectionId || null);
-
-    const logEntry = {
-      id: typeof entry.id === "string" && entry.id.length > 0 ? entry.id : generateLogId(),
-      timestamp: typeof entry.timestamp === "string" ? entry.timestamp : new Date().toISOString(),
-      method: entry.method || "POST",
-      path: entry.path || "/v1/chat/completions",
-      status: entry.status || 0,
-      model: entry.model || "-",
-      requestedModel: entry.requestedModel || null,
-      provider: entry.provider || "-",
-      account,
-      connectionId: entry.connectionId || null,
-      duration: entry.duration || 0,
-      tokensIn: toNumber(getLoggedInputTokens(entry.tokens)),
-      tokensOut: toNumber(getLoggedOutputTokens(entry.tokens)),
-      tokensCacheRead: getPromptCacheReadTokensOrNull(entry.tokens),
-      tokensCacheCreation: getPromptCacheCreationTokensOrNull(entry.tokens),
-      tokensReasoning: getReasoningTokensOrNull(entry.tokens),
-      requestType: entry.requestType || null,
-      sourceFormat: entry.sourceFormat || null,
-      targetFormat: entry.targetFormat || null,
-      apiKeyId,
-      apiKeyName: entry.apiKeyName || null,
-      comboName: entry.comboName || null,
-      requestBody: serializePayloadForStorage(protectedRequestBody, 8192),
-      responseBody: serializePayloadForStorage(protectedResponseBody, 8192),
-      error: toStoredErrorString(protectedError),
-    };
-
-    const db = getDbInstance();
-    db.prepare(
-      `
+function insertCallLogRow(prepared: PreparedCallLogRow): void {
+  const { db, logEntry, insertParams, hasResilienceColumn } = prepared;
+  // Optional column (migration 191) — only fixed identifiers are spliced in.
+  const resilienceCol = hasResilienceColumn ? ", resilience_actions" : "";
+  const resilienceParam = hasResilienceColumn ? ", @resilienceActions" : "";
+  const insertStmt = db.prepare(
+    `
       INSERT INTO call_logs (
         id, timestamp, method, path, status, model, requested_model, provider,
-        account, connection_id, duration, tokens_in, tokens_out,
-        tokens_cache_read, tokens_cache_creation, tokens_reasoning,
-        request_type, source_format,
-        target_format, api_key_id, api_key_name, combo_name, request_body, response_body, error,
-        artifact_relpath, has_pipeline_details
+        account, connection_id, duration, ttft_ms, tokens_in, tokens_out,
+        tokens_cache_read, tokens_cache_creation, tokens_reasoning, tokens_compressed,
+        tokens_cache_creation_5m, tokens_cache_creation_1h, cache_creation_tier_status,
+        cache_write_cost_usd, cache_write_priced_tokens,
+        reasoning_source, reasoning_chars,
+        reasoning_duration_ms, reasoning_effort_requested, reasoning_effort_upstream,
+        reasoning_encrypted,
+        cache_source, request_type, source_format, target_format, api_key_id, api_key_name,
+        combo_name, combo_step_id, combo_execution_key, error_summary, detail_state,
+        detail_pending_until, artifact_relpath, artifact_size_bytes, artifact_sha256,
+        has_request_body, has_response_body, has_pipeline_details, request_summary,
+        correlation_id, model_pinned, session_tag, client_session_id, response_id, error_type,
+        video_content_removed, has_content, usage_provenance,
+        added_wait_ms, added_wait_cause, queue_wait_ms${resilienceCol}
       )
       VALUES (
         @id, @timestamp, @method, @path, @status, @model, @requestedModel, @provider,
-        @account, @connectionId, @duration, @tokensIn, @tokensOut,
-        @tokensCacheRead, @tokensCacheCreation, @tokensReasoning,
-        @requestType, @sourceFormat,
-        @targetFormat, @apiKeyId, @apiKeyName, @comboName, @requestBody, @responseBody, @error,
-        NULL, 0
+        @account, @connectionId, @duration, @ttftMs, @tokensIn, @tokensOut,
+        @tokensCacheRead, @tokensCacheCreation, @tokensReasoning, @tokensCompressed,
+        @tokensCacheCreation5m, @tokensCacheCreation1h, @cacheCreationTierStatus,
+        @cacheWriteCostUsd, @cacheWritePricedTokens,
+        @reasoningSource, @reasoningChars,
+        @reasoningDurationMs, @reasoningEffortRequested, @reasoningEffortUpstream,
+        @reasoningEncrypted,
+        @cacheSource, @requestType, @sourceFormat, @targetFormat, @apiKeyId, @apiKeyName,
+        @comboName, @comboStepId, @comboExecutionKey, @errorSummary, @detailState,
+        @detailPendingUntil, @artifactRelPath, @artifactSizeBytes, @artifactSha256,
+        @hasRequestBody, @hasResponseBody, @hasPipelineDetails, @requestSummary,
+        @correlationId, @modelPinned, @sessionTag, @clientSessionId, @responseId, @errorType,
+        @videoContentRemoved, @hasContent, @usageProvenance,
+        @addedWaitMs, @addedWaitCause, @queueWaitMs${resilienceParam}
       )
     `
-    ).run(logEntry);
-
-    if (!noLogEnabled) {
-      const artifact = buildArtifact(
-        logEntry,
-        protectedRequestBody,
-        protectedResponseBody,
-        protectedError,
-        protectedPipelinePayloads
-      );
-      const artifactRelPath = writeCallArtifact(artifact);
-
-      if (artifactRelPath) {
-        db.prepare(
-          `
-          UPDATE call_logs
-          SET artifact_relpath = ?, has_pipeline_details = ?
-          WHERE id = ?
-        `
-        ).run(artifactRelPath, protectedPipelinePayloads ? 1 : 0, logEntry.id);
-      }
+  );
+  // #14451: a 6-char dashboard traceId (or any reused explicit id) can collide.
+  // Regenerate logEntry.id too, so the artifact summary and path use the final id.
+  for (let attempt = 0; ; attempt++) {
+    try {
+      insertStmt.run(insertParams);
+      break;
+    } catch (error) {
+      if (!isCallLogIdCollision(error) || attempt >= CALL_LOG_ID_RETRY_LIMIT) throw error;
+      insertParams.id = generateLogId();
+      logEntry.id = insertParams.id;
     }
-  } catch (error) {
-    console.error("[callLogs] Failed to save call log:", (error as Error).message);
   }
+  // sink note: the sink is the unique consumer — reset only after a successful
+  // INSERT, so a failed write (or a second persistence of the same
+  // attempt) keeps the summary instead of silently writing NULL.
+  if (!prepared.metadataOnly) resetResilienceActions();
 }
 
-export function rotateCallLogs() {
-  if (!CALL_LOGS_DIR || !fs.existsSync(CALL_LOGS_DIR)) return;
-
-  try {
-    const entries = fs.readdirSync(CALL_LOGS_DIR);
-    const now = Date.now();
-    const retentionMs = getCallLogRetentionDays() * 24 * 60 * 60 * 1000;
-
-    for (const entry of entries) {
-      const entryPath = path.join(CALL_LOGS_DIR, entry);
-      const stat = fs.statSync(entryPath);
-      if (stat.isDirectory() && now - stat.mtimeMs > retentionMs) {
-        fs.rmSync(entryPath, { recursive: true, force: true });
-      }
+/** Write the inserted row's artifact and publish it, or make the row terminal missing. */
+async function publishCallLogDetail(prepared: PreparedCallLogRow): Promise<void> {
+  const { db, logEntry, buildDetailArtifact } = prepared;
+  if (buildDetailArtifact) {
+    const id = String(logEntry.id);
+    try {
+      const artifactResult = await writeCallArtifactAsync(buildDetailArtifact());
+      if (artifactResult) publishPendingCallLogDetail(db, id, artifactResult);
+    } finally {
+      // A null result or a thrown write must not strand the export cursor.
+      failPendingCallLogDetail(db, id);
     }
-    cleanupOverflowCallLogFiles(CALL_LOGS_DIR, getCallLogMaxEntries());
-  } catch (error) {
-    console.error("[callLogs] Failed to rotate request artifacts:", (error as Error).message);
   }
+
+  scheduleCallLogRotation();
 }
 
-if (shouldPersistToDisk) {
-  try {
-    rotateCallLogs();
-  } catch {
-    // Best-effort startup cleanup.
+export function saveCallLog(entry: any, metadataOnly = false): Promise<void> {
+  // Usage is also needed by the live dashboard when disk history is disabled.
+  // Retain only counters, never the request/response bodies from this entry.
+  if (!metadataOnly && entry?.tokens && typeof entry.tokens === "object") {
+    updateRequestTokensById(entry.pendingRequestId ?? entry.id, {
+      in: getLoggedInputTokens(entry.tokens),
+      out: getLoggedOutputTokens(entry.tokens),
+      cacheRead: getPromptCacheReadTokensOrNull(entry.tokens),
+      cacheCreation: readCacheWriteUsage(entry.tokens).total,
+      reasoning: getReasoningTokensOrNull(entry.tokens),
+      compressed: typeof entry.tokensCompressed === "number" ? entry.tokensCompressed : null,
+    });
   }
+  if (!shouldPersistToDisk || callLogSavesClosing) return Promise.resolve();
+
+  const operation = saveCallLogOperation(entry, metadataOnly);
+  pendingCallLogSaves.add(operation);
+  void operation.then(
+    () => pendingCallLogSaves.delete(operation),
+    () => pendingCallLogSaves.delete(operation)
+  );
+  return operation;
+}
+
+export function saveUpstreamHttpAttempt(entry: {
+  timestamp: string;
+  method: string;
+  path: string;
+  status: number;
+  model: string;
+  provider: string;
+  connectionId: string | null;
+  duration: number;
+  error: string | null;
+  correlationId: string;
+  noLog: boolean;
+  upstreamHttp: UpstreamHttpSummary;
+  apiKeyId?: string | null;
+  apiKeyName?: string | null;
+  comboName?: unknown;
+}): Promise<void> {
+  return saveCallLog({ ...entry, requestType: UPSTREAM_HTTP_ATTEMPT }, true);
+}
+
+export async function waitForCallLogSaves(timeoutMs: number): Promise<boolean> {
+  const deadline = Date.now() + Math.max(0, timeoutMs);
+  while (pendingCallLogSaves.size > 0) {
+    const remainingMs = deadline - Date.now();
+    if (remainingMs <= 0) return false;
+
+    let timeout: NodeJS.Timeout | undefined;
+    const settled = await Promise.race([
+      Promise.allSettled([...pendingCallLogSaves]).then(() => true),
+      new Promise<false>((resolve) => {
+        timeout = setTimeout(() => resolve(false), remainingMs);
+        timeout.unref?.();
+      }),
+    ]);
+    if (timeout) clearTimeout(timeout);
+    if (!settled) return false;
+  }
+  return true;
+}
+
+export async function closeCallLogSaves(timeoutMs = 2_000): Promise<void> {
+  callLogSavesClosing = true;
+  const drained = await waitForCallLogSaves(timeoutMs);
+  if (!drained) {
+    await closeCallLogArtifactWriter(0);
+  }
+
+  // The admission gate above makes this a stable snapshot. After a forced worker
+  // close, queued artifact promises have resolved fail-open and their SQLite
+  // continuations can finish before the database is closed.
+  await Promise.allSettled([...pendingCallLogSaves]);
+  await closeCallLogArtifactWriter(0);
+}
+
+if (shouldPersistToDisk && process.env.NODE_ENV !== "test") {
+  scheduleCallLogRotation();
+}
+
+/**
+ * Pushes a `column LIKE %value%` condition (mirrors the correlationId/sessionTag substring-match
+ * precedent). Extracted so getCallLogs stays under the max-lines-per-function ratchet — #8249.
+ */
+function pushLikeFilter(
+  conditions: string[],
+  params: Record<string, unknown>,
+  column: string,
+  paramKey: string,
+  value: unknown
+) {
+  if (!value) return;
+  conditions.push(`cl.${column} LIKE @${paramKey}`);
+  params[paramKey] = `%${value}%`;
 }
 
 export async function getCallLogs(filter: any = {}) {
   const db = getDbInstance();
-  let sql = "SELECT * FROM call_logs";
+  let sql = `
+    SELECT cl.*,
+      pn.name AS provider_node_name, pn.prefix AS provider_node_prefix,
+      ${RESOLVED_ACCOUNT_SQL} AS resolved_account
+    FROM call_logs cl
+    LEFT JOIN provider_nodes pn ON pn.id = cl.provider
+    LEFT JOIN provider_connections pc ON pc.id = cl.connection_id
+  `;
   const conditions: string[] = [];
   const params: Record<string, unknown> = {};
 
   if (filter.status) {
     if (filter.status === "error") {
-      conditions.push("(status >= 400 OR error IS NOT NULL)");
+      conditions.push(
+        "(cl.status >= 400 OR (cl.error_summary IS NOT NULL AND (cl.request_type IS NULL OR cl.request_type <> 'upstream_http_attempt' OR cl.error_summary <> 'No HTTP response observed')) OR (cl.request_type = 'upstream_http_attempt' AND cl.status = 0 AND cl.error_summary IS NULL))"
+      );
     } else if (filter.status === "ok") {
-      conditions.push("status >= 200 AND status < 300");
+      conditions.push("cl.status >= 200 AND cl.status < 300");
     } else {
-      const statusCode = parseInt(filter.status, 10);
+      const statusCode = Number.parseInt(filter.status, 10);
       if (!Number.isNaN(statusCode)) {
-        conditions.push("status = @statusCode");
+        conditions.push("cl.status = @statusCode");
         params.statusCode = statusCode;
       }
     }
   }
 
   if (filter.model) {
-    conditions.push("(model LIKE @modelQ OR requested_model LIKE @modelQ)");
+    conditions.push("(cl.model LIKE @modelQ OR cl.requested_model LIKE @modelQ)");
     params.modelQ = `%${filter.model}%`;
   }
   if (filter.provider) {
-    conditions.push("provider LIKE @providerQ");
+    conditions.push("cl.provider LIKE @providerQ");
     params.providerQ = `%${filter.provider}%`;
   }
   if (filter.account) {
-    conditions.push("account LIKE @accountQ");
+    conditions.push(`(cl.account LIKE @accountQ OR ${RESOLVED_ACCOUNT_SQL} LIKE @accountQ)`);
     params.accountQ = `%${filter.account}%`;
   }
   if (filter.apiKey) {
-    conditions.push("(api_key_name LIKE @apiKeyQ OR api_key_id LIKE @apiKeyQ)");
+    conditions.push("(cl.api_key_name LIKE @apiKeyQ OR cl.api_key_id LIKE @apiKeyQ)");
     params.apiKeyQ = `%${filter.apiKey}%`;
   }
+  pushLikeFilter(conditions, params, "correlation_id", "correlationId", filter.correlationId);
+  pushLikeFilter(conditions, params, "session_tag", "sessionTag", filter.sessionTag);
   if (filter.combo) {
-    conditions.push("combo_name IS NOT NULL");
+    conditions.push("cl.combo_name IS NOT NULL");
+  }
+  if (filter.excludeTests) {
+    // Home "Recent Requests" is an allowlist of real provider inference, not a
+    // blacklist of known backend log types. Persisted provider requests enter via
+    // the public gateway namespaces (/v1/* or /api/v1/*); internal management work
+    // (connection tests, model sync, and future /api/providers/* jobs) does not.
+    // Apply this before LIMIT so backend rows can never displace real traffic.
+    conditions.push(`(cl.path LIKE '/v1/%' OR cl.path LIKE '/api/v1/%')`);
+  }
+  if (filter.since) {
+    conditions.push("cl.timestamp >= @since");
+    params.since = filter.since instanceof Date ? filter.since.toISOString() : String(filter.since);
+  }
+  if (filter.until) {
+    conditions.push("cl.timestamp <= @until");
+    params.until = filter.until instanceof Date ? filter.until.toISOString() : String(filter.until);
   }
   if (filter.search) {
     conditions.push(`(
-      model LIKE @searchQ OR path LIKE @searchQ OR account LIKE @searchQ OR
-      requested_model LIKE @searchQ OR provider LIKE @searchQ OR
-      api_key_name LIKE @searchQ OR api_key_id LIKE @searchQ OR
-      combo_name LIKE @searchQ OR CAST(status AS TEXT) LIKE @searchQ
+      cl.model LIKE @searchQ OR cl.path LIKE @searchQ OR cl.account LIKE @searchQ OR
+      ${RESOLVED_ACCOUNT_SQL} LIKE @searchQ OR
+      cl.requested_model LIKE @searchQ OR cl.provider LIKE @searchQ OR
+      cl.api_key_name LIKE @searchQ OR cl.api_key_id LIKE @searchQ OR
+      cl.combo_name LIKE @searchQ OR CAST(cl.status AS TEXT) LIKE @searchQ
+      OR cl.combo_step_id LIKE @searchQ OR cl.combo_execution_key LIKE @searchQ
+      OR cl.error_summary LIKE @searchQ
+      OR cl.correlation_id LIKE @searchQ
     )`);
     params.searchQ = `%${filter.search}%`;
   }
@@ -552,132 +1111,92 @@ export async function getCallLogs(filter: any = {}) {
     sql += " WHERE " + conditions.join(" AND ");
   }
 
-  const limit = filter.limit || 200;
-  sql += ` ORDER BY timestamp DESC LIMIT ${limit}`;
+  const limit = Number.isInteger(filter.limit) && filter.limit > 0 ? filter.limit : 200;
+  const offset = Number.isInteger(filter.offset) && filter.offset > 0 ? filter.offset : 0;
+  sql += ` ORDER BY cl.timestamp DESC LIMIT @__limit OFFSET @__offset`;
+  params.__limit = limit;
+  params.__offset = offset;
 
-  const rows = db.prepare(sql).all(params);
-
-  return rows.map((row) => {
-    const l = asRecord(row);
-    return {
-      id: toStringOrNull(l.id),
-      timestamp: toStringOrNull(l.timestamp),
-      method: toStringOrNull(l.method),
-      path: toStringOrNull(l.path),
-      status: toNumber(l.status),
-      model: toStringOrNull(l.model),
-      requestedModel: toStringOrNull(l.requested_model),
-      provider: toStringOrNull(l.provider),
-      account: toStringOrNull(l.account),
-      duration: toNumber(l.duration),
-      tokens: {
-        in: toNumber(l.tokens_in),
-        out: toNumber(l.tokens_out),
-        cacheRead: l.tokens_cache_read != null ? toNumber(l.tokens_cache_read) : null,
-        cacheWrite: l.tokens_cache_creation != null ? toNumber(l.tokens_cache_creation) : null,
-        reasoning: l.tokens_reasoning != null ? toNumber(l.tokens_reasoning) : null,
-      },
-      sourceFormat: toStringOrNull(l.source_format),
-      targetFormat: toStringOrNull(l.target_format),
-      error: toStringOrNull(l.error),
-      comboName: toStringOrNull(l.combo_name),
-      apiKeyId: toStringOrNull(l.api_key_id),
-      apiKeyName: toStringOrNull(l.api_key_name),
-      hasRequestBody: typeof l.request_body === "string" && l.request_body.length > 0,
-      hasResponseBody: typeof l.response_body === "string" && l.response_body.length > 0,
-      hasPipelineDetails: toNumber(l.has_pipeline_details) === 1,
-    };
-  });
-}
-
-function buildLegacyPipelinePayloads(id: string) {
-  const detailed = getRequestDetailLogByCallLogId(id);
-  if (!detailed) return null;
-
-  return {
-    clientRequest: detailed.client_request ?? null,
-    providerRequest: detailed.translated_request ?? null,
-    providerResponse: detailed.provider_response ?? null,
-    clientResponse: detailed.client_response ?? null,
-  };
+  const rows = db.prepare(sql).all(params) as CallLogSummaryRow[];
+  return rows.map(mapSummaryRow);
 }
 
 export async function getCallLogById(id: string) {
   const db = getDbInstance();
-  const row = db.prepare("SELECT * FROM call_logs WHERE id = ?").get(id);
+  const row = db
+    .prepare(
+      `SELECT cl.*,
+        pn.name AS provider_node_name,
+        pn.prefix AS provider_node_prefix,
+        ${RESOLVED_ACCOUNT_SQL} AS resolved_account
+       FROM call_logs cl
+       LEFT JOIN provider_nodes pn ON pn.id = cl.provider
+       LEFT JOIN provider_connections pc ON pc.id = cl.connection_id
+       WHERE cl.id = ?`
+    )
+    .get(id) as CallLogSummaryRow | undefined;
   if (!row) return null;
 
-  const entryRow = asRecord(row);
-  const artifactRelPath = toStringOrNull(entryRow.artifact_relpath);
-  const entry = {
-    id: toStringOrNull(entryRow.id),
-    timestamp: toStringOrNull(entryRow.timestamp),
-    method: toStringOrNull(entryRow.method),
-    path: toStringOrNull(entryRow.path),
-    status: toNumber(entryRow.status),
-    model: toStringOrNull(entryRow.model),
-    requestedModel: toStringOrNull(entryRow.requested_model),
-    provider: toStringOrNull(entryRow.provider),
-    account: toStringOrNull(entryRow.account),
-    connectionId: toStringOrNull(entryRow.connection_id),
-    duration: toNumber(entryRow.duration),
-    tokens: {
-      in: toNumber(entryRow.tokens_in),
-      out: toNumber(entryRow.tokens_out),
-      cacheRead: entryRow.tokens_cache_read != null ? toNumber(entryRow.tokens_cache_read) : null,
-      cacheWrite:
-        entryRow.tokens_cache_creation != null ? toNumber(entryRow.tokens_cache_creation) : null,
-      reasoning: entryRow.tokens_reasoning != null ? toNumber(entryRow.tokens_reasoning) : null,
+  const entry = mapSummaryRow(row);
+  return resolveCallLogDetail(db, entry, getCallLogsDir(), {
+    io: dashboardDetailIo,
+    onArtifactState(relativePath, state) {
+      if (state === "missing") clearArtifactReference(relativePath, "missing");
+      else db.prepare("UPDATE call_logs SET detail_state = ? WHERE id = ?").run("corrupt", id);
     },
-    sourceFormat: toStringOrNull(entryRow.source_format),
-    targetFormat: toStringOrNull(entryRow.target_format),
-    apiKeyId: toStringOrNull(entryRow.api_key_id),
-    apiKeyName: toStringOrNull(entryRow.api_key_name),
-    comboName: toStringOrNull(entryRow.combo_name),
-    requestBody: parseStoredPayload(entryRow.request_body),
-    responseBody: parseStoredPayload(entryRow.response_body),
-    error: toStringOrNull(entryRow.error),
-    artifactRelPath,
-    hasPipelineDetails: toNumber(entryRow.has_pipeline_details) === 1,
-  };
+  });
+}
 
-  const artifact = readArtifactFromDisk(artifactRelPath);
-  if (artifact) {
-    return {
-      ...entry,
-      requestBody: artifact.requestBody ?? entry.requestBody,
-      responseBody: artifact.responseBody ?? entry.responseBody,
-      error: artifact.error ?? entry.error,
-      pipelinePayloads: artifact.pipeline ?? null,
-      hasPipelineDetails: Boolean(artifact.pipeline) || entry.hasPipelineDetails,
-    };
+export async function exportCallLogsSince(since: string) {
+  const db = getDbInstance();
+  const ids = db
+    .prepare("SELECT id FROM call_logs WHERE timestamp >= ? ORDER BY timestamp DESC")
+    .all(since)
+    .map((row) => String((row as { id: string }).id));
+
+  const logs: unknown[] = [];
+  for (const id of ids) {
+    const log = await getCallLogById(id);
+    if (log) logs.push(log);
   }
+  return logs;
+}
 
-  const needsLegacyDisk =
-    hasTruncatedFlag(entry.requestBody) || hasTruncatedFlag(entry.responseBody) || !artifactRelPath;
-  if (needsLegacyDisk) {
-    const legacyEntry = readLegacyLogFromDisk(entry);
-    if (legacyEntry) {
-      const legacyPipeline = buildLegacyPipelinePayloads(id);
-      return {
-        ...entry,
-        requestBody: legacyEntry.requestBody ?? entry.requestBody,
-        responseBody: legacyEntry.responseBody ?? entry.responseBody,
-        error: legacyEntry.error ?? entry.error,
-        pipelinePayloads: legacyPipeline,
-        hasPipelineDetails: Boolean(legacyPipeline),
-      };
-    }
+/**
+ * Total number of call_logs rows with timestamp >= `since` — a cheap
+ * aggregate query, no row hydration. Used by /api/logs/export to report
+ * `totalAvailable` without paying the cost of hydrating every row (#13123).
+ */
+export function countCallLogsSince(since: string): number {
+  const db = getDbInstance();
+  const row = db
+    .prepare("SELECT COUNT(*) AS count FROM call_logs WHERE timestamp >= ?")
+    .get(since) as { count: number };
+  return row.count;
+}
+
+/**
+ * Streams up to `limit` hydrated call logs with timestamp >= `since`, most
+ * recent first, one at a time. Only fetches the id list eagerly (small — just
+ * strings) and bounds it with SQL LIMIT; each full log entry (which can
+ * include large request/response artifacts via `getCallLogById`) is only
+ * hydrated and held in memory long enough to be yielded (#13123: the previous
+ * `exportCallLogsSince()` + slice-after-fetch approach hydrated and buffered
+ * every matching row — including rows beyond the cap — before the row cap
+ * was ever applied, which is what left the peak V8 heap unchanged).
+ */
+export async function* iterateCallLogsSince(
+  since: string,
+  limit: number
+): AsyncGenerator<unknown, void, void> {
+  const db = getDbInstance();
+  const ids = db
+    .prepare("SELECT id FROM call_logs WHERE timestamp >= ? ORDER BY timestamp DESC LIMIT ?")
+    .all(since, limit)
+    .map((row) => String((row as { id: string }).id));
+
+  for (const id of ids) {
+    const log = await getCallLogById(id);
+    if (log) yield log;
   }
-
-  const legacyPipeline = buildLegacyPipelinePayloads(id);
-  if (legacyPipeline) {
-    return {
-      ...entry,
-      pipelinePayloads: legacyPipeline,
-      hasPipelineDetails: true,
-    };
-  }
-
-  return entry;
 }

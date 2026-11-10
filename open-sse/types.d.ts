@@ -17,6 +17,14 @@ export interface ProviderCredentials {
   refreshToken?: string;
   /** Internal connection ID */
   connectionId: string;
+  /** Optional per-account concurrency cap */
+  maxConcurrent?: number | null;
+  /**
+   * Optional per-model concurrency ceilings for this connection, keyed by
+   * the exact model string passed to the executor after routing resolution
+   * (normally the bare upstream model id). Absent/null means no model gate.
+   */
+  modelConcurrency?: Record<string, number> | null;
   /** User email associated with the connection */
   email?: string;
   /** API key (for apikey auth type) */
@@ -28,7 +36,7 @@ export interface ProviderCredentials {
 }
 
 export interface ModelInfo {
-  /** Canonical provider ID (e.g., "claude", "gemini-cli") */
+  /** Canonical provider ID (e.g., "claude", "antigravity") */
   provider: string;
   /** Model identifier (e.g., "claude-opus-4-6") */
   model: string;
@@ -67,7 +75,19 @@ export interface ChatCoreParams {
   /** Connection ID for usage tracking */
   connectionId: string;
   /** API key metadata for usage attribution */
-  apiKeyInfo?: { id?: string; name?: string } | null;
+  apiKeyInfo?: {
+    id?: string;
+    name?: string;
+    compressionEnabled?: boolean;
+    /** Scopes granted to this key (e.g. "self:usage", "self:account-quota"). */
+    scopes?: string[];
+    /** Connection ids this key is restricted to; a single entry means the key is pinned to one account. */
+    allowedConnections?: string[];
+    /** Providers whose account quota this key may share/see; null = all. */
+    sharedQuotaProviders?: string[] | null;
+    /** Per-key policy for forwarding upstream anthropic-ratelimit-* / anthropic-organization-id headers. */
+    anthropicRateLimitHeaders?: "auto" | "forward" | "strip";
+  } | null;
   /** Client User-Agent header */
   userAgent?: string;
   /** Callback when credentials are refreshed mid-request */

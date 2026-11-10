@@ -1,51 +1,194 @@
 #!/usr/bin/env node
 
 /**
- * OmniRoute CLI — Smart AI Router with Auto Fallback
+ * OmniRoute CLI entry point.
  *
- * Usage:
- *   omniroute              Start the server (default port 20128)
- *   omniroute --port 3000  Start on custom port
- *   omniroute --no-open    Start without opening browser
- *   omniroute --mcp        Start MCP server (stdio transport for IDEs)
- *   omniroute --help       Show help
- *   omniroute --version    Show version
+ * Special bypasses (handled before Commander):
+ *   --version / -V (alone)    Fast-path: print the version and exit, skipping the
+ *                             tsx/esm + polyfill imports, env-file loading, and
+ *                             Commander's ~70-command registration entirely.
+ *   --mcp                     Start MCP server over stdio
+ *   reset-encrypted-columns   Recovery tool for broken encrypted credentials
+ *   reset-password            Reset the admin/management password
+ *
+ * All other commands are routed through Commander (bin/cli/program.mjs).
  */
 
-import { spawn } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
 import { join, dirname } from "node:path";
-import { fileURLToPath } from "node:url";
-import { homedir, platform } from "node:os";
-import { isNativeBinaryCompatible } from "../scripts/native-binary-compat.mjs";
+import { fileURLToPath, pathToFileURL } from "node:url";
+let updateNotifier = null;
+try {
+  updateNotifier = (await import("update-notifier")).default;
+} catch {
+  // update-notifier is optional in pruned standalone environments
+}
+import { isNativeBinaryCompatible } from "../scripts/build/native-binary-compat.mjs";
+import { getNodeRuntimeSupport, getNodeRuntimeWarning } from "./nodeRuntimeSupport.mjs";
+import { getDefaultDataDir } from "./cli/data-dir.mjs";
+import { shouldProvisionStorageKey } from "./cli/utils/storageKeyProvision.mjs";
+import { isVersionFastPath } from "./cli/utils/versionFastPath.mjs";
+import { parseEnvValue } from "./cli/utils/parseEnvValue.mjs";
+import { describeVolatileEnvWarning } from "./cli/utils/volatileEnvPath.mjs";
+import {
+  cwdEnvRejection,
+  isPlainEnvKey,
+  printableEnvKey,
+  printablePath,
+  UNTRUSTED_CWD_ENV_ALLOWLIST,
+} from "./cli/utils/untrustedCwdEnv.mjs";
+import {
+  ensurePrivateDataDir,
+  tightenDataDirSecrets,
+  writePrivateFile,
+} from "./cli/privateDataDir.mjs";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 const ROOT = join(__dirname, "..");
-const APP_DIR = join(ROOT, "app");
 
-// ── Load .env file (for global npm install) ─────────────────
+// Fast-path a bare `--version`/`-V` query BEFORE the tsx/esm registration, the
+// polyfill import, env-file loading, or Commander's command registration (~70
+// modules — DB, providers, OAuth, etc.) run. None of that work is needed to answer
+// "what version is this" — mirrors upstream 9router PR #2414 (fast-path help/version
+// ahead of expensive self-heal hooks), adapted to OmniRoute's Commander CLI where the
+// equivalent expensive work is eager command registration rather than npm-install-based
+// runtime self-healing. `--help` is intentionally NOT fast-pathed here: its output is
+// generated dynamically from every registered subcommand, so skipping registration
+// would truncate the help text instead of just speeding it up.
+if (isVersionFastPath(process.argv)) {
+  const pkg = JSON.parse(readFileSync(join(ROOT, "package.json"), "utf8"));
+  console.log(pkg.version);
+  process.exit(0);
+}
+
+// Detect an unsupported Node.js runtime BEFORE the heavy `tsx/esm` import and
+// Commander's ~70-command registration chain run. That chain pulls in `ora` ->
+// the hoisted `string-width` package, whose module contains top-level ES2024
+// Unicode-set (`v` flag) regex literals. On a Node/V8 build that predates
+// `v`-flag support, those literals fail to even *parse*, throwing a bare
+// `SyntaxError: Invalid regular expression flags` deep inside a transitive
+// dependency instead of an actionable message (#12296). Skip this for the
+// same read-only invocations `shouldProvisionStorageKey` already exempts
+// (`--help`/`-h`, `help`/`completion`) — those still need the full command
+// registry to render their output, so an incompatible runtime crashing there
+// is a separate, pre-existing limitation this fix does not attempt to solve.
+if (shouldProvisionStorageKey(process.argv)) {
+  const nodeSupport = getNodeRuntimeSupport();
+  if (!nodeSupport.nodeCompatible) {
+    const runtimeWarning = getNodeRuntimeWarning() || "Unsupported Node.js runtime detected.";
+    console.error(
+      `\x1b[31m✖ Node.js ${nodeSupport.nodeVersion} is not supported.\x1b[0m\n` +
+        `  ${runtimeWarning}\n` +
+        `  Supported runtimes: ${nodeSupport.supportedDisplay}\n` +
+        `  Recommended: Node.js ${nodeSupport.recommendedVersion}\n` +
+        `  If you installed OmniRoute globally, run \`node -v\` and confirm \`omniroute\` is not resolving to\n` +
+        `  a stale/distro-packaged \`nodejs\` binary (e.g. /usr/bin/node) instead of the version you expect —\n` +
+        `  that mismatch is the most common cause even when package.json's engines range is correct.`
+    );
+    process.exit(1);
+  }
+}
+
+// MCP stdio transport uses stdout exclusively for JSON-RPC messages. Redirect
+// console.log/warn to stderr before anything else runs — including the tsx/esm and
+// polyfill imports below, since those (and their transitive module graphs, e.g. DB
+// init) can themselves log during evaluation. Redirecting after those imports let
+// early output leak straight into the JSON-RPC stream and corrupt it client-side
+// (e.g. Claude Desktop: "Unexpected token 'D', \"[DB] Changi\"... is not valid JSON").
+//
+// `deploy` needs the same treatment for the same reason: it prints Kubernetes
+// YAML (or JSON) on stdout and is meant to be piped —
+// `omniroute deploy k8s | kubectl apply -f -`. Env-loading notices and DB
+// warnings on stdout make that YAML unparseable ("control characters are not
+// allowed"), so they belong on stderr where a human still sees them.
+const STDOUT_IS_DATA = process.argv.includes("--mcp") || process.argv[2] === "deploy";
+
+if (STDOUT_IS_DATA) {
+  const { Console } = await import("node:console");
+  const stderrConsole = new Console({ stdout: process.stderr, stderr: process.stderr });
+  console.log = stderrConsole.log.bind(stderrConsole);
+  console.warn = stderrConsole.warn.bind(stderrConsole);
+}
+
+// Register tsx so dynamic imports of .ts source files (referenced as .js per
+// TypeScript conventions) resolve correctly. The build never emits .js for
+// src/lib/cli-helper/, so tsx handles the .ts → .js resolution at runtime.
+await import("tsx/esm");
+await import("../open-sse/utils/setupPolyfill.ts");
+
+// #7791: tsx's tsconfig-path resolution does not apply when OmniRoute is
+// installed globally (files live under node_modules/omniroute/), so bare
+// `@/...` specifiers (declared in tsconfig.json paths as `@/* → ./src/*`)
+// fail with ERR_MODULE_NOT_FOUND. Register an ESM resolve hook that maps
+// `@/...` to absolute file URLs under <ROOT>/src/. Safe no-op in dev checkout
+// (paths already resolve via tsconfig) and when ROOT has no `src/` dir.
+const { registerAliasResolver } = await import("./aliasResolver.mjs");
+await registerAliasResolver(ROOT);
+
+// Electron persists secrets (JWT_SECRET, API_KEY_SECRET, STORAGE_ENCRYPTION_KEY) to
+// `<DATA_DIR>/server.env` (electron/main.js), never `.env`. Migrating an existing
+// install (storage.sqlite + server.env) to the CLI left those secrets undiscoverable —
+// the CLI only ever looked for `.env`, so the STORAGE_ENCRYPTION_KEY needed to decrypt
+// the migrated database was silently dropped (#7302). One-time, one-directory migration:
+// if `<dataDir>/.env` is absent but `<dataDir>/server.env` is present, copy it to `.env`
+// so it flows through the normal env-loading path below. Never overwrites an existing
+// `.env` — an explicit `.env` always wins over a legacy `server.env`.
+function migrateElectronServerEnv(dataDir) {
+  try {
+    const envPath = join(dataDir, ".env");
+    const serverEnvPath = join(dataDir, "server.env");
+    if (existsSync(envPath) || !existsSync(serverEnvPath)) return;
+    writePrivateFile(envPath, readFileSync(serverEnvPath, "utf-8"));
+    console.log(`  \x1b[2m♻ Migrated Electron secrets from ${serverEnvPath} to ${envPath}\x1b[0m`);
+  } catch {
+    // Ignore errors migrating server.env — fall back to normal env loading below.
+  }
+}
+
 function loadEnvFile() {
   const envPaths = [];
+  const loadedEnvPaths = [];
+  const seenEnvPaths = new Set();
+  const addEnvPath = (envPath) => {
+    if (seenEnvPaths.has(envPath)) return;
+    seenEnvPaths.add(envPath);
+    envPaths.push(envPath);
+  };
 
-  // 1. DATA_DIR/.env if set
+  migrateElectronServerEnv(process.env.DATA_DIR || getDefaultDataDir());
+
   if (process.env.DATA_DIR) {
-    envPaths.push(join(process.env.DATA_DIR, ".env"));
+    addEnvPath(join(process.env.DATA_DIR, ".env"));
   }
 
-  // 2. ~/.omniroute/.env (default data dir)
-  const home = homedir();
-  if (home) {
-    if (platform() === "win32") {
-      const appData = process.env.APPDATA || join(home, "AppData", "Roaming");
-      envPaths.push(join(appData, "omniroute", ".env"));
-    } else {
-      envPaths.push(join(home, ".omniroute", ".env"));
-    }
+  // Hermetic commands (real CLI smokes, migrations, recovery probes) may point
+  // DATA_DIR at an isolated tree. Do not silently mix the user's default
+  // credential env into that process when isolation is explicitly requested.
+  if (process.env.OMNIROUTE_CLI_SKIP_DEFAULT_DATA_ENV !== "1") {
+    addEnvPath(join(getDefaultDataDir(), ".env"));
   }
 
-  // 3. ./.env (current working directory)
-  envPaths.push(join(process.cwd(), ".env"));
+  // The working directory may belong to someone else (a cloned repo, an
+  // unpacked archive). Its .env still loads, but it may set only the keys in
+  // bin/cli/utils/untrustedCwdEnv.mjs. When the cwd is the data dir or the
+  // package root, that file is already trusted and keeps its full effect.
+  const cwdEnvPath = join(process.cwd(), ".env");
+  const untrustedEnvPath =
+    seenEnvPaths.has(cwdEnvPath) || cwdEnvPath === join(ROOT, ".env") ? null : cwdEnvPath;
+  addEnvPath(cwdEnvPath);
+  // Skip the repo-checkout .env when explicitly requested (used by isolation tests
+  // that need a deterministic environment without the development repo's defaults).
+  if (process.env.OMNIROUTE_CLI_SKIP_REPO_ENV !== "1") {
+    addEnvPath(join(ROOT, ".env"));
+  }
+
+  const keyOrigin = new Map();
+  const shadowed = new Map();
+  const skippedKeys = new Set();
+  // Allowed keys the file wrote with a bad value or in the wrong case, each
+  // with what it should have been.
+  const rejectedKeys = new Map();
 
   for (const envPath of envPaths) {
     try {
@@ -53,81 +196,228 @@ function loadEnvFile() {
         const content = readFileSync(envPath, "utf-8");
         for (const line of content.split("\n")) {
           const trimmed = line.trim();
-          // Skip empty lines and comments
           if (!trimmed || trimmed.startsWith("#")) continue;
           const eqIdx = trimmed.indexOf("=");
           if (eqIdx > 0) {
             const key = trimmed.slice(0, eqIdx).trim();
-            const value = trimmed.slice(eqIdx + 1).trim();
-            // Don't override existing env vars
+            const untrusted = envPath === untrustedEnvPath;
+            if (untrusted && !isPlainEnvKey(key)) {
+              skippedKeys.add(printableEnvKey(key));
+              continue;
+            }
             if (process.env[key] === undefined) {
-              // Remove surrounding quotes
-              process.env[key] = value.replace(/^["']|["']$/g, "");
+              const value = parseEnvValue(trimmed.slice(eqIdx + 1));
+              const rejection = untrusted ? cwdEnvRejection(key, value) : null;
+              if (rejection?.kind === "name") {
+                skippedKeys.add(key);
+                continue;
+              }
+              if (rejection) {
+                rejectedKeys.set(
+                  key,
+                  rejection.kind === "case"
+                    ? `write the name as ${rejection.name}`
+                    : `expected ${rejection.expected}`
+                );
+                continue;
+              }
+              process.env[key] = value;
+              keyOrigin.set(key, envPath);
+            } else if (!shadowed.has(key)) {
+              // The line is inert: something set this key first. Report it once
+              // per key, whether the winner was an earlier file or the process
+              // environment (#6194: a shell's own HOSTNAME beat the .env and the
+              // server bound to the wrong address in silence).
+              shadowed.set(key, { winner: keyOrigin.get(key) ?? null, loser: envPath });
             }
           }
         }
-        console.log(`  \x1b[2m📋 Loaded env from ${envPath}\x1b[0m`);
-        return;
+        loadedEnvPaths.push(envPath);
       }
-    } catch {
-      // Ignore errors reading env files
+    } catch (err) {
+      // The error message can repeat the path, so it is escaped the same way.
+      console.warn(
+        `  \x1b[33m⚠ Could not read ${printablePath(envPath)}: ` +
+          `${printablePath(err?.message ?? err)}\x1b[0m`
+      );
     }
+  }
+
+  for (const envPath of loadedEnvPaths) {
+    console.log(`  \x1b[2m📋 Loaded env from ${printablePath(envPath)}\x1b[0m`);
+  }
+
+  for (const [key, { winner, loser }] of shadowed) {
+    const setter = winner ? printablePath(winner) : "the environment";
+    console.warn(
+      `  \x1b[33m⚠ ${key} in ${printablePath(loser)} is ignored, ${setter} set it first\x1b[0m`
+    );
+  }
+
+  // Name the keys, never the values: the file may be hostile, and the value
+  // of an ignored key is not something the user needs to see on screen.
+  if (skippedKeys.size > 0) {
+    const durableEnvPath = join(process.env.DATA_DIR || getDefaultDataDir(), ".env");
+    console.warn(
+      `  \x1b[33m⚠ ${printablePath(untrustedEnvPath)} cannot set ` +
+        `${[...skippedKeys].join(", ")}; ignored. A .env in the working directory may ` +
+        `set only ${UNTRUSTED_CWD_ENV_ALLOWLIST.join(", ")}. If you wrote these lines ` +
+        `yourself, set them in the shell or in ${printablePath(durableEnvPath)}.\x1b[0m`
+    );
+  }
+  if (rejectedKeys.size > 0) {
+    const reasons = [...rejectedKeys].map(([key, why]) => `${key} (${why})`);
+    console.warn(
+      `  \x1b[33m⚠ ${printablePath(untrustedEnvPath)}: ignored ${reasons.join(", ")}.\x1b[0m`
+    );
+  }
+
+  // The package directory is replaced by the next `npm i -g`, so a .env kept
+  // there is silently lost. Say so once, and only when that file actually
+  // supplied an effective value that is not a regenerated template default.
+  const durableEnvPath = join(process.env.DATA_DIR || getDefaultDataDir(), ".env");
+  const suppliedValues = new Map(
+    [...keyOrigin]
+      .filter(([, origin]) => origin === join(ROOT, ".env"))
+      .map(([key]) => [key, process.env[key]])
+  );
+  const volatileWarning = describeVolatileEnvWarning({
+    envPath: join(ROOT, ".env"),
+    packageRoot: ROOT,
+    durableEnvPath,
+    suppliedKeys: suppliedValues.size > 0,
+    suppliedValues,
+  });
+  if (volatileWarning && loadedEnvPaths.includes(join(ROOT, ".env"))) {
+    console.warn(`  \x1b[33m⚠ ${volatileWarning}\x1b[0m`);
   }
 }
 
 loadEnvFile();
 
-// ── Parse args ─────────────────────────────────────────────
-const args = process.argv.slice(2);
-
-if (args.includes("--help") || args.includes("-h")) {
-  console.log(`
-  \x1b[1m\x1b[36m⚡ OmniRoute\x1b[0m — Smart AI Router with Auto Fallback
-
-  \x1b[1mUsage:\x1b[0m
-    omniroute                 Start the server
-    omniroute --port <port>   Use custom API port (default: 20128)
-    omniroute --no-open       Don't open browser automatically
-    omniroute --mcp           Start MCP server (stdio transport for IDEs)
-    omniroute --help          Show this help
-    omniroute --version       Show version
-
-  \x1b[1mMCP Integration:\x1b[0m
-    The --mcp flag starts an MCP server over stdio, exposing OmniRoute
-    tools for AI agents in VS Code, Cursor, Claude Desktop, and Copilot.
-
-    Available tools: omniroute_get_health, omniroute_list_combos,
-    omniroute_check_quota, omniroute_route_request, and more.
-
-  \x1b[1mConfig:\x1b[0m
-    Loads .env from: ~/.omniroute/.env or ./.env
-    Memory limit: OMNIROUTE_MEMORY_MB (default: 512)
-
-  \x1b[1mAfter starting:\x1b[0m
-    Dashboard:  http://localhost:<dashboard-port>
-    API:        http://localhost:<api-port>/v1
-
-  \x1b[1mConnect your tools:\x1b[0m
-    Set your CLI tool (Cursor, Cline, Codex, etc.) to use:
-    \x1b[33mhttp://localhost:<api-port>/v1\x1b[0m
-  `);
-  process.exit(0);
+// Next.js has no android branch in getCacheDirectory(): if ~/.cache (and tmp)
+// do not already exist it aborts the instrumentation hook, and every request
+// then returns a silent HTTP 500 even though the CLI still looks "running".
+// Create the cache dir (and set XDG_CACHE_HOME when unset) before serve/Next.
+{
+  const { ensureAndroidCacheDir } = await import("./cli/utils/ensureAndroidCacheDir.mjs");
+  ensureAndroidCacheDir();
 }
 
-if (args.includes("--version") || args.includes("-v")) {
-  try {
-    const { version } = JSON.parse(readFileSync(join(ROOT, "package.json"), "utf8"));
-    console.log(version);
-  } catch {
-    console.log("unknown");
+// Generate STORAGE_ENCRYPTION_KEY if not set (persisted to DATA_DIR or getDefaultDataDir()/.env)
+// This ensures the key survives across upgrades and is not regenerated on each install.
+// See: https://github.com/cheaper-inference/OmniRoute/issues/1622
+//
+// Only provision for commands that actually touch encrypted storage. Purely
+// informational invocations (`--version`, `--help`, `help`) must not create a
+// key or write ~/.omniroute/.env — running a read-only command should never
+// mutate the data dir.
+if (shouldProvisionStorageKey(process.argv)) {
+  const { randomBytes } = await import("node:crypto");
+  const { existsSync, readFileSync } = await import("node:fs");
+  const { join } = await import("node:path");
+
+  // GHSA-2pg2-xm9r-8544: installs created before the fix have a world-readable .env and a
+  // world-traversable data dir. Repair them on every run that touches encrypted storage
+  // (best-effort; group bits are kept). Informational commands never reach this block.
+  tightenDataDirSecrets(process.env.DATA_DIR || getDefaultDataDir());
+
+  if (!process.env.STORAGE_ENCRYPTION_KEY) {
+    // Persist the key into DATA_DIR when set — that's the directory mounted as a volume in
+    // Docker (where storage.sqlite lives), so the key survives `docker down` / `docker pull`.
+    // Writing only to ~/.omniroute (the container home, not a volume) silently lost the key on
+    // container recreation, leaving the persisted encrypted DB undecryptable (regression of #1622).
+    const dataDir = process.env.DATA_DIR || getDefaultDataDir();
+    const envPath = join(dataDir, ".env");
+    const dbPath = join(dataDir, "storage.sqlite");
+
+    // Safety guard: never auto-generate a fresh key when a database already exists in
+    // DATA_DIR. A new key cannot decrypt previously-encrypted credentials and would lock the
+    // user out (then the encryption layer aborts on every read). Mirrors bootstrapEnv's
+    // hasEncryptedCredentials guard. Restoring the previous key in DATA_DIR/.env recovers it.
+    // (#1622 follow-up — reported by Daniel Nach; original persistence by @Chewji9875)
+    if (existsSync(dbPath)) {
+      console.warn(
+        `  \x1b[33m⚠ STORAGE_ENCRYPTION_KEY is not set but a database already exists at\x1b[0m\n` +
+          `  \x1b[33m  ${dbPath}\x1b[0m\n` +
+          `  \x1b[33m  Not auto-generating a new key — it could not decrypt existing data. Restore your\x1b[0m\n` +
+          `  \x1b[33m  previous key in ${envPath}, or move/remove the database to start fresh.\x1b[0m`
+      );
+    } else {
+      // First run (no database yet) — generate and persist a fresh key.
+      // GHSA-2pg2-xm9r-8544: owner-only — .env holds the key to every stored credential.
+      ensurePrivateDataDir(dataDir);
+
+      const key = randomBytes(32).toString("hex");
+
+      // Read existing .env content or start fresh
+      let content = "";
+      if (existsSync(envPath)) {
+        content = readFileSync(envPath, "utf-8");
+      }
+
+      // Append key if not already present
+      if (!content.includes("STORAGE_ENCRYPTION_KEY=")) {
+        const separator = content.trim() ? "\n" : "";
+        const newContent = content.trimEnd() + separator + `STORAGE_ENCRYPTION_KEY=${key}`;
+        writePrivateFile(envPath, newContent + "\n");
+        console.log(`  \x1b[2m✨ Generated STORAGE_ENCRYPTION_KEY in ${envPath}\x1b[0m`);
+      }
+
+      // Set in process.env for immediate use
+      process.env.STORAGE_ENCRYPTION_KEY = key;
+    }
   }
-  process.exit(0);
 }
 
-// ── MCP Server Mode ───────────────────────────────────────
-if (args.includes("--mcp")) {
+// Apply --lang before Commander parses (program descriptions call t() during setup)
+{
+  const langIdx = process.argv.findIndex((a) => a === "--lang");
+  const langArg = langIdx >= 0 ? process.argv[langIdx + 1] : null;
+  const langEnv = process.env.OMNIROUTE_LANG;
+  const chosen = langArg || langEnv;
+  if (chosen) {
+    const { setLocale } = await import(pathToFileURL(join(ROOT, "bin", "cli", "i18n.mjs")).href);
+    setLocale(chosen);
+  }
+}
+
+// Register update notifier — checks npm once per 24h, notifies on exit via stderr.
+const _pkg = JSON.parse(readFileSync(join(ROOT, "package.json"), "utf8"));
+const _notifier = updateNotifier
+  ? updateNotifier({ pkg: _pkg, updateCheckInterval: 1000 * 60 * 60 * 24 })
+  : null;
+process.on("exit", () => {
+  if (!_notifier || !_notifier.update) return;
+  if (process.env.OMNIROUTE_NO_UPDATE_NOTIFIER) return;
+  if (process.env.CI) return;
+  if (process.argv.includes("--quiet") || process.argv.includes("-q")) return;
+  const outputIdx = process.argv.indexOf("--output");
+  const outputVal = outputIdx >= 0 ? process.argv[outputIdx + 1] : null;
+  if (outputVal === "json" || outputVal === "jsonl" || outputVal === "csv") return;
+  if (
+    process.argv.some(
+      (a) =>
+        a.startsWith("--output=json") ||
+        a.startsWith("--output=jsonl") ||
+        a.startsWith("--output=csv")
+    )
+  )
+    return;
+  if (_notifier.update) {
+    _notifier.notify({
+      defer: false,
+      isGlobal: true,
+      message:
+        `Update available: ${_notifier.update.current} → ${_notifier.update.latest}\n` +
+        "Run `npm install -g omniroute` or `omniroute update --apply`",
+    });
+  }
+});
+
+if (process.argv.includes("--mcp")) {
   try {
-    const { startMcpCli } = await import(join(ROOT, "bin", "mcp-server.mjs"));
+    const { startMcpCli } = await import(pathToFileURL(join(ROOT, "bin", "mcp-server.mjs")).href);
     await startMcpCli(ROOT);
   } catch (err) {
     console.error("\x1b[31m✖ Failed to start MCP server:\x1b[0m", err.message || err);
@@ -136,205 +426,31 @@ if (args.includes("--mcp")) {
   process.exit(0);
 }
 
-function parsePort(value, fallback) {
-  const parsed = parseInt(String(value), 10);
-  return Number.isFinite(parsed) && parsed > 0 && parsed <= 65535 ? parsed : fallback;
-}
-
-// Parse --port (canonical/base port)
-let port = parsePort(process.env.PORT || "20128", 20128);
-const portIdx = args.indexOf("--port");
-if (portIdx !== -1 && args[portIdx + 1]) {
-  const cliPort = parsePort(args[portIdx + 1], null);
-  if (cliPort === null) {
-    console.error("\x1b[31m✖ Invalid port number\x1b[0m");
-    process.exit(1);
-  }
-  port = cliPort;
-}
-
-const apiPort = parsePort(process.env.API_PORT || String(port), port);
-const dashboardPort = parsePort(process.env.DASHBOARD_PORT || String(port), port);
-
-const noOpen = args.includes("--no-open");
-
-// ── Banner ─────────────────────────────────────────────────
-console.log(`
-\x1b[36m   ____                  _ ____              _
-   / __ \\                (_) __ \\            | |
-  | |  | |_ __ ___  _ __ _| |__) |___  _   _| |_ ___
-  | |  | | '_ \` _ \\| '_ \\ |  _  // _ \\| | | | __/ _ \\
-  | |__| | | | | | | | | | | | \\ \\ (_) | |_| | ||  __/
-   \\____/|_| |_| |_|_| |_|_|_|  \\_\\___/ \\__,_|\\__\\___|
-\x1b[0m`);
-
-// ── Node.js version check ──────────────────────────────────
-const nodeMajor = parseInt(process.versions.node.split(".")[0], 10);
-if (nodeMajor >= 24) {
-  console.warn(`\x1b[33m  ⚠  Warning: You are running Node.js ${process.versions.node}.
-     OmniRoute uses better-sqlite3, a native addon that does not yet
-     have compatible prebuilt binaries for Node.js 24+.
-     You may experience errors like "is not a valid Win32 application"
-     or "NODE_MODULE_VERSION mismatch".
-
-     Recommended: use Node.js 22 LTS (or 20 LTS).
-     Workaround:  npm rebuild better-sqlite3\x1b[0m
-`);
-}
-
-// ── Resolve server entry ───────────────────────────────────
-const serverJs = join(APP_DIR, "server.js");
-
-if (!existsSync(serverJs)) {
-  console.error("\x1b[31m✖ Server not found at:\x1b[0m", serverJs);
-  console.error("  The package may not have been built correctly.");
-  console.error("");
-  // (#492) Detect common non-standard Node managers that cause this issue
-  const nodeExec = process.execPath || "";
-  const isMise = nodeExec.includes("mise") || nodeExec.includes(".local/share/mise");
-  const isNvm = nodeExec.includes(".nvm") || nodeExec.includes("nvm");
-  if (isMise) {
-    console.error(
-      "  \x1b[33m⚠ mise detected:\x1b[0m If you installed via `npm install -g omniroute`,"
-    );
-    console.error("    try: \x1b[36mnpx omniroute@latest\x1b[0m  (downloads a fresh copy)");
-    console.error("    or:  \x1b[36mmise exec -- npx omniroute\x1b[0m");
-  } else if (isNvm) {
-    console.error(
-      "  \x1b[33m⚠ nvm detected:\x1b[0m Try reinstalling after loading the correct Node version:"
-    );
-    console.error("    \x1b[36mnvm use --lts && npm install -g omniroute\x1b[0m");
-  } else {
-    console.error("  Try: \x1b[36mnpm install -g omniroute\x1b[0m  (reinstall)");
-    console.error("  Or:  \x1b[36mnpx omniroute@latest\x1b[0m");
-  }
-  process.exit(1);
-}
-
-// ── Pre-flight: verify better-sqlite3 native binary ───────
-// Verify the binary's actual target platform/arch before trusting dlopen.
-// This avoids the macOS false positive where a bundled linux-x64 addon can
-// appear to load even though the runtime will fail when better-sqlite3 starts.
-const sqliteBinary = join(
-  APP_DIR,
-  "node_modules",
-  "better-sqlite3",
-  "build",
-  "Release",
-  "better_sqlite3.node"
-);
-if (existsSync(sqliteBinary) && !isNativeBinaryCompatible(sqliteBinary)) {
-  console.error(
-    "\x1b[31m✖ better-sqlite3 native module is incompatible with this platform.\x1b[0m"
+if (process.argv.includes("reset-encrypted-columns")) {
+  const { runResetEncryptedColumns } = await import(
+    pathToFileURL(join(ROOT, "bin", "cli", "commands", "reset-encrypted-columns.mjs")).href
   );
-  console.error(`  Run: cd ${APP_DIR} && npm rebuild better-sqlite3`);
-  if (platform() === "darwin") {
-    console.error("  If build tools are missing: xcode-select --install");
-  }
+  const exitCode = await runResetEncryptedColumns(process.argv.slice(2));
+  process.exit(exitCode ?? 0);
+}
+
+if (process.argv.includes("reset-password")) {
+  // bin/reset-password.mjs self-executes its `main()` on import and calls
+  // process.exit() on completion/error. Await a never-resolving promise so
+  // control never falls through to Commander (which would then reject
+  // `reset-password` as an unknown command). See #6261.
+  await import(pathToFileURL(join(ROOT, "bin", "reset-password.mjs")).href);
+  await new Promise(() => {});
+}
+
+try {
+  const { createProgram } = await import(
+    pathToFileURL(join(ROOT, "bin", "cli", "program.mjs")).href
+  );
+  const program = createProgram();
+  await program.parseAsync(process.argv);
+} catch (err) {
+  if (err.exitCode !== undefined) process.exit(err.exitCode);
+  console.error("\x1b[31m✖", err.message, "\x1b[0m");
   process.exit(1);
 }
-
-// ── Start server ───────────────────────────────────────────
-console.log(`  \x1b[2m⏳ Starting server...\x1b[0m\n`);
-
-// Sanitize memory limit — parseInt to prevent command injection (#150)
-const rawMemory = parseInt(process.env.OMNIROUTE_MEMORY_MB || "512", 10);
-const memoryLimit =
-  Number.isFinite(rawMemory) && rawMemory >= 64 && rawMemory <= 16384 ? rawMemory : 512;
-
-const env = {
-  ...process.env,
-  OMNIROUTE_PORT: String(port),
-  PORT: String(dashboardPort),
-  DASHBOARD_PORT: String(dashboardPort),
-  API_PORT: String(apiPort),
-  HOSTNAME: "0.0.0.0",
-  NODE_ENV: "production",
-  NODE_OPTIONS: `--max-old-space-size=${memoryLimit}`,
-};
-
-const server = spawn("node", [`--max-old-space-size=${memoryLimit}`, serverJs], {
-  cwd: APP_DIR,
-  env,
-  stdio: "pipe",
-});
-
-let started = false;
-
-server.stdout.on("data", (data) => {
-  const text = data.toString();
-  process.stdout.write(text);
-
-  // Detect server ready
-  if (
-    !started &&
-    (text.includes("Ready") || text.includes("started") || text.includes("listening"))
-  ) {
-    started = true;
-    onReady();
-  }
-});
-
-server.stderr.on("data", (data) => {
-  process.stderr.write(data);
-});
-
-server.on("error", (err) => {
-  console.error("\x1b[31m✖ Failed to start server:\x1b[0m", err.message);
-  process.exit(1);
-});
-
-server.on("exit", (code) => {
-  if (code !== 0 && code !== null) {
-    console.error(`\x1b[31m✖ Server exited with code ${code}\x1b[0m`);
-  }
-  process.exit(code ?? 0);
-});
-
-// ── Graceful shutdown ──────────────────────────────────────
-function shutdown() {
-  console.log("\n\x1b[33m⏹ Shutting down OmniRoute...\x1b[0m");
-  server.kill("SIGTERM");
-  setTimeout(() => {
-    server.kill("SIGKILL");
-    process.exit(0);
-  }, 5000);
-}
-
-process.on("SIGINT", shutdown);
-process.on("SIGTERM", shutdown);
-
-// ── On ready ───────────────────────────────────────────────
-async function onReady() {
-  const dashboardUrl = `http://localhost:${dashboardPort}`;
-  const apiUrl = `http://localhost:${apiPort}`;
-
-  console.log(`
-  \x1b[32m✔ OmniRoute is running!\x1b[0m
-
-  \x1b[1m  Dashboard:\x1b[0m  ${dashboardUrl}
-  \x1b[1m  API Base:\x1b[0m   ${apiUrl}/v1
-
-  \x1b[2m  Point your CLI tool (Cursor, Cline, Codex) to:\x1b[0m
-  \x1b[33m  ${apiUrl}/v1\x1b[0m
-
-  \x1b[2m  Press Ctrl+C to stop\x1b[0m
-  `);
-
-  if (!noOpen) {
-    try {
-      const open = await import("open");
-      await open.default(dashboardUrl);
-    } catch {
-      // open is optional — if not available, just skip
-    }
-  }
-}
-
-// Fallback: if no "Ready" message detected in 15s, assume server is up
-setTimeout(() => {
-  if (!started) {
-    started = true;
-    onReady();
-  }
-}, 15000);

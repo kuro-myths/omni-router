@@ -1,15 +1,20 @@
 "use server";
 
 import { NextResponse } from "next/server";
+import { requireCliToolsAuth } from "@/lib/api/requireCliToolsAuth";
 import { listBackups, restoreBackup, deleteBackup } from "@/shared/services/backupService";
 import { ensureCliConfigWriteAllowed } from "@/shared/services/cliRuntime";
 import { cliBackupMutationSchema } from "@/shared/validation/schemas";
 import { isValidationFailure, validateBody } from "@/shared/validation/helpers";
+import { sanitizeErrorMessage } from "@omniroute/open-sse/utils/error";
 
-const VALID_TOOLS = ["claude", "codex", "droid", "openclaw", "cline", "kilo"];
+const VALID_TOOLS = ["claude", "codex", "droid", "grok-build", "openclaw", "cline", "kilo", "qwen"];
 
 // GET /api/cli-tools/backups?tool=claude — list backups
 export async function GET(request) {
+  const authError = await requireCliToolsAuth(request, { alwaysRequireAuth: true });
+  if (authError) return authError;
+
   try {
     const { searchParams } = new URL(request.url);
     const tool = searchParams.get("tool") || searchParams.get("toolId");
@@ -37,6 +42,9 @@ export async function GET(request) {
 
 // POST /api/cli-tools/backups { tool, backupId } — restore a backup
 export async function POST(request) {
+  const authError = await requireCliToolsAuth(request, { alwaysRequireAuth: true });
+  if (authError) return authError;
+
   let rawBody;
   try {
     rawBody = await request.json();
@@ -78,7 +86,11 @@ export async function POST(request) {
   } catch (error) {
     console.log("Error restoring backup:", error.message);
     return NextResponse.json(
-      { error: error.message || "Failed to restore backup" },
+      {
+        error:
+          sanitizeErrorMessage(error instanceof Error ? error.message : String(error)) ||
+          "Failed to restore backup",
+      },
       { status: 500 }
     );
   }
@@ -86,6 +98,9 @@ export async function POST(request) {
 
 // DELETE /api/cli-tools/backups { tool, backupId } — delete a backup
 export async function DELETE(request) {
+  const authError = await requireCliToolsAuth(request, { alwaysRequireAuth: true });
+  if (authError) return authError;
+
   let rawBody;
   try {
     rawBody = await request.json();

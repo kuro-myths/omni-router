@@ -4,47 +4,51 @@
  * Stores extracted facts asynchronously (non-blocking).
  */
 
+import { logger } from "../../../open-sse/utils/logger.ts";
 import { createMemory } from "./store";
 import { MemoryType } from "./types";
+
+const log = logger("MEMORY_EXTRACTION");
 
 // ─── Pattern Definitions ────────────────────────────────────────────────────
 
 /** Patterns indicating user preferences */
 const PREFERENCE_PATTERNS: RegExp[] = [
-  /\bI\s+(?:really\s+)?prefer\s+(.+?)(?:\.|,|$)/gi,
-  /\bI\s+(?:really\s+)?like\s+(.+?)(?:\.|,|$)/gi,
-  /\bmy\s+(?:favorite|favourite)\s+(?:is|are)\s+(.+?)(?:\.|,|$)/gi,
-  /\bI\s+(?:don'?t|do\s+not)\s+like\s+(.+?)(?:\.|,|$)/gi,
-  /\bI\s+(?:hate|dislike|avoid)\s+(.+?)(?:\.|,|$)/gi,
-  /\bI\s+enjoy\s+(.+?)(?:\.|,|$)/gi,
-  /\bI\s+love\s+(.+?)(?:\.|,|$)/gi,
+  /\bI\s+(?:really\s+)?prefer\s+([^.,\n]+)/gi,
+  /\bI\s+(?:really\s+)?like\s+([^.,\n]+)/gi,
+  /\bmy\s+(?:favorite|favourite)\s+(?:is|are)\s+([^.,\n]+)/gi,
+  /\bI\s+(?:don'?t|do\s+not)\s+like\s+([^.,\n]+)/gi,
+  /\bI\s+(?:hate|dislike|avoid)\s+([^.,\n]+)/gi,
+  /\bI\s+enjoy\s+([^.,\n]+)/gi,
+  /\bI\s+love\s+([^.,\n]+)/gi,
 ];
 
 /** Patterns indicating user decisions */
 const DECISION_PATTERNS: RegExp[] = [
-  /\bI'?(?:ll|will)\s+use\s+(.+?)(?:\.|,|$)/gi,
-  /\bI\s+chose\s+(.+?)(?:\.|,|$)/gi,
-  /\bI\s+(?:have\s+)?decided\s+(?:to\s+)?(.+?)(?:\.|,|$)/gi,
-  /\bI'?m\s+going\s+(?:to\s+)?(?:use|with|adopt)\s+(.+?)(?:\.|,|$)/gi,
-  /\bI\s+selected\s+(.+?)(?:\.|,|$)/gi,
-  /\bI\s+picked\s+(.+?)(?:\.|,|$)/gi,
-  /\bI\s+went\s+with\s+(.+?)(?:\.|,|$)/gi,
+  /\bI'?(?:ll|will)\s+use\s+([^.,\n]+)/gi,
+  /\bI\s+chose\s+([^.,\n]+)/gi,
+  /\bI\s+(?:have\s+)?decided\s+(?:to\s+)?([^.,\n]+)/gi,
+  /\bI'?m\s+going\s+(?:to\s+)?(?:use|with|adopt)\s+([^.,\n]+)/gi,
+  /\bI\s+selected\s+([^.,\n]+)/gi,
+  /\bI\s+picked\s+([^.,\n]+)/gi,
+  /\bI\s+went\s+with\s+([^.,\n]+)/gi,
 ];
 
 /** Patterns indicating user behavioral patterns */
 const PATTERN_PATTERNS: RegExp[] = [
-  /\bI\s+usually\s+(.+?)(?:\.|,|$)/gi,
-  /\bI\s+always\s+(.+?)(?:\.|,|$)/gi,
-  /\bI\s+never\s+(.+?)(?:\.|,|$)/gi,
-  /\bI\s+typically\s+(.+?)(?:\.|,|$)/gi,
-  /\bI\s+tend\s+to\s+(.+?)(?:\.|,|$)/gi,
-  /\bI\s+(?:often|frequently|regularly)\s+(.+?)(?:\.|,|$)/gi,
+  /\bI\s+usually\s+([^.,\n]+)/gi,
+  /\bI\s+always\s+([^.,\n]+)/gi,
+  /\bI\s+never\s+([^.,\n]+)/gi,
+  /\bI\s+typically\s+([^.,\n]+)/gi,
+  /\bI\s+tend\s+to\s+([^.,\n]+)/gi,
+  /\bI\s+(?:often|frequently|regularly)\s+([^.,\n]+)/gi,
 ];
 
 // Maximum length for extracted content
 const MAX_FACT_LENGTH = 500;
 // Minimum content length to avoid noise
 const MIN_FACT_LENGTH = 3;
+const MAX_EXTRACTION_TEXT_LENGTH = 64 * 1024;
 
 // ─── Types ──────────────────────────────────────────────────────────────────
 
@@ -57,11 +61,65 @@ export interface ExtractedFact {
 
 // ─── Extraction Logic ────────────────────────────────────────────────────────
 
+// Lookback window (chars) used to back a hard cut index off to a clean
+// sentence or word boundary instead of slicing mid-word (see #8169's
+// compressToolResults for the same pattern applied to tool-result truncation).
+const BOUNDARY_LOOKBACK = 80;
+
+function isWordChar(char: string | undefined): boolean {
+  return char !== undefined && /\S/.test(char);
+}
+
 /**
- * Sanitize a matched string: trim, collapse whitespace, cap length
+ * Back a hard cut index off to the nearest clean boundary within
+ * BOUNDARY_LOOKBACK chars before it. Prefers a sentence-ending punctuation
+ * mark (. ! ?) so a fact reads as a complete clause; falls back to a plain
+ * whitespace/word boundary; falls back to the original cut index when
+ * neither is found in the window (e.g. one long unbroken run of chars).
+ */
+function backOffToBoundary(content: string, cutIndex: number): number {
+  if (!isWordChar(content[cutIndex - 1]) || !isWordChar(content[cutIndex])) return cutIndex;
+
+  const windowStart = Math.max(0, cutIndex - BOUNDARY_LOOKBACK);
+
+  for (let i = cutIndex; i > windowStart; i--) {
+    if (/[.!?]/.test(content[i - 1])) return i;
+  }
+
+  for (let i = cutIndex; i > windowStart; i--) {
+    if (!isWordChar(content[i - 1])) return i - 1;
+  }
+
+  return cutIndex;
+}
+
+/**
+ * Sanitize a matched string: trim, collapse whitespace, cap length without
+ * cutting mid-word or mid-clause.
  */
 function sanitizeMatch(raw: string): string {
-  return raw.trim().replace(/\s+/g, " ").slice(0, MAX_FACT_LENGTH);
+  const collapsed = raw.trim().replace(/\s+/g, " ");
+  if (collapsed.length <= MAX_FACT_LENGTH) return collapsed;
+  return collapsed.slice(0, backOffToBoundary(collapsed, MAX_FACT_LENGTH));
+}
+
+/**
+ * Cap oversized extraction input to its tail, without cutting the leading
+ * edge of the kept tail mid-word.
+ */
+function capExtractionText(text: string): string {
+  if (text.length <= MAX_EXTRACTION_TEXT_LENGTH) return text;
+  const cutIndex = text.length - MAX_EXTRACTION_TEXT_LENGTH;
+  if (!isWordChar(text[cutIndex - 1]) || !isWordChar(text[cutIndex])) {
+    return text.slice(cutIndex);
+  }
+
+  const windowEnd = Math.min(text.length, cutIndex + BOUNDARY_LOOKBACK);
+  for (let i = cutIndex; i < windowEnd; i++) {
+    if (!isWordChar(text[i])) return text.slice(i);
+  }
+
+  return text.slice(cutIndex);
 }
 
 /**
@@ -123,6 +181,8 @@ function runPatterns(
 export function extractFactsFromText(text: string): ExtractedFact[] {
   if (!text || typeof text !== "string") return [];
 
+  text = capExtractionText(text);
+
   const seen = new Set<string>();
   const facts: ExtractedFact[] = [];
 
@@ -150,13 +210,18 @@ export function extractFactsFromText(text: string): ExtractedFact[] {
 export function extractFacts(response: string, apiKeyId: string, sessionId: string): void {
   if (!response || !apiKeyId || !sessionId) return;
 
+  const cappedResponse = capExtractionText(response);
+
+  log.info("memory.extraction.start", { apiKeyId });
+
   // Non-blocking: schedule after current event loop tick
   setImmediate(() => {
-    const facts = extractFactsFromText(response);
+    const facts = extractFactsFromText(cappedResponse);
     if (facts.length === 0) return;
 
-    // Store each fact, swallow errors to never block the response pipeline
     for (const fact of facts) {
+      log.debug("memory.extraction.fact_found", { key: fact.key, category: fact.category });
+
       createMemory({
         apiKeyId,
         sessionId,
@@ -170,11 +235,10 @@ export function extractFacts(response: string, apiKeyId: string, sessionId: stri
         },
         expiresAt: null,
       }).catch((err) => {
-        // Silent: extraction must never affect response delivery
-        if (process.env.NODE_ENV !== "test") {
-          console.warn("[memory:extraction] Failed to store fact:", err?.message);
-        }
+        log.error("memory.extraction.background.failed", { err: err?.message, apiKeyId });
       });
     }
+
+    log.info("memory.extraction.complete", { apiKeyId, factCount: facts.length });
   });
 }

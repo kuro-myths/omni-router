@@ -1,8 +1,19 @@
+import { withConnectionSpeedStats } from "@/lib/usage/connectionSpeedStats";
 import { fetchAndPersistProviderLimits } from "@/lib/usage/providerLimits";
 
 /**
  * GET /api/usage/[connectionId] - Get live usage data for a specific connection
  * and persist the refreshed Provider Limits cache.
+ *
+ * This is the on-demand, per-connection path (the dashboard quota page fetches
+ * only the connections it shows through here, not all of them at once). It opts
+ * into refreshing rotating-refresh providers (Codex/OpenAI) so an account with an
+ * expired access_token still surfaces live quota — made cascade-safe by
+ * `serializeRefresh` (one token mint at a time per Auth0 group). The bulk
+ * scheduler keeps the #3019 behaviour of never refreshing rotating providers.
+ *
+ * The response also carries `speed` (recent decode tok/s + TTFT for this
+ * connection), computed at read time and fail-open; it is not persisted.
  */
 export async function GET(
   _request: Request,
@@ -10,8 +21,11 @@ export async function GET(
 ) {
   try {
     const { connectionId } = await params;
-    const { usage } = await fetchAndPersistProviderLimits(connectionId, "manual");
-    return Response.json(usage);
+    const { usage } = await fetchAndPersistProviderLimits(connectionId, "manual", {
+      allowRotatingRefresh: true,
+      includeResetCredits: true,
+    });
+    return Response.json(withConnectionSpeedStats(connectionId, usage));
   } catch (error) {
     const status =
       typeof (error as { status?: unknown })?.status === "number"

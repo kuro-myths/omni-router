@@ -1,29 +1,37 @@
 "use client";
 
-import { useState, useEffect } from "react";
-import { Card, Toggle } from "@/shared/components";
+import { useState, useEffect, useRef } from "react";
 import { useTranslations } from "next-intl";
+import { Field } from "@omniroute/ui-kit/field";
+import { Card, Textarea, Toggle } from "@/shared/components";
+import Icon from "@/shared/components/Icon";
 
 export default function SystemPromptTab() {
-  const [config, setConfig] = useState({ enabled: false, prompt: "" });
+  const [config, setConfig] = useState({ enabled: false, prefixPrompt: "", suffixPrompt: "" });
   const [loading, setLoading] = useState(true);
   const [status, setStatus] = useState("");
   const [debounceTimer, setDebounceTimer] = useState(null);
+  const configRef = useRef(config);
   const t = useTranslations("settings");
 
   useEffect(() => {
     fetch("/api/settings/system-prompt")
       .then((res) => res.json())
       .then((data) => {
-        setConfig(data);
+        setConfig({
+          enabled: data?.enabled ?? false,
+          prefixPrompt: data?.prefixPrompt ?? "",
+          suffixPrompt: data?.suffixPrompt ?? "",
+        });
         setLoading(false);
       })
       .catch(() => setLoading(false));
   }, []);
 
   const save = async (updates) => {
-    const newConfig = { ...config, ...updates };
+    const newConfig = { ...configRef.current, ...updates };
     setConfig(newConfig);
+    configRef.current = newConfig;
     setStatus("");
     try {
       const res = await fetch("/api/settings/system-prompt", {
@@ -40,12 +48,14 @@ export default function SystemPromptTab() {
     }
   };
 
-  const handlePromptChange = (text) => {
-    setConfig((prev) => ({ ...prev, prompt: text }));
+  const handleFieldChange = (field, text) => {
+    const updated = { ...configRef.current, [field]: text };
+    setConfig(updated);
+    configRef.current = updated;
     if (debounceTimer) clearTimeout(debounceTimer);
     setDebounceTimer(
       setTimeout(() => {
-        save({ prompt: text });
+        save({ [field]: text });
       }, 800)
     );
   };
@@ -53,52 +63,82 @@ export default function SystemPromptTab() {
   return (
     <Card>
       <div className="flex items-center gap-3 mb-5">
-        <div className="p-2 rounded-lg bg-amber-500/10 text-amber-500">
-          <span className="material-symbols-outlined text-[20px]" aria-hidden="true">
-            edit_note
-          </span>
+        <div className="p-2 rounded-lg bg-bg-subtle text-text-muted">
+          <Icon name="edit_note" size={20} />
         </div>
         <div className="flex-1">
           <h3 className="text-lg font-semibold">{t("globalSystemPrompt")}</h3>
-          <p className="text-sm text-text-muted">{t("systemPromptDesc")}</p>
         </div>
         <div className="flex items-center gap-3">
           {status === "saved" && (
-            <span className="text-xs font-medium text-emerald-500 flex items-center gap-1">
-              <span className="material-symbols-outlined text-[14px]">check_circle</span>{" "}
-              {t("saved")}
+            <span className="text-xs font-medium text-success flex items-center gap-1">
+              <Icon name="check_circle" size={14} /> {t("saved")}
             </span>
           )}
           <Toggle
             checked={config.enabled}
             onChange={() => save({ enabled: !config.enabled })}
             disabled={loading}
+            ariaLabel={t("globalSystemPrompt")}
           />
         </div>
       </div>
 
       {config.enabled && (
-        <div className="flex flex-col gap-3">
-          <div className="relative">
-            <textarea
-              value={config.prompt}
-              onChange={(e) => handlePromptChange(e.target.value)}
-              placeholder={t("systemPromptPlaceholder")}
-              rows={5}
-              className="w-full px-4 py-3 rounded-lg border border-border/50 bg-surface/30 text-sm
-                         placeholder:text-text-muted/50 resize-y min-h-[120px]
-                         focus:outline-none focus:ring-1 focus:ring-amber-500/30 focus:border-amber-500/50
-                         transition-colors"
-              disabled={loading}
-            />
-            <div className="absolute bottom-2 right-3 text-xs text-text-muted/60 tabular-nums">
-              {t("chars", { count: config.prompt.length })}
+        <div className="flex flex-col gap-5">
+          {/* Before Prompt — injected BEFORE agent/provider instructions */}
+          <Field
+            htmlFor="system-prompt-before"
+            label={
+              <span className="flex items-center gap-1.5">
+                <Icon name="vertical_align_top" size={16} />
+                {t("beforePromptLabel")}
+              </span>
+            }
+            hint={t("beforePromptDesc")}
+          >
+            <div className="relative">
+              <Textarea
+                id="system-prompt-before"
+                value={config.prefixPrompt}
+                onChange={(e) => handleFieldChange("prefixPrompt", e.target.value)}
+                placeholder={t("beforePromptPlaceholder")}
+                rows={9}
+                className="min-h-[220px] resize-y"
+                disabled={loading}
+              />
+              <div className="absolute bottom-2 right-3 text-xs text-text-muted tabular-nums">
+                {t("chars", { count: config.prefixPrompt.length })}
+              </div>
             </div>
-          </div>
-          <p className="text-xs text-text-muted/70 flex items-center gap-1.5">
-            <span className="material-symbols-outlined text-[14px]">info</span>
-            {t("systemPromptHint")}
-          </p>
+          </Field>
+
+          {/* After Prompt — injected AFTER agent/provider instructions */}
+          <Field
+            htmlFor="system-prompt-after"
+            label={
+              <span className="flex items-center gap-1.5">
+                <Icon name="vertical_align_bottom" size={16} />
+                {t("afterPromptLabel")}
+              </span>
+            }
+            hint={t("afterPromptDesc")}
+          >
+            <div className="relative">
+              <Textarea
+                id="system-prompt-after"
+                value={config.suffixPrompt}
+                onChange={(e) => handleFieldChange("suffixPrompt", e.target.value)}
+                placeholder={t("afterPromptPlaceholder")}
+                rows={9}
+                className="min-h-[220px] resize-y"
+                disabled={loading}
+              />
+              <div className="absolute bottom-2 right-3 text-xs text-text-muted tabular-nums">
+                {t("chars", { count: config.suffixPrompt.length })}
+              </div>
+            </div>
+          </Field>
         </div>
       )}
     </Card>

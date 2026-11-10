@@ -1,19 +1,21 @@
 import { NextResponse } from "next/server";
 import {
-  getCachedProviderLimitsMap,
   getLastProviderLimitsAutoSyncTime,
   getProviderLimitsSyncIntervalMinutes,
+  getSanitizedCachedProviderLimitsMap,
   syncAllProviderLimits,
 } from "@/lib/usage/providerLimits";
+import { attachConnectionSpeedStats } from "@/lib/usage/connectionSpeedStats";
 
 /**
  * GET /api/usage/provider-limits
- * Returns cached Provider Limits data without triggering live refreshes.
+ * Returns cached Provider Limits data without triggering live refreshes. Each entry
+ * also carries its connection's read-time `speed` stats when available.
  */
 export async function GET() {
   try {
     return NextResponse.json({
-      caches: getCachedProviderLimitsMap(),
+      caches: attachConnectionSpeedStats(await getSanitizedCachedProviderLimitsMap()),
       intervalMinutes: getProviderLimitsSyncIntervalMinutes(),
       lastAutoSyncAt: await getLastProviderLimitsAutoSyncTime(),
     });
@@ -30,7 +32,7 @@ export async function GET() {
 export async function POST() {
   try {
     const result = await syncAllProviderLimits({ source: "manual" });
-    const caches = getCachedProviderLimitsMap();
+    const caches = attachConnectionSpeedStats(await getSanitizedCachedProviderLimitsMap());
     return NextResponse.json({
       ...result,
       caches,

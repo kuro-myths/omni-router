@@ -10,6 +10,11 @@
  * Header order and body field order were captured via mitmproxy traffic analysis.
  */
 import { isClaudeCodeCompatible } from "../services/provider.ts";
+import {
+  getAntigravityUserAgent,
+  getGitHubCopilotChatUserAgent,
+} from "./providerHeaderProfiles.ts";
+import { normalizeCliCompatProviderId } from "@/shared/utils/cliCompat";
 
 export interface CliFingerprint {
   /** Ordered list of header names (case-sensitive). Unlisted headers are appended. */
@@ -17,7 +22,7 @@ export interface CliFingerprint {
   /** Ordered list of top-level JSON body fields. Unlisted fields are appended. */
   bodyFieldOrder: string[];
   /** User-Agent string to inject (overrides default) */
-  userAgent?: string;
+  userAgent?: string | (() => string);
   /** Extra headers to add */
   extraHeaders?: Record<string, string>;
 }
@@ -38,49 +43,72 @@ export const CLI_FINGERPRINTS: Record<string, CliFingerprint> = {
     ],
     bodyFieldOrder: [
       "model",
-      "messages",
-      "temperature",
-      "top_p",
-      "max_tokens",
       "stream",
+      "input",
+      "instructions",
+      "store",
+      "reasoning",
+      "prompt_cache_key",
       "tools",
       "tool_choice",
-      "response_format",
-      "n",
-      "stop",
+      "include",
+      "service_tier",
+      "client_metadata",
+      "parallel_tool_calls",
+      "metadata",
     ],
-    userAgent: "codex-cli",
+    // Codex builds mode-specific client headers in its executor/config. The CLI fingerprint must
+    // only preserve ordering here; overriding User-Agent with a generic value would erase the
+    // executor-provided version or user override.
   },
   claude: {
+    // Header order matching real claude-cli: Title-Case (Stainless) keys
+    // alphabetically, then lowercase Anthropic keys alphabetically, then
+    // transport headers added by Node fetch.
     headerOrder: [
-      "Host",
-      "Content-Type",
-      "x-api-key",
-      "anthropic-version",
       "Accept",
+      "Authorization",
+      "Content-Type",
       "User-Agent",
+      "X-Claude-Code-Session-Id",
+      "X-Stainless-Arch",
+      "X-Stainless-Lang",
+      "X-Stainless-OS",
+      "X-Stainless-Package-Version",
+      "X-Stainless-Retry-Count",
+      "X-Stainless-Runtime",
+      "X-Stainless-Runtime-Version",
+      "X-Stainless-Timeout",
+      "anthropic-beta",
+      "anthropic-dangerous-direct-browser-access",
+      "anthropic-version",
+      "x-app",
+      "x-client-request-id",
+      "Connection",
+      "Host",
       "Accept-Encoding",
+      "Content-Length",
     ],
     bodyFieldOrder: [
       "model",
-      "max_tokens",
       "messages",
       "system",
-      "temperature",
-      "top_p",
-      "top_k",
-      "stream",
       "tools",
       "tool_choice",
       "metadata",
+      "max_tokens",
+      "temperature",
+      "thinking",
+      "context_management",
+      "output_config",
+      "stream",
     ],
-    userAgent: "claude-code",
   },
   "claude-code-compatible": {
     headerOrder: [
       "Host",
       "Content-Type",
-      "x-api-key",
+      "Authorization",
       "anthropic-version",
       "anthropic-beta",
       "anthropic-dangerous-direct-browser-access",
@@ -96,19 +124,18 @@ export const CLI_FINGERPRINTS: Record<string, CliFingerprint> = {
       "X-Stainless-Runtime",
       "X-Stainless-Runtime-Version",
       "Accept",
-      "accept-language",
-      "sec-fetch-mode",
       "accept-encoding",
+      "Connection",
     ],
     bodyFieldOrder: [
       "model",
       "messages",
       "system",
       "tools",
+      "tool_choice",
       "metadata",
       "max_tokens",
       "thinking",
-      "context_management",
       "output_config",
       "stream",
     ],
@@ -142,71 +169,30 @@ export const CLI_FINGERPRINTS: Record<string, CliFingerprint> = {
       "intent_threshold",
       "intent_content",
     ],
-    userAgent: "GitHubCopilotChat",
+    userAgent: getGitHubCopilotChatUserAgent,
   },
   antigravity: {
+    // Native capture of the Go CLI (agy 1.4.4, Windows): streaming is requested by the
+    // `?alt=sse` query param, so there is no Accept header, and the consumer path carries
+    // no x-goog-* identity headers at all.
     headerOrder: [
       "Host",
       "Content-Type",
       "Authorization",
       "User-Agent",
-      "Accept",
       "Accept-Encoding",
-    ],
-    bodyFieldOrder: ["project", "model", "userAgent", "requestType", "requestId", "request"],
-    userAgent: "antigravity",
-  },
-  qwen: {
-    headerOrder: [
-      "Host",
-      "Content-Type",
-      "Authorization",
-      "User-Agent",
-      "X-Dashscope-AuthType",
-      "X-Dashscope-CacheControl",
-      "X-Dashscope-UserAgent",
-      "X-Stainless-Arch",
-      "X-Stainless-Lang",
-      "X-Stainless-Os",
-      "X-Stainless-Package-Version",
-      "X-Stainless-Retry-Count",
-      "X-Stainless-Runtime",
-      "X-Stainless-Runtime-Version",
-      "Connection",
-      "Accept",
-      "Accept-Language",
-      "Sec-Fetch-Mode",
-      "Accept-Encoding",
+      "Transfer-Encoding",
     ],
     bodyFieldOrder: [
+      "project",
+      "requestId",
+      "request",
       "model",
-      "messages",
-      "temperature",
-      "top_p",
-      "max_tokens",
-      "stream",
-      "tools",
-      "tool_choice",
-      "response_format",
-      "n",
-      "stop",
+      "userAgent",
+      "requestType",
+      "enabledCreditTypes",
     ],
-    userAgent: "QwenCode/0.12.3 (linux; x64)",
-    extraHeaders: {
-      "X-Dashscope-AuthType": "qwen-oauth",
-      "X-Dashscope-CacheControl": "enable",
-      "X-Dashscope-UserAgent": "QwenCode/0.12.3 (linux; x64)",
-      "X-Stainless-Arch": "x64",
-      "X-Stainless-Lang": "js",
-      "X-Stainless-Os": "Linux",
-      "X-Stainless-Package-Version": "5.11.0",
-      "X-Stainless-Retry-Count": "1",
-      "X-Stainless-Runtime": "node",
-      "X-Stainless-Runtime-Version": "v18.19.1",
-      Connection: "keep-alive",
-      "Accept-Language": "*",
-      "Sec-Fetch-Mode": "cors",
-    },
+    userAgent: getAntigravityUserAgent,
   },
 };
 
@@ -273,17 +259,73 @@ export function orderHeaders(
 }
 
 /**
- * Apply a CLI fingerprint to headers and body.
- * Returns { headers, bodyString } with the correct ordering.
+ * Internal request-body markers that are NOT `_omniroute*`-prefixed and must be
+ * removed key-by-key. Everything else is caught by INTERNAL_BODY_FIELD_PREFIX.
  */
+/**
+ * Markers consumed by the EXECUTOR, not by routing: `codex.ts` and `xai.ts` read
+ * them to decide native passthrough and delete them right after. They must survive
+ * the shared pre-executor boundary (#14252) — stripping them there silently turns a
+ * Responses-native request into a translated one, which then loses client fields to
+ * the #2608 allowlist. They are still removed at serialization by applyFingerprint().
+ */
+export const EXECUTOR_CONSUMED_BODY_FIELDS: readonly string[] = [
+  "_claudeCodeRequiresLowercaseToolNames",
+  "_nativeCodexPassthrough",
+  "_nativeXaiResponsesPassthrough",
+  "_nativeOpenAICompatibleResponsesPassthrough",
+];
+
+const INTERNAL_BODY_FIELDS: readonly string[] = [...EXECUTOR_CONSUMED_BODY_FIELDS];
+
+/**
+ * Every omniroute-owned internal marker uses this prefix, so the strip is
+ * prefix-based rather than an allowlist. An allowlist silently leaks each newly
+ * added marker to the upstream, where strict gateways reject the whole request
+ * (observed live: `[400]: _omnirouteSkipContextRelay: Extra inputs are not
+ * permitted` on a claude hop, from the context/universal-handoff markers set in
+ * `open-sse/services/contextHandoff.ts`). Markers are consumed by routing before
+ * dispatch, so removing them at this chokepoint is always safe.
+ *
+ * Deliberately narrow: only omniroute-owned prefixes are ours. A caller-sent
+ * field that merely starts with `_` is client payload and passes through.
+ */
+const INTERNAL_BODY_FIELD_PREFIX = "_omniroute";
+
+/**
+ * Remove omniroute-internal markers from a request body before it is serialized
+ * for an upstream. Mutates and returns the same object.
+ */
+export function stripInternalBodyFields(
+  body: unknown,
+  options: { keepExecutorMarkers?: boolean } = {}
+): unknown {
+  if (!body || typeof body !== "object" || Array.isArray(body)) return body;
+
+  const record = body as Record<string, unknown>;
+  if (!options.keepExecutorMarkers) {
+    for (const field of INTERNAL_BODY_FIELDS) {
+      delete record[field];
+    }
+  }
+  for (const key of Object.keys(record)) {
+    if (key.startsWith(INTERNAL_BODY_FIELD_PREFIX)) {
+      delete record[key];
+    }
+  }
+  return body;
+}
+
 export function applyFingerprint(
   provider: string,
   headers: Record<string, string>,
   body: unknown
 ): { headers: Record<string, string>; bodyString: string } {
+  body = stripInternalBodyFields(body);
+  const normalizedProvider = normalizeCliCompatProviderId(provider || "");
   const fingerprintKey = isClaudeCodeCompatible(provider)
     ? "claude-code-compatible"
-    : provider?.toLowerCase();
+    : normalizedProvider;
   const fingerprint = CLI_FINGERPRINTS[fingerprintKey];
 
   if (!fingerprint) {
@@ -292,7 +334,8 @@ export function applyFingerprint(
 
   // Apply user agent override
   if (fingerprint.userAgent) {
-    headers["User-Agent"] = fingerprint.userAgent;
+    headers["User-Agent"] =
+      typeof fingerprint.userAgent === "function" ? fingerprint.userAgent() : fingerprint.userAgent;
   }
 
   // Apply extra headers
@@ -326,7 +369,11 @@ let _cliCompatProviders: Set<string> = new Set();
  * Called from the settings API when cliCompatProviders is updated.
  */
 export function setCliCompatProviders(providers: string[]): void {
-  _cliCompatProviders = new Set((providers || []).map((p) => p.toLowerCase()));
+  _cliCompatProviders = new Set(
+    (providers || [])
+      .map((p) => normalizeCliCompatProviderId(p))
+      .filter((provider) => provider in CLI_FINGERPRINTS)
+  );
 }
 
 /**
@@ -346,7 +393,8 @@ export function isCliCompatEnabled(provider: string): boolean {
   const key = provider?.toLowerCase().replace(/[^a-z0-9]/g, "_");
 
   // 1. Check runtime cache (set via Settings UI)
-  if (_cliCompatProviders.has(provider?.toLowerCase())) return true;
+  const normalizedProvider = normalizeCliCompatProviderId(provider || "");
+  if (_cliCompatProviders.has(normalizedProvider)) return true;
 
   // 2. Check environment variable: CLI_COMPAT_<PROVIDER>=1
   const envKey = `CLI_COMPAT_${key?.toUpperCase()}`;

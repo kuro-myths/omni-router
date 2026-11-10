@@ -3,36 +3,37 @@
 import { NextResponse } from "next/server";
 import fs from "fs/promises";
 import path from "path";
+import { requireCliToolsAuth } from "@/lib/api/requireCliToolsAuth";
 import {
   ensureCliConfigWriteAllowed,
   getCliPrimaryConfigPath,
   getCliRuntimeStatus,
 } from "@/shared/services/cliRuntime";
 import { createBackup } from "@/shared/services/backupService";
+import { normalizeClaudeBaseUrl } from "@/shared/services/claudeCliConfig";
 import { saveCliToolLastConfigured, deleteCliToolLastConfigured } from "@/lib/db/cliToolState";
 import { cliSettingsEnvSchema } from "@/shared/validation/schemas";
 import { isValidationFailure, validateBody } from "@/shared/validation/helpers";
-import { getApiKeyById } from "@/lib/localDb";
+import { getApiKeyById } from "@/lib/db/apiKeys";
+import { readJsoncConfig } from "../_lib/jsoncConfig";
 
 // Get claude settings path based on OS
 const getClaudeSettingsPath = () => getCliPrimaryConfigPath("claude");
 
-// Read current settings
+// Read current settings.
+// Ported from upstream decolua/9router@6c10edf8: tolerate JSONC (trailing
+// commas) and return null on any parse error so the dashboard renders
+// "installed but not configured" instead of a 500 misread as "not installed".
 const readSettings = async () => {
-  try {
-    const settingsPath = getClaudeSettingsPath();
-    const content = await fs.readFile(settingsPath, "utf-8");
-    return JSON.parse(content);
-  } catch (error: any) {
-    if (error.code === "ENOENT") {
-      return null;
-    }
-    throw error;
-  }
+  const settingsPath = getClaudeSettingsPath();
+  return readJsoncConfig(settingsPath);
 };
 
 // GET - Check claude CLI and read current settings
-export async function GET() {
+export async function GET(request: Request) {
+  const authError = await requireCliToolsAuth(request);
+  if (authError) return authError;
+
   try {
     const runtime = await getCliRuntimeStatus("claude");
 
@@ -74,6 +75,9 @@ export async function GET() {
 
 // POST - Backup old fields and write new settings
 export async function POST(request: Request) {
+  const authError = await requireCliToolsAuth(request);
+  if (authError) return authError;
+
   let rawBody;
   try {
     rawBody = await request.json();
@@ -95,17 +99,19 @@ export async function POST(request: Request) {
       return NextResponse.json({ error: writeGuard }, { status: 403 });
     }
 
+    // (#523/#526) Extract keyId BEFORE validation — Zod strips unknown fields!
+    // The /api/keys list endpoint returns masked key strings — sending those to
+    // disk would save an unusable half-hidden token. Resolving by ID guarantees
+    // we always write the full key value to the config file.
+    const keyId = typeof rawBody?.keyId === "string" ? rawBody.keyId.trim() : null;
+
     const validation = validateBody(cliSettingsEnvSchema, rawBody);
     if (isValidationFailure(validation)) {
       return NextResponse.json({ error: validation.error }, { status: 400 });
     }
     const { env } = validation.data;
 
-    // (#523/#526) If a keyId was provided, resolve the real API key from DB.
-    // The /api/keys list endpoint returns masked key strings — sending those to
-    // disk would save an unusable half-hidden token. Resolving by ID guarantees
-    // we always write the full key value to the config file.
-    const keyId = typeof rawBody?.keyId === "string" ? rawBody.keyId.trim() : null;
+    // Resolve the real API key from DB by ID
     if (keyId) {
       try {
         const keyRecord = await getApiKeyById(keyId);
@@ -113,7 +119,7 @@ export async function POST(request: Request) {
           env.ANTHROPIC_AUTH_TOKEN = keyRecord.key as string;
         }
       } catch {
-        // Non-critical: fall back to whatever value was in env (e.g. sk_omniroute)
+        // Non-critical: fall back to whatever value was already provided in env.
       }
     }
 
@@ -137,11 +143,9 @@ export async function POST(request: Request) {
       }
     }
 
-    // Normalize ANTHROPIC_BASE_URL to ensure /v1 suffix
+    // Claude Code gateway mode expects the unified root endpoint, not a forced /v1 suffix.
     if (env.ANTHROPIC_BASE_URL) {
-      env.ANTHROPIC_BASE_URL = env.ANTHROPIC_BASE_URL.endsWith("/v1")
-        ? env.ANTHROPIC_BASE_URL
-        : `${env.ANTHROPIC_BASE_URL}/v1`;
+      env.ANTHROPIC_BASE_URL = normalizeClaudeBaseUrl(env.ANTHROPIC_BASE_URL);
     }
 
     // Merge new env with existing settings
@@ -177,6 +181,7 @@ export async function POST(request: Request) {
 const RESET_ENV_KEYS = [
   "ANTHROPIC_BASE_URL",
   "ANTHROPIC_AUTH_TOKEN",
+  "ANTHROPIC_API_KEY",
   "ANTHROPIC_DEFAULT_OPUS_MODEL",
   "ANTHROPIC_DEFAULT_SONNET_MODEL",
   "ANTHROPIC_DEFAULT_HAIKU_MODEL",
@@ -184,7 +189,10 @@ const RESET_ENV_KEYS = [
 ];
 
 // DELETE - Reset settings (remove env fields)
-export async function DELETE() {
+export async function DELETE(request: Request) {
+  const authError = await requireCliToolsAuth(request);
+  if (authError) return authError;
+
   try {
     const writeGuard = ensureCliConfigWriteAllowed();
     if (writeGuard) {

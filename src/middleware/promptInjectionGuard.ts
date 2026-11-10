@@ -1,110 +1,24 @@
 /**
  * Prompt Injection Guard — Express/Next.js middleware
  *
- * Wraps the inputSanitizer module as middleware for API routes.
- * Blocks or warns on detected prompt injection attempts.
+ * Legacy middleware facade that now delegates to the guardrail system.
  *
  * @module middleware/promptInjectionGuard
  */
 
-import { extractMessageContents, sanitizeRequest } from "../shared/utils/inputSanitizer";
-
-/**
- * @typedef {Object} GuardOptions
- * @property {"block"|"warn"|"log"} [mode="warn"] - Action on detection
- * @property {boolean} [enabled=true] - Whether the guard is active
- * @property {"low"|"medium"|"high"} [blockThreshold="high"] - Minimum severity to block
- * @property {Array<string|RegExp|{name?: string, pattern: string|RegExp, severity?: "low"|"medium"|"high"}>} [customPatterns]
- * @property {Object} [logger] - Logger instance (defaults to console)
- */
-
-const DEFAULT_GUARD_PATTERNS = [
-  {
-    name: "system_override_inline",
-    pattern: /\bsystem\s*:\s*override\b/i,
-    severity: "high",
-  },
-  {
-    name: "markdown_system_block",
-    pattern: /```+\s*system\b/i,
-    severity: "high",
-  },
-];
-
-const SEVERITY_SCORES = {
-  low: 1,
-  medium: 2,
-  high: 3,
-};
-
-function normalizePatternEntry(entry: any, index: number) {
-  if (entry instanceof RegExp) {
-    return {
-      name: `custom_${index}`,
-      pattern: entry,
-      severity: "high",
-    };
-  }
-
-  if (typeof entry === "string") {
-    return {
-      name: `custom_${index}`,
-      pattern: new RegExp(entry, "i"),
-      severity: "high",
-    };
-  }
-
-  if (!entry || (!(entry.pattern instanceof RegExp) && typeof entry.pattern !== "string")) {
-    return null;
-  }
-
-  return {
-    name: entry.name || `custom_${index}`,
-    pattern: entry.pattern instanceof RegExp ? entry.pattern : new RegExp(entry.pattern, "i"),
-    severity: entry.severity || "high",
-  };
-}
-
-function detectWithPatterns(text: string, patterns: any[]) {
-  const detections = [];
-
-  for (const rule of patterns) {
-    const match = text.match(rule.pattern);
-    if (match) {
-      detections.push({
-        pattern: rule.name,
-        severity: rule.severity,
-        match: match[0].slice(0, 50),
-      });
-    }
-  }
-
-  return detections;
-}
-
-function shouldBlock(detections: any[], threshold: string) {
-  const minimumSeverity = SEVERITY_SCORES[threshold as keyof typeof SEVERITY_SCORES] || 3;
-  return detections.some(
-    (d) => (SEVERITY_SCORES[d.severity as keyof typeof SEVERITY_SCORES] || 0) >= minimumSeverity
-  );
-}
+import {
+  evaluatePromptInjection,
+  type PromptInjectionGuardrailOptions,
+} from "@/lib/guardrails/promptInjection";
+import { CORS_HEADERS } from "@/shared/utils/cors";
 
 /**
  * Create a prompt injection guard middleware.
  *
- * @param {GuardOptions} [options={}]
+ * @param {PromptInjectionGuardrailOptions} [options={}]
  * @returns {(req: Request) => { blocked: boolean, result: Object }|null}
  */
-export function createInjectionGuard(options: any = {}) {
-  const mode =
-    options.mode || process.env.INJECTION_GUARD_MODE || process.env.INPUT_SANITIZER_MODE || "warn";
-  const enabled = options.enabled ?? process.env.INPUT_SANITIZER_ENABLED !== "false";
-  const blockThreshold = options.blockThreshold || options.threshold || "high";
-  const logger = options.logger || console;
-  const customPatterns = [...DEFAULT_GUARD_PATTERNS, ...(options.customPatterns || [])]
-    .map(normalizePatternEntry)
-    .filter(Boolean);
-
+export function createInjectionGuard(options: PromptInjectionGuardrailOptions = {}) {
   /**
    * Check a request body for prompt injection.
    *
@@ -112,52 +26,25 @@ export function createInjectionGuard(options: any = {}) {
    * @returns {{ blocked: boolean, result: Object }}
    */
   return function guardRequest(body: any) {
-    if (!enabled || !body || typeof body !== "object") {
+    if (!body || typeof body !== "object") {
       return { blocked: false, result: { flagged: false, detections: [], piiDetections: [] } };
     }
 
-    const result: any = sanitizeRequest(body, logger);
-    const contents = extractMessageContents(body);
-    const customDetections = detectWithPatterns(contents.join("\n"), customPatterns);
-
-    if (customDetections.length > 0) {
-      const existingDetections = new Set(
-        result.detections.map((d) => `${d.pattern}:${d.match}:${d.severity}`)
-      );
-
-      for (const detection of customDetections) {
-        const key = `${detection.pattern}:${detection.match}:${detection.severity}`;
-        if (!existingDetections.has(key)) {
-          result.detections.push(detection);
-        }
-      }
-    }
-
-    result.flagged = result.detections.length > 0 || result.piiDetections.length > 0;
-
-    // Check if any detections were found (sanitizeRequest returns .detections, NOT .flagged)
-    if (!result.flagged) {
-      return { blocked: false, result };
-    }
-
-    if (mode === "block" && shouldBlock(result.detections, blockThreshold)) {
-      logger.warn?.("[InjectionGuard] Blocked request with prompt injection:", {
-        detections: result.detections.map((d) => ({ pattern: d.pattern, severity: d.severity })),
-      });
-      return { blocked: true, result };
-    }
-
-    if (mode === "warn" || mode === "log") {
-      logger[mode === "warn" ? "warn" : "info"]?.(
-        "[InjectionGuard] Detected potential injection patterns:",
-        {
-          detections: result.detections.map((d) => ({ pattern: d.pattern, severity: d.severity })),
-          pii: result.piiDetections.length,
-        }
-      );
-    }
-
-    return { blocked: false, result };
+    const decision = evaluatePromptInjection(body, options, {
+      // Mandatory injection block mode intentionally ignores all caller-
+      // controlled disabledGuardrails. Registry-managed guardrails use those
+      // channels independently; never pass them into this middleware.
+      // Omitted logger → console fallback: for middleware-only routes (embeddings,
+      // images, audio, moderations, …) this guard is the ONLY injection evaluation,
+      // so a silent guard would leave blocked requests with zero server-side trace.
+      // Chat-family routes are re-evaluated by the guardrail registry with a pino
+      // logger and opt out of the duplicate line with `logger: null` (#11936).
+      log: options.logger === undefined ? console : options.logger,
+    });
+    return {
+      blocked: decision.blocked,
+      result: decision.result,
+    };
   };
 }
 
@@ -171,19 +58,22 @@ export function createInjectionGuard(options: any = {}) {
 export function withInjectionGuard(handler: any, options: any = {}) {
   const guard = createInjectionGuard(options);
 
-  return async function guardedHandler(request: any, context: any) {
+  return async function guardedHandler(request: any, context?: any) {
     // Only apply to POST/PUT/PATCH
     if (!["POST", "PUT", "PATCH"].includes(request.method)) {
       return handler(request, context);
     }
 
+    // Hoist parsed body so it can be threaded to the downstream handler (#4041).
+    let parsedBody: any = null;
+
     try {
       // Clone request so body can still be read by handler
       const cloned = request.clone();
-      const body = await cloned.json().catch(() => null);
+      parsedBody = await cloned.json().catch(() => null);
 
-      if (body) {
-        const { blocked, result }: any = guard(body);
+      if (parsedBody) {
+        const { blocked, result }: any = guard(parsedBody);
 
         if (blocked) {
           return new Response(
@@ -191,23 +81,41 @@ export function withInjectionGuard(handler: any, options: any = {}) {
               error: {
                 message: "Request blocked: potential prompt injection detected",
                 type: "injection_detected",
+                code: "SECURITY_001",
                 detections: result.detections.length,
               },
             }),
-            { status: 400, headers: { "Content-Type": "application/json" } }
+            { status: 400, headers: { ...CORS_HEADERS, "Content-Type": "application/json" } }
           );
         }
 
-        // Attach sanitization result as header for downstream handlers
+        // Attach sanitization result as header for downstream handlers.
+        // Web Request headers may be immutable — never let this throw into the
+        // outer security-check path (issue #8095).
         if (result.flagged) {
-          request.headers.set("X-Injection-Flagged", "true");
-          request.headers.set("X-Injection-Detections", String(result.detections.length));
+          try {
+            request.headers.set("X-Injection-Flagged", "true");
+            request.headers.set(
+              "X-Injection-Detections",
+              String(result.detections.length)
+            );
+          } catch {
+            // immutable headers: detection still applied; metadata is best-effort
+          }
         }
       }
-    } catch {
-      // Don't block on guard errors — fail open
+    } catch (error) {
+      console.error("[SECURITY] Injection guard error:", error);
+      return new Response(JSON.stringify({ error: "Security check failed" }), {
+        status: 500,
+        headers: { "Content-Type": "application/json" },
+      });
     }
 
-    return handler(request, context);
+    // Thread the already-parsed body to the handler as a third argument so downstream
+    // handlers (e.g. /v1/responses) can reuse it without re-cloning+re-parsing the
+    // request on the hot path (#4041). Handlers that don't accept a preParsedBody
+    // simply ignore the extra argument — no signature change required for other routes.
+    return handler(request, context, parsedBody);
   };
 }

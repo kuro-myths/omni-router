@@ -1,4 +1,4 @@
-import { getCorsOrigin } from "./cors.ts";
+import { getReadableReasoningValue } from "./reasoningFields.ts";
 
 type PendingToolCall = {
   id?: string;
@@ -8,104 +8,158 @@ type PendingToolCall = {
   };
 };
 
+type ToolCallDelta = {
+  index: number;
+  id?: string | number;
+  function?: { name?: string; arguments?: string };
+};
+
+function appendToolCallDelta(
+  tc: ToolCallDelta,
+  pending: Record<number, PendingToolCall>,
+  completed: PendingToolCall[]
+): void {
+  const idx = tc.index;
+  const toolCallId = tc.id != null ? String(tc.id) : undefined;
+  // T37: Prevent merging tool_calls on same index if ID changes.
+  if (pending[idx] && toolCallId && pending[idx].id !== toolCallId) {
+    completed.push(pending[idx]);
+    delete pending[idx];
+  }
+  if (!pending[idx]) {
+    pending[idx] = { id: toolCallId, function: { name: "", arguments: "" } };
+  }
+  if (tc.function?.name) pending[idx].function.name += tc.function.name;
+  if (tc.function?.arguments) pending[idx].function.arguments += tc.function.arguments;
+}
+
+type OllamaMessage = {
+  role: "assistant";
+  content: string;
+  thinking?: string;
+  tool_calls?: Array<{ function: { name: string; arguments: unknown } }>;
+};
+
+// Tool arguments arrive as streamed JSON text. A malformed or truncated payload must not
+// throw: that would abort the whole finish line and drop every tool call with it.
+function parseToolArguments(raw: string): unknown {
+  try {
+    return JSON.parse(raw || "{}");
+  } catch {
+    return {};
+  }
+}
+
 // Transform OpenAI SSE stream to Ollama JSON lines format
 export function transformToOllama(response, model) {
+  // Only successful SSE responses belong to the NDJSON transformer. Preserve errors,
+  // bodyless responses, and successful JSON responses without losing status/body/headers.
+  const contentType = String(response.headers?.get?.("content-type") || "").toLowerCase();
+  if (!response.ok || !response.body || !contentType.includes("text/event-stream")) return response;
+
   let buffer = "";
   let pendingToolCalls: Record<number, PendingToolCall> = {};
   const completedToolCalls: PendingToolCall[] = [];
+  let doneSent = false;
+  // Persistent decoder with { stream: true } carries pending bytes between chunks, so a
+  // multi-byte UTF-8 sequence split across network chunks is not corrupted into U+FFFD.
+  const decoder = new TextDecoder();
+  const encoder = new TextEncoder();
 
-  const transform = new TransformStream({
-    transform(chunk, controller) {
-      const text = new TextDecoder().decode(chunk);
-      buffer += text;
-      const lines = buffer.split("\n");
-      buffer = lines.pop() || "";
+  const emit = (controller, message: OllamaMessage, done: boolean) => {
+    controller.enqueue(encoder.encode(JSON.stringify({ model, message, done }) + "\n"));
+  };
 
-      for (const line of lines) {
-        if (!line.startsWith("data:")) continue;
-        const data = line.slice(5).trim();
+  // Ollama ends a stream with exactly one done:true message, and that message carries the
+  // tool calls when there are any. Emitting more than one (finish_reason, [DONE], flush)
+  // leaves a client that keeps the last terminal message holding an empty one.
+  const emitDone = (controller, message: OllamaMessage) => {
+    if (doneSent) return;
+    doneSent = true;
+    emit(controller, message, true);
+  };
 
-        if (data === "[DONE]") {
-          const ollamaEnd =
-            JSON.stringify({ model, message: { role: "assistant", content: "" }, done: true }) +
-            "\n";
-          controller.enqueue(new TextEncoder().encode(ollamaEnd));
-          return;
-        }
+  const handleLine = (line: string, controller) => {
+    // Nothing follows the terminal message in an Ollama stream (this also keeps the old
+    // "stop at [DONE]" behavior for lines that share a chunk with it).
+    if (doneSent || !line.startsWith("data:")) return;
+    const data = line.slice(5).trim();
 
-        try {
-          const parsed = JSON.parse(data);
-          const delta = parsed.choices?.[0]?.delta || {};
-          const content = delta.content || "";
-          const toolCalls = delta.tool_calls;
+    if (data === "[DONE]") {
+      emitDone(controller, { role: "assistant", content: "" });
+      return;
+    }
 
-          if (toolCalls) {
-            for (const tc of toolCalls) {
-              const idx = tc.index;
+    let parsed;
+    try {
+      parsed = JSON.parse(data);
+    } catch {
+      return; // Ignore non-JSON SSE payloads (keep-alives, comments).
+    }
 
-              // T37: Prevent merging tool_calls on same index if ID changes
-              if (pendingToolCalls[idx] && tc.id && pendingToolCalls[idx].id !== tc.id) {
-                completedToolCalls.push(pendingToolCalls[idx]);
-                delete pendingToolCalls[idx];
-              }
+    const delta = parsed.choices?.[0]?.delta || {};
+    const content = delta.content || "";
+    const thinking = getReadableReasoningValue(delta);
+    const toolCalls = delta.tool_calls;
 
-              if (!pendingToolCalls[idx]) {
-                pendingToolCalls[idx] = { id: tc.id, function: { name: "", arguments: "" } };
-              }
-              if (tc.function?.name) pendingToolCalls[idx].function.name += tc.function.name;
-              if (tc.function?.arguments)
-                pendingToolCalls[idx].function.arguments += tc.function.arguments;
-            }
-          }
-
-          if (content) {
-            const ollama =
-              JSON.stringify({ model, message: { role: "assistant", content }, done: false }) +
-              "\n";
-            controller.enqueue(new TextEncoder().encode(ollama));
-          }
-
-          const finishReason = parsed.choices?.[0]?.finish_reason;
-          if (finishReason === "tool_calls" || finishReason === "stop") {
-            const toolCallsArr = [...completedToolCalls, ...Object.values(pendingToolCalls)];
-            if (toolCallsArr.length > 0) {
-              const formattedCalls = toolCallsArr.map((tc) => ({
-                function: {
-                  name: tc.function.name,
-                  arguments: JSON.parse(tc.function.arguments || "{}"),
-                },
-              }));
-              const ollama =
-                JSON.stringify({
-                  model,
-                  message: { role: "assistant", content: "", tool_calls: formattedCalls },
-                  done: true,
-                }) + "\n";
-              controller.enqueue(new TextEncoder().encode(ollama));
-              pendingToolCalls = {};
-            } else if (finishReason === "stop") {
-              const ollamaEnd =
-                JSON.stringify({ model, message: { role: "assistant", content: "" }, done: true }) +
-                "\n";
-              controller.enqueue(new TextEncoder().encode(ollamaEnd));
-            }
-          }
-        } catch (e) {
-          // Silently ignore parse errors
-        }
+    if (toolCalls) {
+      for (const tc of toolCalls) {
+        appendToolCallDelta(tc, pendingToolCalls, completedToolCalls);
       }
+    }
+
+    if (thinking) {
+      emit(controller, { role: "assistant", content: "", thinking }, false);
+    }
+
+    if (content) {
+      emit(controller, { role: "assistant", content }, false);
+    }
+
+    const finishReason = parsed.choices?.[0]?.finish_reason;
+    if (finishReason === "tool_calls" || finishReason === "stop") {
+      const toolCallsArr = [...completedToolCalls, ...Object.values(pendingToolCalls)];
+      if (toolCallsArr.length > 0) {
+        const formattedCalls = toolCallsArr.map((tc) => ({
+          function: {
+            name: tc.function.name,
+            arguments: parseToolArguments(tc.function.arguments),
+          },
+        }));
+        emitDone(controller, { role: "assistant", content: "", tool_calls: formattedCalls });
+        pendingToolCalls = {};
+        completedToolCalls.length = 0;
+      } else if (finishReason === "stop") {
+        emitDone(controller, { role: "assistant", content: "" });
+      }
+    }
+  };
+
+  const transform = new TransformStream(
+    {
+      transform(chunk, controller) {
+        buffer += decoder.decode(chunk, { stream: true });
+        const lines = buffer.split("\n");
+        buffer = lines.pop() || "";
+
+        for (const line of lines) handleLine(line, controller);
+      },
+      flush(controller) {
+        // A last line that arrived without its trailing newline is still a line.
+        buffer += decoder.decode();
+        const tail = buffer.trim();
+        buffer = "";
+        if (tail) handleLine(tail, controller);
+        emitDone(controller, { role: "assistant", content: "" });
+      },
     },
-    flush(controller) {
-      const ollamaEnd =
-        JSON.stringify({ model, message: { role: "assistant", content: "" }, done: true }) + "\n";
-      controller.enqueue(new TextEncoder().encode(ollamaEnd));
-    },
-  });
+    { highWaterMark: 16384 },
+    { highWaterMark: 16384 }
+  );
 
   return new Response(response.body.pipeThrough(transform), {
     headers: {
       "Content-Type": "application/x-ndjson",
-      "Access-Control-Allow-Origin": getCorsOrigin(),
     },
   });
 }

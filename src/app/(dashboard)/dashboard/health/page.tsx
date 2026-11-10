@@ -1,21 +1,25 @@
 "use client";
 
-/**
- * Health Dashboard — Phase 8.3
- *
- * System health overview with cards for:
- * - System status (uptime, version, memory)
- * - Provider health (circuit breaker states)
- * - Rate limit status
- * - Active lockouts
- * - Signature cache stats
- * - Latency telemetry & prompt cache
- */
+/** System health diagnostics and independently refreshed local concurrency gates. */
 
 import { useState, useEffect, useCallback } from "react";
+
+import { PageHeader, SectionHeader } from "@omniroute/ui-kit/page-header";
+import { Progress } from "@omniroute/ui-kit/progress";
+import Button from "@/shared/components/Button";
+import Icon from "@/shared/components/Icon";
 import { Card } from "@/shared/components";
 import { AI_PROVIDERS } from "@/shared/constants/providers";
-import { useTranslations } from "next-intl";
+import { getProviderDisplayName } from "@/lib/display/names";
+import { useProviderNodeMap, resolveProviderName } from "@/lib/display/useProviderNodeMap";
+import { compareTr } from "@/shared/utils/turkishText";
+import { startVisiblePolling } from "@/shared/utils/visiblePolling";
+import { useConfirmDialog } from "@/shared/hooks/useConfirmDialog";
+import { useLocale, useTranslations } from "next-intl";
+import TelemetryCard from "./TelemetryCard";
+import ProviderHealthAutopilotCard from "./ProviderHealthAutopilotCard";
+import ProviderHealthMatrixCard from "./ProviderHealthMatrixCard";
+import ConcurrencyQueuesCard from "./ConcurrencyQueuesCard";
 
 function formatUptime(seconds) {
   const d = Math.floor(seconds / 86400);
@@ -32,24 +36,69 @@ function formatBytes(bytes) {
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
 
+function formatRelativeTime(timestamp) {
+  if (!timestamp || !Number.isFinite(timestamp)) return null;
+  const diffMs = Math.max(0, Date.now() - timestamp);
+  const diffMinutes = Math.floor(diffMs / 60000);
+  if (diffMinutes < 1) return "<1m";
+  if (diffMinutes < 60) return `${diffMinutes}m`;
+  const diffHours = Math.floor(diffMinutes / 60);
+  if (diffHours < 24) return `${diffHours}h`;
+  const diffDays = Math.floor(diffHours / 24);
+  return `${diffDays}d`;
+}
+
 const CB_STYLES = {
-  CLOSED: { bg: "bg-green-500/10", text: "text-green-500", labelKey: "healthy" },
-  OPEN: { bg: "bg-red-500/10", text: "text-red-500", labelKey: "down" },
-  HALF_OPEN: { bg: "bg-amber-500/10", text: "text-amber-500", labelKey: "recovering" },
+  CLOSED: { bg: "bg-success/10", text: "text-success", labelKey: "healthy" },
+  OPEN: { bg: "bg-error/10", text: "text-error", labelKey: "down" },
+  HALF_OPEN: { bg: "bg-warning/10", text: "text-warning", labelKey: "recovering" },
 };
 
 export default function HealthPage() {
+  return <HealthSnapshot />;
+}
+
+/**
+ * Page frame: the verdict header (once the snapshot has loaded) stays on top, then the queue
+ * card, then the snapshot body. Every HealthSnapshot branch returns this same component, so the
+ * queue card keeps its slot and state (it polls on its own, independently of /api/monitoring/health).
+ */
+function HealthLayout({
+  header,
+  children,
+}: {
+  header?: React.ReactNode;
+  children: React.ReactNode;
+}) {
+  return (
+    <div className="space-y-6">
+      {header ?? null}
+      <ConcurrencyQueuesCard />
+      {children}
+    </div>
+  );
+}
+
+function HealthSnapshot() {
+  const locale = useLocale();
   const t = useTranslations("health");
   const tc = useTranslations("common");
   const tp = useTranslations("providers");
+  const nodeMap = useProviderNodeMap();
+  const { requestConfirm, confirmDialog } = useConfirmDialog();
   const [data, setData] = useState(null);
+  const [dbHealth, setDbHealth] = useState(null);
+  const [dbHealthError, setDbHealthError] = useState(null);
   const [error, setError] = useState(null);
   const [lastRefresh, setLastRefresh] = useState(null);
-  const [telemetry, setTelemetry] = useState(null);
   const [cache, setCache] = useState(null);
   const [signatureCache, setSignatureCache] = useState(null);
   const [degradation, setDegradation] = useState(null);
   const [resetting, setResetting] = useState(false);
+  const [repairingDb, setRepairingDb] = useState(false);
+  const [unblocking, setUnblocking] = useState(false);
+  const [unblockingKey, setUnblockingKey] = useState<string | null>(null);
+  const [showAdvanced, setShowAdvanced] = useState(false);
 
   const fetchHealth = useCallback(async () => {
     try {
@@ -64,34 +113,44 @@ export default function HealthPage() {
     }
   }, []);
 
-  // Fetch telemetry, cache, and signature cache stats
+  const fetchDbHealth = useCallback(async () => {
+    try {
+      const res = await fetch("/api/db/health");
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const json = await res.json();
+      setDbHealth(json);
+      setDbHealthError(null);
+    } catch (err) {
+      setDbHealthError(err.message);
+    }
+  }, []);
+
+  // Fetch cache, signature cache, and degradation stats.
   const fetchExtras = useCallback(async () => {
     const results = await Promise.allSettled([
-      fetch("/api/telemetry/summary").then((r) => r.json()),
       fetch("/api/cache/stats").then((r) => r.json()),
       fetch("/api/rate-limits").then((r) => r.json()),
       fetch("/api/health/degradation").then((r) => r.json()),
     ]);
-    if (results[0].status === "fulfilled") setTelemetry(results[0].value);
-    if (results[1].status === "fulfilled") setCache(results[1].value);
-    if (results[2].status === "fulfilled" && results[2].value.cacheStats) {
-      setSignatureCache(results[2].value.cacheStats);
+    if (results[0].status === "fulfilled") setCache(results[0].value);
+    if (results[1].status === "fulfilled" && results[1].value.cacheStats) {
+      setSignatureCache(results[1].value.cacheStats);
     }
-    if (results[3].status === "fulfilled") setDegradation(results[3].value);
+    if (results[2].status === "fulfilled") setDegradation(results[2].value);
   }, []);
 
   useEffect(() => {
-    fetchHealth();
-    fetchExtras();
-    const interval = setInterval(() => {
-      fetchHealth();
-      fetchExtras();
+    // Skips ticks while the tab is hidden and catches up on return: these
+    // three endpoints hit the same process that serves the LLM proxy.
+    return startVisiblePolling(() => {
+      void fetchHealth();
+      void fetchExtras();
+      void fetchDbHealth();
     }, 15000);
-    return () => clearInterval(interval);
-  }, [fetchHealth, fetchExtras]);
+  }, [fetchHealth, fetchExtras, fetchDbHealth]);
 
   const handleResetHealth = async () => {
-    if (!confirm(t("resetConfirm"))) return;
+    if (!(await requestConfirm(t("resetConfirm")))) return;
     setResetting(true);
     try {
       const res = await fetch("/api/monitoring/health", { method: "DELETE" });
@@ -106,96 +165,261 @@ export default function HealthPage() {
     }
   };
 
+  const handleUnblockAll = async () => {
+    setUnblocking(true);
+    try {
+      const res = await fetch("/api/resilience/model-cooldowns", {
+        method: "DELETE",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ all: true }),
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      await fetchHealth();
+    } catch (err) {
+      console.error("Failed to unblock all models:", err);
+    } finally {
+      setUnblocking(false);
+    }
+  };
+
+  const handleUnblockOne = async (provider: string, model: string) => {
+    const key = `${provider}::${model}`;
+    setUnblockingKey(key);
+    try {
+      const res = await fetch("/api/resilience/model-cooldowns", {
+        method: "DELETE",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ provider, model }),
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      await fetchHealth();
+    } catch (err) {
+      console.error(`Failed to unblock ${provider}/${model}:`, err);
+    } finally {
+      setUnblockingKey(null);
+    }
+  };
+
+  const handleRepairDb = async () => {
+    setRepairingDb(true);
+    try {
+      const res = await fetch("/api/db/health", { method: "POST" });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const json = await res.json();
+      setDbHealth(json);
+      setDbHealthError(null);
+      await fetchHealth();
+      await fetchExtras();
+    } catch (err) {
+      console.error("Failed to repair database health:", err);
+      setDbHealthError(err.message);
+    } finally {
+      setRepairingDb(false);
+    }
+  };
+
   const fmtMs = (ms) =>
     ms != null ? t("millisecondsShort", { value: Math.round(ms) }) : t("notAvailable");
 
   if (!data && !error) {
     return (
-      <div className="p-6 flex items-center justify-center min-h-[400px]">
-        <div className="text-center">
-          <div className="inline-block animate-spin rounded-full h-8 w-8 border-b-2 border-primary" />
-          <p className="text-text-muted mt-4">{t("loadingHealth")}</p>
+      <HealthLayout>
+        <div className="flex items-center justify-center min-h-100">
+          <div className="text-center">
+            <div className="inline-block animate-spin rounded-full h-8 w-8 border-b-2 border-primary" />
+            <p className="text-text-muted mt-4">{t("loadingHealth")}</p>
+          </div>
         </div>
-      </div>
+      </HealthLayout>
     );
   }
 
   if (error && !data) {
     return (
-      <div className="p-6">
-        <div className="bg-red-500/10 border border-red-500/30 rounded-xl p-6 text-center">
-          <span className="material-symbols-outlined text-red-500 text-[32px] mb-2">error</span>
-          <p className="text-red-400">{t("failedToLoad", { error })}</p>
-          <button
-            onClick={fetchHealth}
-            className="mt-4 px-4 py-2 rounded-lg bg-primary/10 text-primary text-sm hover:bg-primary/20 transition-colors"
-          >
-            {t("retry")}
-          </button>
+      <HealthLayout>
+        <div>
+          <div className="bg-error/10 border border-error/30 rounded-xl p-6 text-center">
+            <Icon name="error" size={32} className="text-error mb-2" />
+            <p className="text-error">{t("failedToLoad", { error })}</p>
+            <Button variant="secondary" size="sm" onClick={fetchHealth} className="mt-4">
+              {t("retry")}
+            </Button>
+          </div>
         </div>
-      </div>
+      </HealthLayout>
     );
   }
 
-  const { system, providerHealth, providerSummary, rateLimitStatus, lockouts } = data;
+  const {
+    system,
+    providerHealth,
+    providerSummary,
+    rateLimitStatus,
+    learnedLimits,
+    lockouts,
+    sessions,
+    quotaMonitor,
+  } = data;
   const cbEntries = Object.entries(providerHealth || {});
   const lockoutEntries = Object.entries(lockouts || {});
 
   return (
-    <div className="p-6 space-y-6 max-w-6xl mx-auto">
-      {/* Header */}
-      <div className="flex items-center justify-between">
-        <div>
-          <h1 className="text-2xl font-bold text-text-main">{t("title")}</h1>
-          <p className="text-sm text-text-muted mt-1">{t("description")}</p>
-        </div>
-        <div className="flex items-center gap-3">
-          {lastRefresh && (
-            <span className="text-xs text-text-muted">
-              {t("updatedAt", { time: lastRefresh.toLocaleTimeString() })}
-            </span>
-          )}
-          <button
-            onClick={() => {
-              fetchHealth();
-              fetchExtras();
-            }}
-            className="p-2 rounded-lg bg-surface hover:bg-surface/80 text-text-muted hover:text-text-main transition-colors"
-            title={tc("refresh")}
-          >
-            <span className="material-symbols-outlined text-[18px]">refresh</span>
-          </button>
-        </div>
-      </div>
-
-      {/* Status Banner */}
+    <HealthLayout
+      header={
+        <PageHeader
+          compact
+          title={
+            data.status === "healthy"
+              ? t("healthVerdictReady")
+              : data.status === "cooling"
+                ? t("healthVerdictCoolingDown")
+                : t("healthVerdictActionRequired")
+          }
+          description={t("healthSubtitle")}
+          actions={
+            <>
+              {lastRefresh && (
+                <span className="text-xs text-text-muted">
+                  {t("updatedAt", { time: lastRefresh.toLocaleTimeString(locale) })}
+                </span>
+              )}
+              <Button
+                variant="ghost"
+                size="icon"
+                icon="refresh"
+                onClick={() => {
+                  fetchHealth();
+                  fetchExtras();
+                  fetchDbHealth();
+                }}
+                title={tc("refresh")}
+                aria-label={tc("refresh")}
+              />
+            </>
+          }
+        />
+      }
+    >
+      {/* Status Details */}
       <div
         role="status"
         aria-live="polite"
         className={`rounded-xl p-4 flex items-center gap-3 ${
           data.status === "healthy"
-            ? "bg-green-500/10 border border-green-500/20"
-            : "bg-red-500/10 border border-red-500/20"
+            ? "bg-success/10 border border-success/20"
+            : "bg-error/10 border border-error/20"
         }`}
       >
-        <span
-          className={`material-symbols-outlined text-[24px] ${
-            data.status === "healthy" ? "text-green-500" : "text-red-500"
-          }`}
-        >
-          {data.status === "healthy" ? "check_circle" : "error"}
-        </span>
-        <span className={data.status === "healthy" ? "text-green-400" : "text-red-400"}>
+        <Icon
+          name={data.status === "healthy" ? "check_circle" : "error"}
+          size={24}
+          className={data.status === "healthy" ? "text-success" : "text-error"}
+        />
+        <span className={data.status === "healthy" ? "text-success" : "text-error"}>
           {data.status === "healthy" ? t("allOperational") : t("issuesDetected")}
         </span>
       </div>
+
+      {/* Advanced Diagnostics Section */}
+      <div className="mt-8">
+        <SectionHeader
+          className="mb-4"
+          title={t("advancedDiagnosticsTitle")}
+          actions={
+            <Button
+              variant="ghost"
+              size="sm"
+              aria-expanded={showAdvanced}
+              onClick={() => setShowAdvanced(!showAdvanced)}
+            >
+              {showAdvanced ? t("hide") : t("show")}
+            </Button>
+          }
+        />
+        <div className={showAdvanced ? "block" : "hidden"}>
+          <TelemetryCard />
+          <ProviderHealthAutopilotCard />
+          <ProviderHealthMatrixCard />
+        </div>
+      </div>
+
+      <Card className="p-5">
+        <div className="flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">
+          <div>
+            <div className="flex items-center gap-3 mb-2">
+              <div
+                className={`flex items-center justify-center size-9 rounded-lg ${
+                  dbHealth?.isHealthy ? "bg-success/10 text-success" : "bg-warning/10 text-warning"
+                }`}
+              >
+                <Icon name="database" size={18} />
+              </div>
+              <div>
+                <h2 className="text-lg font-semibold text-text-main">{t("databaseHealth")}</h2>
+                <p className="text-sm text-text-muted">{t("databaseHealthDescription")}</p>
+              </div>
+            </div>
+            <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 mt-4">
+              <div className="rounded-xl border border-border bg-surface/50 p-3">
+                <p className="text-xs uppercase tracking-wide text-text-muted">{t("status")}</p>
+                <p
+                  className={`mt-1 text-sm font-medium ${
+                    dbHealth?.isHealthy ? "text-success" : "text-warning"
+                  }`}
+                >
+                  {dbHealth?.isHealthy ? t("healthy") : t("attentionNeeded")}
+                </p>
+              </div>
+              <div className="rounded-xl border border-border bg-surface/50 p-3">
+                <p className="text-xs uppercase tracking-wide text-text-muted">{t("issues")}</p>
+                <p className="mt-1 text-sm font-medium text-text-main">
+                  {dbHealth?.issues?.length ?? 0}
+                </p>
+              </div>
+              <div className="rounded-xl border border-border bg-surface/50 p-3">
+                <p className="text-xs uppercase tracking-wide text-text-muted">{t("repairs")}</p>
+                <p className="mt-1 text-sm font-medium text-text-main">
+                  {dbHealth?.repairedCount ?? 0}
+                </p>
+              </div>
+            </div>
+          </div>
+          <div className="flex flex-col items-stretch gap-2 min-w-45">
+            <Button variant="secondary" size="sm" onClick={handleRepairDb} loading={repairingDb}>
+              {repairingDb ? t("repairing") : t("runAutoRepair")}
+            </Button>
+            {dbHealth?.backupCreated && (
+              <p className="text-xs text-text-muted">{t("repairBackupCreated")}</p>
+            )}
+            {dbHealthError && <p className="text-xs text-error">{dbHealthError}</p>}
+          </div>
+        </div>
+        {Array.isArray(dbHealth?.issues) && dbHealth.issues.length > 0 && (
+          <div className="mt-4 space-y-2">
+            {dbHealth.issues.map((issue, index) => (
+              <div
+                key={`${issue.table}-${issue.type}-${index}`}
+                className="rounded-xl border border-warning/20 bg-warning/5 px-3 py-2"
+              >
+                <div className="flex items-center justify-between gap-3">
+                  <p className="text-sm text-text-main">{issue.description}</p>
+                  <span className="text-xs text-warning">{issue.count}</span>
+                </div>
+                <p className="text-xs text-text-muted mt-1">
+                  {issue.table} · {issue.type}
+                </p>
+              </div>
+            ))}
+          </div>
+        )}
+      </Card>
 
       {/* System Info Cards */}
       <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
         <Card className="p-4">
           <div className="flex items-center gap-3 mb-2">
             <div className="flex items-center justify-center size-8 rounded-lg bg-primary/10 text-primary">
-              <span className="material-symbols-outlined text-[18px]">timer</span>
+              <Icon name="timer" size={18} />
             </div>
             <span className="text-sm text-text-muted">{t("uptime")}</span>
           </div>
@@ -204,8 +428,8 @@ export default function HealthPage() {
 
         <Card className="p-4">
           <div className="flex items-center gap-3 mb-2">
-            <div className="flex items-center justify-center size-8 rounded-lg bg-blue-500/10 text-blue-500">
-              <span className="material-symbols-outlined text-[18px]">info</span>
+            <div className="flex items-center justify-center size-8 rounded-lg bg-info/10 text-info">
+              <Icon name="info" size={18} />
             </div>
             <span className="text-sm text-text-muted">{t("version")}</span>
           </div>
@@ -217,8 +441,8 @@ export default function HealthPage() {
 
         <Card className="p-4">
           <div className="flex items-center gap-3 mb-2">
-            <div className="flex items-center justify-center size-8 rounded-lg bg-purple-500/10 text-purple-500">
-              <span className="material-symbols-outlined text-[18px]">memory</span>
+            <div className="flex items-center justify-center size-8 rounded-lg bg-chart-3/10 text-chart-3">
+              <Icon name="memory" size={18} />
             </div>
             <span className="text-sm text-text-muted">{t("memoryRss")}</span>
           </div>
@@ -233,8 +457,8 @@ export default function HealthPage() {
 
         <Card className="p-4">
           <div className="flex items-center gap-3 mb-2">
-            <div className="flex items-center justify-center size-8 rounded-lg bg-amber-500/10 text-amber-500">
-              <span className="material-symbols-outlined text-[18px]">dns</span>
+            <div className="flex items-center justify-center size-8 rounded-lg bg-warning/10 text-warning">
+              <Icon name="dns" size={18} />
             </div>
             <span className="text-sm text-text-muted">{t("providers")}</span>
           </div>
@@ -246,18 +470,14 @@ export default function HealthPage() {
             title={t("configuredProvidersHint")}
           >
             {t("configuredProvidersLabel")}
-            <span className="material-symbols-outlined text-[12px]" aria-hidden="true">
-              help
-            </span>
+            <Icon name="help" size={12} />
           </p>
           <p
             className="text-xs text-text-muted inline-flex items-center gap-1"
             title={t("activeProvidersHint")}
           >
             {t("activeProviders", { count: providerSummary?.activeCount ?? 0 })}
-            <span className="material-symbols-outlined text-[12px]" aria-hidden="true">
-              info
-            </span>
+            <Icon name="info" size={12} />
           </p>
           <p
             className="text-xs text-text-muted inline-flex items-center gap-1"
@@ -266,33 +486,169 @@ export default function HealthPage() {
             {t("monitoredProviders", {
               count: providerSummary?.monitoredCount ?? cbEntries.length,
             })}
-            <span className="material-symbols-outlined text-[12px]" aria-hidden="true">
-              info
-            </span>
+            <Icon name="info" size={12} />
           </p>
+        </Card>
+      </div>
+
+      {/* Session & Quota Observability */}
+      <div className="grid grid-cols-1 xl:grid-cols-2 gap-4">
+        <Card className="p-5">
+          <div className="flex items-center justify-between mb-4">
+            <h2 className="text-lg font-semibold text-text-main flex items-center gap-2">
+              <Icon name="groups" size={20} className="text-primary" />
+              {t("sessionActivity")}
+            </h2>
+            <span className="text-xs text-text-muted">
+              {t("activeCount", { count: sessions?.activeCount ?? 0 })}
+            </span>
+          </div>
+          <div className="grid grid-cols-2 gap-3 mb-4">
+            <div className="rounded-xl border border-border/40 bg-surface/30 p-3">
+              <div className="text-xs text-text-muted">{t("stickyBoundSessions")}</div>
+              <div className="text-2xl font-semibold text-text-main mt-1">
+                {sessions?.stickyBoundCount ?? 0}
+              </div>
+            </div>
+            <div className="rounded-xl border border-border/40 bg-surface/30 p-3">
+              <div className="text-xs text-text-muted">{t("sessionsByApiKey")}</div>
+              <div className="text-2xl font-semibold text-text-main mt-1">
+                {Object.keys(sessions?.byApiKey || {}).length}
+              </div>
+            </div>
+          </div>
+          {sessions?.top?.length > 0 ? (
+            <div className="space-y-2">
+              {sessions.top.slice(0, 5).map((session: any) => (
+                <div
+                  key={session.sessionId}
+                  className="rounded-lg border border-border/30 bg-surface/20 p-3 flex items-center justify-between gap-3"
+                >
+                  <div className="min-w-0">
+                    <div className="font-mono text-xs text-text-main truncate">
+                      {session.sessionId}
+                    </div>
+                    <div className="text-xs text-text-muted mt-1">
+                      {t("requestCount", { count: session.requestCount })}
+                      {session.connectionId ? ` • ${session.connectionId.slice(0, 8)}…` : ""}
+                    </div>
+                  </div>
+                  <div className="text-right text-xs text-text-muted shrink-0">
+                    <div>
+                      {t("idleSeconds", { count: Math.round((session.idleMs || 0) / 1000) })}
+                    </div>
+                    <div>{t("ageSeconds", { count: Math.round((session.ageMs || 0) / 1000) })}</div>
+                  </div>
+                </div>
+              ))}
+            </div>
+          ) : (
+            <p className="text-sm text-text-muted">{t("noActiveSessionsTracked")}</p>
+          )}
+        </Card>
+
+        <Card className="p-5">
+          <div className="flex items-center justify-between mb-4">
+            <h2 className="text-lg font-semibold text-text-main flex items-center gap-2">
+              <Icon name="radar" size={20} className="text-primary" />
+              {t("quotaMonitors")}
+            </h2>
+            <span className="text-xs text-text-muted">
+              {t("activeCount", { count: quotaMonitor?.active ?? 0 })}
+            </span>
+          </div>
+          <div className="grid grid-cols-2 md:grid-cols-4 gap-3 mb-4">
+            <div className="rounded-xl border border-border/40 bg-surface/30 p-3">
+              <div className="text-xs text-text-muted">{t("alerting")}</div>
+              <div className="text-2xl font-semibold text-warning mt-1">
+                {quotaMonitor?.alerting ?? 0}
+              </div>
+            </div>
+            <div className="rounded-xl border border-border/40 bg-surface/30 p-3">
+              <div className="text-xs text-text-muted">{t("limitExhausted")}</div>
+              <div className="text-2xl font-semibold text-error mt-1">
+                {quotaMonitor?.exhausted ?? 0}
+              </div>
+            </div>
+            <div className="rounded-xl border border-border/40 bg-surface/30 p-3">
+              <div className="text-xs text-text-muted">{t("errors")}</div>
+              <div className="text-2xl font-semibold text-warning mt-1">
+                {quotaMonitor?.errors ?? 0}
+              </div>
+            </div>
+            <div className="rounded-xl border border-border/40 bg-surface/30 p-3">
+              <div className="text-xs text-text-muted">{t("providers")}</div>
+              <div className="text-2xl font-semibold text-text-main mt-1">
+                {Object.keys(quotaMonitor?.byProvider || {}).length}
+              </div>
+            </div>
+          </div>
+          {quotaMonitor?.monitors?.length > 0 ? (
+            <div className="space-y-2">
+              {quotaMonitor.monitors.slice(0, 5).map((monitor: any) => (
+                <div
+                  key={`${monitor.sessionId}:${monitor.accountId}`}
+                  className="rounded-lg border border-border/30 bg-surface/20 p-3 flex items-center justify-between gap-3"
+                >
+                  <div className="min-w-0">
+                    <div className="text-sm font-medium text-text-main truncate">
+                      {monitor.provider} • {monitor.accountId.slice(0, 8)}…
+                    </div>
+                    <div className="text-xs text-text-muted mt-1 truncate">
+                      {monitor.sessionId} • {monitor.status}
+                    </div>
+                  </div>
+                  <div className="text-right text-xs shrink-0">
+                    <div
+                      className={
+                        monitor.status === "exhausted"
+                          ? "text-error"
+                          : monitor.status === "warning"
+                            ? "text-warning"
+                            : monitor.status === "error"
+                              ? "text-warning"
+                              : "text-text-main"
+                      }
+                    >
+                      {typeof monitor.lastQuotaPercent === "number"
+                        ? `${Math.round(monitor.lastQuotaPercent * 100)}%`
+                        : "—"}
+                    </div>
+                    <div className="text-text-muted">
+                      {monitor.nextPollDelayMs
+                        ? `${Math.round(monitor.nextPollDelayMs / 1000)}s`
+                        : "—"}
+                    </div>
+                  </div>
+                </div>
+              ))}
+            </div>
+          ) : (
+            <p className="text-sm text-text-muted">{t("noSessionQuotaMonitorsActive")}</p>
+          )}
         </Card>
       </div>
 
       {/* Graceful Degradation Status */}
       {degradation && degradation.features && degradation.features.length > 0 && (
-        <Card className="p-5" role="region" aria-label="Graceful Degradation Status">
+        <Card className="p-5" role="region" aria-label={t("gracefulDegradationStatus")}>
           <div className="flex items-center justify-between mb-4">
             <h2 className="text-lg font-semibold text-text-main flex items-center gap-2">
-              <span className="material-symbols-outlined text-[20px] text-primary">healing</span>
-              Graceful Degradation Status
+              <Icon name="healing" size={20} className="text-primary" />
+              {t("gracefulDegradationStatus")}
             </h2>
             <div className="flex items-center gap-3 text-xs text-text-muted font-medium">
-              <span className="px-2 py-0.5 rounded bg-green-500/10 text-green-400">
-                Full: {degradation.summary.full}
+              <span className="px-2 py-0.5 rounded bg-success/10 text-success">
+                {t("degradationFull")}: {degradation.summary.full}
               </span>
-              <span className="px-2 py-0.5 rounded bg-amber-500/10 text-amber-500">
-                Reduced: {degradation.summary.reduced}
+              <span className="px-2 py-0.5 rounded bg-warning/10 text-warning">
+                {t("degradationReduced")}: {degradation.summary.reduced}
               </span>
-              <span className="px-2 py-0.5 rounded bg-orange-500/10 text-orange-500">
-                Minimal: {degradation.summary.minimal}
+              <span className="px-2 py-0.5 rounded bg-warning/10 text-warning">
+                {t("degradationMinimal")}: {degradation.summary.minimal}
               </span>
-              <span className="px-2 py-0.5 rounded bg-red-500/10 text-red-500">
-                Default: {degradation.summary.default}
+              <span className="px-2 py-0.5 rounded bg-error/10 text-error">
+                {t("degradationDefault")}: {degradation.summary.default}
               </span>
             </div>
           </div>
@@ -300,45 +656,47 @@ export default function HealthPage() {
             {degradation.features.map((feat: any) => {
               const bg =
                 feat.level === "full"
-                  ? "bg-green-500/5 border-green-500/10"
+                  ? "bg-success/5 border-success/10"
                   : feat.level === "reduced"
-                    ? "bg-amber-500/5 border-amber-500/20"
+                    ? "bg-warning/5 border-warning/20"
                     : feat.level === "minimal"
-                      ? "bg-orange-500/5 border-orange-500/20"
-                      : "bg-red-500/5 border-red-500/20";
+                      ? "bg-warning/5 border-warning/20"
+                      : "bg-error/5 border-error/20";
               const dot =
                 feat.level === "full"
-                  ? "bg-green-500"
+                  ? "bg-success"
                   : feat.level === "reduced"
-                    ? "bg-amber-500"
+                    ? "bg-warning"
                     : feat.level === "minimal"
-                      ? "bg-orange-500"
-                      : "bg-red-500";
+                      ? "bg-warning"
+                      : "bg-error";
               return (
                 <div
                   key={feat.feature}
-                  className={`rounded-lg p-3 border \${bg} flex flex-col gap-2`}
+                  className={`rounded-lg p-3 border ${bg} flex flex-col gap-2`}
                 >
                   <div className="flex items-center justify-between">
-                    <span className="text-sm font-semibold capitalize flex items-center gap-2 text-[var(--text-primary,#fff)]">
-                      <span className={`w-2 h-2 rounded-full \${dot}`}></span>
+                    <span className="text-sm font-semibold capitalize flex items-center gap-2 text-text-main">
+                      <span className={`w-2 h-2 rounded-full ${dot}`}></span>
                       {feat.feature}
                     </span>
                     <span className="text-xs uppercase tracking-wider font-bold opacity-70">
                       {feat.level}
                     </span>
                   </div>
-                  <div className="text-xs text-[var(--text-secondary,#aaa)]">{feat.capability}</div>
+                  <div className="text-xs text-text-muted">{feat.capability}</div>
                   {feat.reason && (
                     <div
-                      className="text-[10px] text-red-300 mt-1 bg-red-900/20 p-1.5 rounded"
+                      className="text-[10px] text-error mt-1 bg-error/20 p-1.5 rounded"
                       title={feat.reason}
                     >
                       {feat.reason.length > 80 ? feat.reason.substring(0, 80) + "..." : feat.reason}
                     </div>
                   )}
-                  <div className="text-[10px] text-[var(--text-muted,#666)] text-right mt-1">
-                    Since {new Date(feat.since).toLocaleTimeString()}
+                  <div className="text-[10px] text-text-muted text-right mt-1">
+                    {t("sinceTime", {
+                      time: new Date(feat.since).toLocaleTimeString(locale),
+                    })}
                   </div>
                 </div>
               );
@@ -347,42 +705,12 @@ export default function HealthPage() {
         </Card>
       )}
 
-      {/* Telemetry Cards — Latency & Prompt Cache */}
-      <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
-        {/* Latency Card */}
-        <Card className="p-4">
-          <h3 className="text-sm font-semibold text-text-muted mb-3 flex items-center gap-2">
-            <span className="material-symbols-outlined text-[18px]">speed</span>
-            {t("latency")}
-          </h3>
-          {telemetry ? (
-            <div className="space-y-2 text-sm">
-              <div className="flex justify-between">
-                <span className="text-text-muted">{t("latencyP50")}</span>
-                <span className="font-mono">{fmtMs(telemetry.p50)}</span>
-              </div>
-              <div className="flex justify-between">
-                <span className="text-text-muted">{t("latencyP95")}</span>
-                <span className="font-mono">{fmtMs(telemetry.p95)}</span>
-              </div>
-              <div className="flex justify-between">
-                <span className="text-text-muted">{t("latencyP99")}</span>
-                <span className="font-mono">{fmtMs(telemetry.p99)}</span>
-              </div>
-              <div className="flex justify-between border-t border-border pt-2 mt-2">
-                <span className="text-text-muted">{t("totalRequests")}</span>
-                <span className="font-mono">{telemetry.totalRequests ?? 0}</span>
-              </div>
-            </div>
-          ) : (
-            <p className="text-sm text-text-muted">{t("noDataYet")}</p>
-          )}
-        </Card>
-
+      {/* Cache Cards */}
+      <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
         {/* Prompt Cache Card */}
         <Card className="p-4">
           <h3 className="text-sm font-semibold text-text-muted mb-3 flex items-center gap-2">
-            <span className="material-symbols-outlined text-[18px]">cached</span>
+            <Icon name="cached" size={18} />
             {t("promptCache")}
           </h3>
           {cache ? (
@@ -412,7 +740,7 @@ export default function HealthPage() {
         {/* Signature Cache Card */}
         <Card className="p-4">
           <h3 className="text-sm font-semibold text-text-muted mb-3 flex items-center gap-2">
-            <span className="material-symbols-outlined text-[18px]">database</span>
+            <Icon name="database" size={18} />
             {t("signatureCache")}
           </h3>
           {signatureCache ? (
@@ -426,17 +754,17 @@ export default function HealthPage() {
                 {
                   label: t("signatureTool"),
                   value: `${signatureCache.tool.entries}/${signatureCache.tool.patterns}`,
-                  color: "text-blue-400",
+                  color: "text-info",
                 },
                 {
                   label: t("signatureFamily"),
                   value: `${signatureCache.family.entries}/${signatureCache.family.patterns}`,
-                  color: "text-purple-400",
+                  color: "text-chart-3",
                 },
                 {
                   label: t("signatureSession"),
                   value: `${signatureCache.session.entries}/${signatureCache.session.patterns}`,
-                  color: "text-cyan-400",
+                  color: "text-info",
                 },
               ].map(({ label, value, color }) => (
                 <div
@@ -458,48 +786,33 @@ export default function HealthPage() {
       <Card className="p-5" role="region" aria-label={t("providerHealthStatusAria")}>
         <div className="flex items-center justify-between mb-4">
           <h2 className="text-lg font-semibold text-text-main flex items-center gap-2">
-            <span className="material-symbols-outlined text-[20px] text-primary">
-              health_and_safety
-            </span>
+            <Icon name="health_and_safety" size={20} className="text-primary" />
             {t("providerHealth")}
           </h2>
           <div className="flex items-center gap-3">
             {cbEntries.some(([, cb]: [string, any]) => cb.state !== "CLOSED") && (
-              <button
+              <Button
+                variant="danger"
+                size="sm"
                 onClick={handleResetHealth}
-                disabled={resetting}
-                className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold transition-all ${
-                  resetting
-                    ? "bg-surface/50 text-text-muted cursor-wait"
-                    : "bg-red-500/10 text-red-400 hover:bg-red-500/20 hover:text-red-300 border border-red-500/20"
-                }`}
+                loading={resetting}
+                icon="restart_alt"
                 title={t("resetAllTitle")}
+                className="text-xs"
               >
-                {resetting ? (
-                  <>
-                    <span className="material-symbols-outlined text-[14px] animate-spin">
-                      progress_activity
-                    </span>
-                    {t("resetting")}
-                  </>
-                ) : (
-                  <>
-                    <span className="material-symbols-outlined text-[14px]">restart_alt</span>
-                    {t("resetAll")}
-                  </>
-                )}
-              </button>
+                {resetting ? t("resetting") : t("resetAll")}
+              </Button>
             )}
             {cbEntries.length > 0 && (
               <div className="flex items-center gap-3 text-xs text-text-muted">
                 <span className="flex items-center gap-1">
-                  <span className="size-2 rounded-full bg-green-500" /> {t("healthy")}
+                  <span className="size-2 rounded-full bg-success" /> {t("healthy")}
                 </span>
                 <span className="flex items-center gap-1">
-                  <span className="size-2 rounded-full bg-amber-500" /> {t("recovering")}
+                  <span className="size-2 rounded-full bg-warning" /> {t("recovering")}
                 </span>
                 <span className="flex items-center gap-1">
-                  <span className="size-2 rounded-full bg-red-500" /> {t("down")}
+                  <span className="size-2 rounded-full bg-error" /> {t("down")}
                 </span>
               </div>
             )}
@@ -516,23 +829,26 @@ export default function HealthPage() {
                 {/* Unhealthy providers first */}
                 {unhealthy.length > 0 && (
                   <div className="space-y-2">
-                    <p className="text-xs font-medium text-red-400 uppercase tracking-wide">
+                    <p className="text-xs font-medium text-error uppercase tracking-wide">
                       {t("issuesLabel")}
                     </p>
                     {unhealthy.map(([provider, cb]: [string, any]) => {
                       const style = CB_STYLES[cb.state] || CB_STYLES.OPEN;
                       const providerInfo = AI_PROVIDERS[provider];
-                      const displayName = providerInfo?.name || provider;
+                      const displayName = getProviderDisplayName(
+                        provider,
+                        nodeMap.get(provider) ?? providerInfo
+                      );
                       return (
                         <div
                           key={provider}
-                          className={`rounded-lg p-3 ${style.bg} border border-white/5 flex items-center gap-3`}
+                          className={`rounded-lg p-3 ${style.bg} border border-border flex items-center gap-3`}
                         >
                           <div
                             className="size-8 rounded-lg flex items-center justify-center shrink-0 text-xs font-bold"
                             style={{
-                              backgroundColor: `${providerInfo?.color || "#888"}15`,
-                              color: providerInfo?.color || "#888",
+                              backgroundColor: `color-mix(in srgb, ${providerInfo?.color || "var(--color-text-muted)"} 8%, transparent)`,
+                              color: providerInfo?.color || "var(--color-text-muted)",
                             }}
                           >
                             {providerInfo?.textIcon || provider.slice(0, 2).toUpperCase()}
@@ -552,10 +868,15 @@ export default function HealthPage() {
                               {cb.failures === 1
                                 ? t("failures", { count: cb.failures })
                                 : t("failuresPlural", { count: cb.failures })}
+                              {Number(cb.retryAfterMs) > 0 && (
+                                <span className="ml-2">
+                                  · {t("retryIn", { duration: fmtMs(cb.retryAfterMs) })}
+                                </span>
+                              )}
                               {cb.lastFailure && (
                                 <span className="ml-2">
                                   · {t("lastFailure")}:{" "}
-                                  {new Date(cb.lastFailure).toLocaleTimeString()}
+                                  {new Date(cb.lastFailure).toLocaleTimeString(locale)}
                                 </span>
                               )}
                             </div>
@@ -570,20 +891,23 @@ export default function HealthPage() {
                 {healthy.length > 0 && (
                   <div>
                     {unhealthy.length > 0 && (
-                      <p className="text-xs font-medium text-green-400 uppercase tracking-wide mb-2">
+                      <p className="text-xs font-medium text-success uppercase tracking-wide mb-2">
                         {t("operational")}
                       </p>
                     )}
                     <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 xl:grid-cols-5 gap-2">
                       {healthy.map(([provider]) => {
                         const providerInfo = AI_PROVIDERS[provider];
-                        const displayName = providerInfo?.name || provider;
+                        const displayName = getProviderDisplayName(
+                          provider,
+                          nodeMap.get(provider) ?? providerInfo
+                        );
                         return (
                           <div
                             key={provider}
-                            className="rounded-lg p-2.5 bg-green-500/5 border border-white/5 flex items-center gap-2"
+                            className="rounded-lg p-2.5 bg-success/5 border border-border flex items-center gap-2"
                           >
-                            <span className="size-2 rounded-full bg-green-500 shrink-0" />
+                            <span className="size-2 rounded-full bg-success shrink-0" />
                             <span
                               className="text-xs font-medium text-text-main truncate"
                               title={displayName}
@@ -613,25 +937,9 @@ export default function HealthPage() {
             const connectionId = parts[1] || "";
             const model = parts.slice(2).join(":") || null;
 
-            // Resolve friendly name
-            let displayName;
+            // Resolve friendly name — prefer user-given name from provider node map
             let providerInfo = AI_PROVIDERS[providerId];
-
-            if (providerId.startsWith("openai-compatible-")) {
-              const customName = providerId.replace("openai-compatible-", "");
-              displayName = tp("openaiCompatibleName");
-              providerInfo = { color: "#10A37F", textIcon: "OC" };
-              if (customName.length > 12) displayName += ` (${customName.slice(0, 8)}…)`;
-              else if (customName) displayName += ` (${customName})`;
-            } else if (providerId.startsWith("anthropic-compatible-")) {
-              const customName = providerId.replace("anthropic-compatible-", "");
-              displayName = tp("anthropicCompatibleName");
-              providerInfo = { color: "#D97757", textIcon: "AC" };
-              if (customName.length > 12) displayName += ` (${customName.slice(0, 8)}…)`;
-              else if (customName) displayName += ` (${customName})`;
-            } else {
-              displayName = providerInfo?.name || providerId;
-            }
+            const displayName = resolveProviderName(providerId, nodeMap);
 
             return { providerId, displayName, providerInfo, connectionId, model };
           };
@@ -648,16 +956,14 @@ export default function HealthPage() {
             const aActive = (a.status.queued || 0) + (a.status.running || 0);
             const bActive = (b.status.queued || 0) + (b.status.running || 0);
             if (aActive !== bActive) return bActive - aActive;
-            return a.displayName.localeCompare(b.displayName);
+            return compareTr(a.displayName, b.displayName);
           });
 
           return (
             <Card className="p-5">
               <div className="flex items-center justify-between mb-4">
                 <h2 className="text-lg font-semibold text-text-main flex items-center gap-2">
-                  <span className="material-symbols-outlined text-[20px] text-amber-500">
-                    speed
-                  </span>
+                  <Icon name="speed" size={20} className="text-warning" />
                   {t("rateLimitStatus")}
                 </h2>
                 <span className="text-xs text-text-muted">
@@ -669,17 +975,41 @@ export default function HealthPage() {
               <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
                 {entries.map(
                   ({ key, displayName, providerInfo, connectionId, model, status }: any) => {
+                    const learned = learnedLimits?.[key] || null;
                     const isActive = (status.queued || 0) + (status.running || 0) > 0;
                     const isQueued = (status.queued || 0) > 0;
+                    const learnedLimit =
+                      typeof learned?.limit === "number" && learned.limit > 0
+                        ? learned.limit
+                        : null;
+                    const learnedRemaining =
+                      typeof learned?.remaining === "number" ? learned.remaining : null;
+                    const learnedMinTime =
+                      typeof learned?.minTime === "number" && learned.minTime > 0
+                        ? learned.minTime
+                        : null;
+                    const learnedLastUpdated =
+                      typeof learned?.lastUpdated === "number" ? learned.lastUpdated : null;
+                    const lowRemaining =
+                      learnedLimit != null &&
+                      learnedRemaining != null &&
+                      learnedRemaining / learnedLimit <= 0.1;
+                    const exhausted = learnedRemaining != null && learnedRemaining <= 0;
+                    const quotaProgress =
+                      learnedLimit != null && learnedRemaining != null
+                        ? Math.max(0, Math.min(100, (learnedRemaining / learnedLimit) * 100))
+                        : null;
                     return (
                       <div
                         key={key}
                         className={`rounded-lg p-3 border transition-colors ${
-                          isQueued
-                            ? "bg-amber-500/5 border-amber-500/20"
-                            : isActive
-                              ? "bg-blue-500/5 border-blue-500/15"
-                              : "bg-surface/30 border-white/5"
+                          exhausted
+                            ? "bg-error/5 border-error/20"
+                            : isQueued || lowRemaining
+                              ? "bg-warning/5 border-warning/20"
+                              : isActive
+                                ? "bg-info/5 border-info/15"
+                                : "bg-surface/30 border-border"
                         }`}
                         title={key}
                       >
@@ -687,8 +1017,8 @@ export default function HealthPage() {
                           <div
                             className="size-7 rounded-md flex items-center justify-center shrink-0 text-[10px] font-bold"
                             style={{
-                              backgroundColor: `${providerInfo?.color || "#888"}15`,
-                              color: providerInfo?.color || "#888",
+                              backgroundColor: `color-mix(in srgb, ${providerInfo?.color || "var(--color-text-muted)"} 8%, transparent)`,
+                              color: providerInfo?.color || "var(--color-text-muted)",
                             }}
                           >
                             {providerInfo?.textIcon || displayName.slice(0, 2).toUpperCase()}
@@ -710,28 +1040,78 @@ export default function HealthPage() {
                           </div>
                           <span
                             className={`inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-semibold ${
-                              isQueued
-                                ? "bg-amber-500/15 text-amber-400"
-                                : isActive
-                                  ? "bg-blue-500/15 text-blue-400"
-                                  : "bg-green-500/10 text-green-400"
+                              exhausted
+                                ? "bg-error/15 text-error"
+                                : isQueued || lowRemaining
+                                  ? "bg-warning/15 text-warning"
+                                  : isActive
+                                    ? "bg-info/15 text-info"
+                                    : "bg-success/10 text-success"
                             }`}
                           >
-                            {isQueued ? t("queued") : isActive ? tc("active") : t("ok")}
+                            {exhausted
+                              ? t("limitExhausted")
+                              : isQueued || lowRemaining
+                                ? t("queued")
+                                : isActive
+                                  ? tc("active")
+                                  : t("ok")}
                           </span>
                         </div>
+                        {quotaProgress != null && (
+                          <div className="mb-3">
+                            <div className="mb-1 flex items-center justify-between text-[11px] text-text-muted">
+                              <span>{t("learnedFromHeaders")}</span>
+                              <span>
+                                {t("remainingOfLimit", {
+                                  remaining: learnedRemaining,
+                                  limit: learnedLimit,
+                                })}
+                              </span>
+                            </div>
+                            {/* Kit Progress, decorative: the kit spreads aria-* onto its outer div and
+                                never names the inner role="progressbar" (no label forwarding), so the
+                                bar is hidden from assistive tech — the remaining/limit text above
+                                carries the value. No tone prop either: status colour on the indicator. */}
+                            <div aria-hidden="true" data-testid="health-pool-bar">
+                              <Progress
+                                value={quotaProgress}
+                                animate={false}
+                                className={
+                                  exhausted
+                                    ? "[&_.ci-progress__indicator]:bg-none [&_.ci-progress__indicator]:bg-error"
+                                    : lowRemaining
+                                      ? "[&_.ci-progress__indicator]:bg-none [&_.ci-progress__indicator]:bg-warning"
+                                      : "[&_.ci-progress__indicator]:bg-none [&_.ci-progress__indicator]:bg-success"
+                                }
+                              />
+                            </div>
+                          </div>
+                        )}
                         <div className="flex items-center gap-3 text-[11px] text-text-muted">
                           <span className="flex items-center gap-1">
-                            <span className="material-symbols-outlined text-[12px]">schedule</span>
+                            <Icon name="schedule" size={12} />
                             {t("queuedCount", { count: status.queued || 0 })}
                           </span>
                           <span className="flex items-center gap-1">
-                            <span className="material-symbols-outlined text-[12px]">
-                              play_arrow
-                            </span>
+                            <Icon name="play_arrow" size={12} />
                             {t("runningCount", { count: status.running || 0 })}
                           </span>
                         </div>
+                        {(learnedMinTime != null || learnedLastUpdated != null) && (
+                          <div className="mt-3 space-y-1 text-[11px] text-text-muted">
+                            {learnedMinTime != null && (
+                              <p>{t("throttleStatus", { value: `${learnedMinTime}ms/req` })}</p>
+                            )}
+                            {learnedLastUpdated != null && (
+                              <p>
+                                {t("lastHeaderUpdate", {
+                                  age: formatRelativeTime(learnedLastUpdated) || t("notAvailable"),
+                                })}
+                              </p>
+                            )}
+                          </div>
+                        )}
                       </div>
                     );
                   }
@@ -744,32 +1124,62 @@ export default function HealthPage() {
       {/* Active Lockouts */}
       {lockoutEntries.length > 0 && (
         <Card className="p-5">
-          <h2 className="text-lg font-semibold text-text-main mb-4 flex items-center gap-2">
-            <span className="material-symbols-outlined text-[20px] text-red-500">lock</span>
-            {t("activeLockouts")}
-          </h2>
+          <div className="flex items-center justify-between mb-4">
+            <h2 className="text-lg font-semibold text-text-main flex items-center gap-2">
+              <Icon name="lock" size={20} className="text-error" />
+              {t("activeLockouts")}
+            </h2>
+            <Button
+              variant="warning"
+              size="sm"
+              icon="lock_open"
+              onClick={handleUnblockAll}
+              disabled={unblocking}
+              className="text-xs"
+            >
+              {unblocking ? "Unblocking..." : "Unblock all"}
+            </Button>
+          </div>
           <div className="space-y-2">
-            {lockoutEntries.map(([key, lockout]: [string, any]) => (
-              <div
-                key={key}
-                className="rounded-lg p-3 bg-red-500/5 border border-red-500/10 flex items-center justify-between"
-              >
-                <div>
-                  <span className="text-sm font-medium text-text-main">{key}</span>
-                  {lockout.reason && (
-                    <span className="text-xs text-text-muted ml-2">({lockout.reason})</span>
-                  )}
+            {lockoutEntries.map(([key, lockout]: [string, any]) => {
+              const lockProvider = lockout.provider as string;
+              const lockModel = lockout.model as string;
+              const lockKey = `${lockProvider}::${lockModel}`;
+              return (
+                <div
+                  key={key}
+                  className="rounded-lg p-3 bg-error/5 border border-error/10 flex items-center justify-between"
+                >
+                  <div className="min-w-0">
+                    <span className="text-sm font-medium text-text-main">
+                      {lockProvider}/{lockModel}
+                    </span>
+                    {lockout.reason && (
+                      <span className="text-xs text-text-muted ml-2">({lockout.reason})</span>
+                    )}
+                    {lockout.until && (
+                      <span className="text-xs text-error ml-2">
+                        until {new Date(lockout.until).toLocaleTimeString()}
+                      </span>
+                    )}
+                  </div>
+                  <Button
+                    variant="warning"
+                    size="sm"
+                    icon="lock_open"
+                    onClick={() => handleUnblockOne(lockProvider, lockModel)}
+                    disabled={unblockingKey === lockKey}
+                    className="h-7 min-h-7 shrink-0 px-2.5 text-xs"
+                  >
+                    {unblockingKey === lockKey ? "..." : "Unblock"}
+                  </Button>
                 </div>
-                {lockout.until && (
-                  <span className="text-xs text-red-400">
-                    {t("until", { time: new Date(lockout.until).toLocaleTimeString() })}
-                  </span>
-                )}
-              </div>
-            ))}
+              );
+            })}
           </div>
         </Card>
       )}
-    </div>
+      {confirmDialog}
+    </HealthLayout>
   );
 }

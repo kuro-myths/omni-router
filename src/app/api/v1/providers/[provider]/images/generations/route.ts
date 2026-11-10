@@ -1,19 +1,25 @@
-import { CORS_ORIGIN } from "@/shared/utils/cors";
+import { getFalCompatibilityPreparer } from "@/lib/fal/compatibility";
 import { handleImageGeneration } from "@omniroute/open-sse/handlers/imageGeneration.ts";
-import { errorResponse, unavailableResponse } from "@omniroute/open-sse/utils/error.ts";
+import { errorResponse } from "@omniroute/open-sse/utils/error.ts";
 import { HTTP_STATUS } from "@omniroute/open-sse/config/constants.ts";
 import {
-  getProviderCredentials,
+  getProviderCredentialsWithQuotaPreflight,
   clearRecoveredProviderState,
-  extractApiKey,
-  isValidApiKey,
 } from "@/sse/services/auth";
-import { getImageProvider } from "@omniroute/open-sse/config/imageRegistry.ts";
+import { getImageProvider, parseImageModel } from "@omniroute/open-sse/config/imageRegistry.ts";
 import * as log from "@/sse/utils/logger";
 import { toJsonErrorPayload } from "@/shared/utils/upstreamError";
-import { enforceApiKeyPolicy } from "@/shared/utils/apiKeyPolicy";
+import {
+  enforceApiKeyPolicyWithScope,
+  unusableCredentialsResponse,
+} from "@/app/api/v1/_shared/keyScopedRoute";
 import { v1ImageGenerationSchema } from "@/shared/validation/schemas";
 import { isValidationFailure, validateBody } from "@/shared/validation/helpers";
+import { enforceClientApiRouteAuth } from "@/shared/utils/clientApiRouteAuth";
+import { runImageRequestWithAccounting } from "@/lib/usage/imageRequestAccounting";
+import { executeImageWithCredentialFallback } from "@/sse/services/imageCredentialRetry";
+import { rejectRetiredCommonChatGptWebProvider } from "@/lib/providers/chatgptWebRetirementResponse";
+import { getImageLongJobOptions } from "@/lib/images/imageGenerationLongJobs";
 
 /**
  * Handle CORS preflight
@@ -21,7 +27,6 @@ import { isValidationFailure, validateBody } from "@/shared/validation/helpers";
 export async function OPTIONS() {
   return new Response(null, {
     headers: {
-      "Access-Control-Allow-Origin": CORS_ORIGIN,
       "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
       "Access-Control-Allow-Headers": "*",
     },
@@ -33,6 +38,8 @@ export async function OPTIONS() {
  */
 export async function POST(request, { params }) {
   const { provider: rawProvider } = await params;
+  const retirementResponse = rejectRetiredCommonChatGptWebProvider(rawProvider);
+  if (retirementResponse) return retirementResponse;
 
   // Verify this is a valid image provider
   const imageProvider = getImageProvider(rawProvider);
@@ -51,23 +58,21 @@ export async function POST(request, { params }) {
     return errorResponse(HTTP_STATUS.BAD_REQUEST, validation.error.message);
   }
   const body = validation.data;
-
-  // Optional API key validation
-  if (process.env.REQUIRE_API_KEY === "true") {
-    const apiKey = extractApiKey(request);
-    if (!apiKey || !(await isValidApiKey(apiKey))) {
-      return errorResponse(HTTP_STATUS.UNAUTHORIZED, "Invalid API key");
-    }
-  }
+  const startTime = Date.now();
 
   // Ensure model has provider prefix
   if (!body.model.includes("/")) {
     body.model = `${rawProvider}/${body.model}`;
   }
 
-  // Enforce API key policies (model restrictions + budget limits)
-  const policy = await enforceApiKeyPolicy(request, body.model);
-  if (policy.rejection) return policy.rejection;
+  const authRejection = await enforceClientApiRouteAuth(request);
+  if (authRejection) return authRejection;
+
+  // Enforce API key policies (model restrictions + budget limits). GHSA-3w2r:
+  // credential selection stays inside the key's connection scope, as in chat.
+  const scope = await enforceApiKeyPolicyWithScope(request, body.model);
+  if (scope.rejection) return scope.rejection;
+  const { policy } = scope;
 
   // Validate provider match
   const modelProvider = body.model.split("/")[0];
@@ -78,23 +83,61 @@ export async function POST(request, { params }) {
     );
   }
 
-  const credentials = await getProviderCredentials(rawProvider);
+  // Use the handler's registry resolution for accounting, without rewriting the
+  // request or changing credential selection/retry. Never dispatch an alias that
+  // resolves outside the provider whose credentials this scoped route selects.
+  const parsedModel = parseImageModel(body.model);
+  if (parsedModel.provider !== imageProvider.id) {
+    return errorResponse(
+      HTTP_STATUS.BAD_REQUEST,
+      `Model "${body.model}" does not belong to image provider "${rawProvider}"`
+    );
+  }
+  const requestedModel = body.model.slice(rawProvider.length + 1);
+  let credentials = await getProviderCredentialsWithQuotaPreflight(
+    rawProvider,
+    null,
+    scope.allowedConnections,
+    requestedModel
+  );
   if (!credentials) {
     return errorResponse(
       HTTP_STATUS.BAD_REQUEST,
       `No credentials for image provider: ${rawProvider}`
     );
   }
-  if (credentials.allRateLimited) {
-    return unavailableResponse(
-      HTTP_STATUS.RATE_LIMITED,
-      `[${rawProvider}] All accounts rate limited`,
-      credentials.retryAfter,
-      credentials.retryAfterHuman
-    );
-  }
+  const unusable = unusableCredentialsResponse(rawProvider, credentials);
+  if (unusable) return unusable;
 
-  const result = await handleImageGeneration({ body, credentials, log });
+  // #16260 — IMAGE_GENERATION_LONG_JOBS (default off): caller cancellation + connection timeout.
+  const longJobs = getImageLongJobOptions();
+  const execution = await executeImageWithCredentialFallback({
+    provider: rawProvider,
+    requestedModel,
+    credentials,
+    allowedConnections: scope.allowedConnections,
+    execute: (attemptCredentials) =>
+      runImageRequestWithAccounting(
+        {
+          endpoint: "/v1/images/generations",
+          provider: parsedModel.provider,
+          model: parsedModel.model,
+          apiKeyInfo: policy.apiKeyInfo,
+          credentials: attemptCredentials,
+          startTime,
+        },
+        () =>
+          handleImageGeneration({
+            prepareFalInput: getFalCompatibilityPreparer(),
+            body,
+            credentials: attemptCredentials,
+            log,
+            ...(longJobs ? { signal: request.signal, longJobs } : {}),
+          })
+      ),
+  });
+  credentials = execution.credentials;
+  const result = execution.result;
 
   if (result.success) {
     await clearRecoveredProviderState(credentials);
@@ -105,8 +148,9 @@ export async function POST(request, { params }) {
   }
 
   const errorPayload = toJsonErrorPayload((result as any).error, "Image generation provider error");
-  return new Response(JSON.stringify(errorPayload), {
-    status: (result as any).status,
-    headers: { "Content-Type": "application/json" },
-  });
+  const message =
+    typeof errorPayload?.error?.message === "string"
+      ? errorPayload.error.message
+      : "Image generation provider error";
+  return errorResponse((result as any).status, message);
 }

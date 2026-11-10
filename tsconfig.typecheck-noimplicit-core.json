@@ -5,10 +5,12 @@
     "strictNullChecks": true,
     "noImplicitAny": true,
     "noEmit": true,
-    "incremental": false
+    "incremental": true,
+    "tsBuildInfoFile": ".tsbuildinfo-typecheck-noimplicit-core"
   },
   "include": [],
   "files": [
+    "src/types/sqljs.d.ts",
     "src/app/api/settings/proxy/test/route.ts",
     "src/lib/db/apiKeys.ts",
     "src/lib/db/cliToolState.ts",

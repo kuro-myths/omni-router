@@ -1,6 +1,30 @@
 import { NextResponse } from "next/server";
-import { getProviderConnectionById } from "@/models";
-import { getAccessToken, updateProviderCredentials } from "@/sse/services/tokenRefresh";
+import * as passive from "@omniroute/open-sse/services/tokenRefresh/passiveCodex.ts";
+import { getCachedProviderConnectionById } from "@/lib/db/readCache";
+import { updateProviderConnection } from "@/lib/db/providers";
+import {
+  getAccessToken,
+  updateProviderCredentials,
+  refreshCopilotToken,
+  resolveCopilotTokenBaseUrl,
+} from "@/sse/services/tokenRefresh";
+import { rotationGroupFor } from "@omniroute/open-sse/services/refreshSerializer.ts";
+
+type RefreshResult = {
+  accessToken?: string;
+  expiresIn?: number;
+  /** Absolute expiry, preferred over expiresIn when the provider returns one. */
+  expiresAt?: string;
+  error?: string;
+  /**
+   * Set when the provider has been retired upstream. The caller surfaces a
+   * migration hint instead of asking the operator to re-authenticate in a loop
+   * against something that no longer exists.
+   */
+  code?: string;
+  reason?: string;
+  migrateTo?: string;
+};
 
 /**
  * POST /api/providers/[id]/refresh
@@ -14,7 +38,7 @@ export async function POST(_request: Request, { params }: { params: Promise<{ id
   try {
     const { id } = await params;
 
-    const connection = await getProviderConnectionById(id);
+    const connection = await getCachedProviderConnectionById(id);
     if (!connection) {
       return NextResponse.json({ error: "Connection not found" }, { status: 404 });
     }
@@ -33,7 +57,38 @@ export async function POST(_request: Request, { params }: { params: Promise<{ id
       );
     }
 
-    const provider = connection.provider as string;
+    if (typeof connection.provider !== "string" || connection.provider.length === 0) {
+      return NextResponse.json({ error: "Connection provider is invalid" }, { status: 422 });
+    }
+
+    const provider = connection.provider;
+    if (passive.isPassiveCodex(provider)) {
+      return NextResponse.json(
+        { error: passive.PASSIVE_REFRESH_MESSAGE, code: "refresh_disabled" },
+        { status: 409 }
+      );
+    }
+
+    // Codex/OpenAI multi-account family-revocation cascade guard.
+    // These two providers share the same Auth0 client_id and can revoke sibling
+    // accounts when several refresh_tokens are rotated proactively. Other
+    // serialized providers (for example Kiro) still support safe manual refresh;
+    // the serializer only prevents concurrent sibling refreshes.
+    const rotationGroup = rotationGroupFor(provider);
+    if (rotationGroup === "openai-auth0") {
+      return NextResponse.json({
+        success: true,
+        skipped: true,
+        connectionId: id,
+        provider,
+        message:
+          "Rotating-refresh provider: the token refreshes automatically on the next request. " +
+          "Manual/bulk refresh is intentionally skipped to avoid Auth0 token-family revocation.",
+        expiresAt: connection.tokenExpiresAt || connection.expiresAt || null,
+        refreshedAt: new Date().toISOString(),
+      });
+    }
+
     const credentials = {
       connectionId: id,
       accessToken: connection.accessToken,
@@ -44,9 +99,113 @@ export async function POST(_request: Request, { params }: { params: Promise<{ id
       providerSpecificData: connection.providerSpecificData,
     };
 
+    // github.com Copilot and GHE Copilot (device-code flow) never receive a
+    // refresh_token — only a GitHub access token plus a short-lived Copilot
+    // sub-token (providerSpecificData.copilotToken). The generic access-token
+    // helper below requires credentials.refreshToken and returns null
+    // immediately without one, which always surfaced as "Token refresh failed
+    // — provider returned no new token" for these connections. Refresh the
+    // Copilot sub-token directly instead, mirroring the health-check sweep's
+    // dedicated path.
+    //
+    // NB: keep the generic helper's name out of the comments above its real
+    // call site. tests/unit/codex-manual-refresh-rotating-guard.test.ts finds
+    // that call with a plain substring search and asserts the openai-auth0
+    // rotation guard precedes it, so an earlier textual mention would become
+    // the match instead of the actual invocation.
+    if (
+      (provider === "github" || provider === "ghe-copilot") &&
+      !connection.refreshToken &&
+      connection.accessToken
+    ) {
+      const copilotResult = await refreshCopilotToken(
+        connection.accessToken,
+        credentials,
+        resolveCopilotTokenBaseUrl(provider, credentials)
+      );
+      if (!copilotResult?.token) {
+        return NextResponse.json(
+          { error: "Token refresh failed — provider returned no new token" },
+          { status: 502 }
+        );
+      }
+
+      const refreshedProviderSpecificData = {
+        ...(connection.providerSpecificData || {}),
+        copilotToken: copilotResult.token,
+        copilotTokenExpiresAt: copilotResult.expiresAt,
+      };
+      await updateProviderConnection(id, {
+        providerSpecificData: refreshedProviderSpecificData,
+        testStatus: "active",
+        lastError: null,
+        lastErrorAt: null,
+        lastErrorType: null,
+        lastErrorSource: null,
+        errorCode: null,
+      });
+
+      const expiresAtMs =
+        typeof copilotResult.expiresAt === "number" && copilotResult.expiresAt < 1e12
+          ? copilotResult.expiresAt * 1000
+          : typeof copilotResult.expiresAt === "string"
+            ? new Date(copilotResult.expiresAt).getTime()
+            : (copilotResult.expiresAt as number | undefined);
+
+      return NextResponse.json({
+        success: true,
+        connectionId: id,
+        provider,
+        expiresAt: expiresAtMs ? new Date(expiresAtMs).toISOString() : null,
+        refreshedAt: new Date().toISOString(),
+      });
+    }
+
     // Use the existing getAccessToken helper which knows how to refresh
-    // tokens for each provider type (Claude, GitHub, Gemini, etc.)
-    const newCredentials = await getAccessToken(provider, credentials);
+    // tokens for each provider type (Claude, GitHub, Gemini, etc.).
+    // Pass onPersist so the DB write happens atomically INSIDE the per-connection
+    // mutex — prevents the race where a concurrent request reads stale credentials
+    // between the network call and the DB update.
+    let persistedCredentials: RefreshResult | null = null;
+    const newCredentials = (await getAccessToken(provider, credentials, async (result) => {
+      await updateProviderCredentials(id, result);
+      persistedCredentials = result;
+    })) as RefreshResult | null;
+
+    if (newCredentials && typeof newCredentials === "object" && newCredentials.error) {
+      if (
+        newCredentials.error === "unrecoverable_refresh_error" ||
+        newCredentials.error === "refresh_token_reused" ||
+        newCredentials.error === "invalid_grant"
+      ) {
+        // A deprecated provider reuses the unrecoverable contract so callers stop
+        // retrying, but "Refresh token expired" would be a lie: the token is fine, the
+        // provider is gone. Say that, and say where to go — the operator otherwise
+        // re-authenticates in a loop against something that no longer exists.
+        const isDeprecated = newCredentials.code === "provider_deprecated";
+        const reason =
+          isDeprecated && typeof newCredentials.reason === "string"
+            ? newCredentials.reason
+            : "Refresh token expired. Please re-authenticate this account.";
+        await updateProviderConnection(id, {
+          testStatus: isDeprecated ? "expired" : "invalid",
+          lastError: reason,
+          ...(isDeprecated
+            ? { lastErrorType: "provider_deprecated", errorCode: "provider_deprecated" }
+            : {}),
+        });
+        return NextResponse.json(
+          {
+            error: isDeprecated
+              ? "This provider was deprecated and can no longer be refreshed"
+              : "Token refresh failed — provider returned no new token",
+            requiresReauth: true,
+            ...(isDeprecated ? { deprecated: true, migrateTo: newCredentials.migrateTo } : {}),
+          },
+          { status: 401 }
+        );
+      }
+    }
 
     if (!newCredentials?.accessToken) {
       return NextResponse.json(
@@ -55,12 +214,17 @@ export async function POST(_request: Request, { params }: { params: Promise<{ id
       );
     }
 
-    // Persist new credentials to DB
-    await updateProviderCredentials(id, newCredentials);
+    // If onPersist was not called (e.g. no connectionId in credentials path), persist now.
+    if (!persistedCredentials) {
+      await updateProviderCredentials(id, newCredentials);
+    }
 
-    const expiresAt = newCredentials.expiresIn
-      ? new Date(Date.now() + newCredentials.expiresIn * 1000).toISOString()
-      : null;
+    const resolvedCreds = persistedCredentials || newCredentials;
+    const expiresAt = resolvedCreds.expiresAt
+      ? resolvedCreds.expiresAt
+      : resolvedCreds.expiresIn
+        ? new Date(Date.now() + resolvedCreds.expiresIn * 1000).toISOString()
+        : null;
 
     return NextResponse.json({
       success: true,

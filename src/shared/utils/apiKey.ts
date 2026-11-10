@@ -6,9 +6,12 @@ if (!process.env.API_KEY_SECRET) {
 }
 
 function getApiKeySecret(): string {
-  const secret = process.env.API_KEY_SECRET || "omniroute-default-insecure-api-key-secret";
+  const secret = process.env.API_KEY_SECRET;
   if (!secret || secret.trim() === "") {
-    throw new Error("API_KEY_SECRET is required for API key CRC operations");
+    throw new Error(
+      "API_KEY_SECRET is required for API key CRC operations. " +
+        "The startup validator (instrumentation-node.ts) should have set this automatically."
+    );
   }
   return secret;
 }
@@ -86,30 +89,4 @@ export function parseApiKey(
   }
 
   return null;
-}
-
-/**
- * Verify API key CRC (only for new format)
- * @param {string} apiKey
- * @returns {boolean}
- */
-export function verifyApiKeyCrc(apiKey: string): boolean {
-  const parsed = parseApiKey(apiKey);
-  if (!parsed) return false;
-
-  // Old format doesn't have CRC, always valid if parsed
-  if (!parsed.isNewFormat) return true;
-
-  // New format already verified in parseApiKey
-  return true;
-}
-
-/**
- * Check if API key is new format (contains machineId)
- * @param {string} apiKey
- * @returns {boolean}
- */
-export function isNewFormatKey(apiKey: string): boolean {
-  const parsed = parseApiKey(apiKey);
-  return parsed?.isNewFormat === true;
 }

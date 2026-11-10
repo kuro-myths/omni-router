@@ -1,7 +1,7 @@
-import { CORS_ORIGIN } from "@/shared/utils/cors";
 import { handleChat } from "@/sse/handlers/chat";
 import { initTranslators } from "@omniroute/open-sse/translator/index.ts";
 import { transformToOllama } from "@omniroute/open-sse/utils/ollamaTransform.ts";
+import { withChatAdmission } from "@/shared/middleware/withChatAdmission";
 
 let initialized = false;
 
@@ -16,14 +16,13 @@ async function ensureInitialized() {
 export async function OPTIONS() {
   return new Response(null, {
     headers: {
-      "Access-Control-Allow-Origin": CORS_ORIGIN,
       "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
       "Access-Control-Allow-Headers": "*",
     },
   });
 }
 
-export async function POST(request) {
+async function postHandler(request) {
   await ensureInitialized();
 
   const clonedReq = request.clone();
@@ -36,3 +35,5 @@ export async function POST(request) {
   const response = await handleChat(request);
   return transformToOllama(response, modelName);
 }
+
+export const POST = withChatAdmission(postHandler);

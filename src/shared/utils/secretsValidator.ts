@@ -54,14 +54,15 @@ const SECRET_RULES = [
 
 /**
  * Validate all required secrets.
+ * @param {NodeJS.ProcessEnv} [env]
  * @returns {ValidationResult}
  */
-export function validateSecrets() {
+export function validateSecrets(env = process.env) {
   const errors = [];
   const warnings = [];
 
   for (const rule of SECRET_RULES) {
-    const value = process.env[rule.name];
+    const value = env[rule.name];
 
     // Missing entirely
     if (!value || value.trim() === "") {
@@ -99,36 +100,4 @@ export function validateSecrets() {
     errors,
     warnings,
   };
-}
-
-/**
- * Validate secrets and terminate process if critical ones are missing.
- * Should be called during server initialization (fail-fast).
- * @param {object} [logger] - Optional logger (defaults to console)
- */
-export function enforceSecrets(logger = console) {
-  const result = validateSecrets();
-
-  // Print warnings (non-fatal)
-  for (const w of result.warnings) {
-    logger.warn(`⚠️  [SECURITY] ${w.issue}`);
-  }
-
-  // If there are errors, print them and exit
-  if (!result.valid) {
-    logger.error("");
-    logger.error("═══════════════════════════════════════════════════");
-    logger.error("  ❌  SECURITY: Missing required secrets");
-    logger.error("═══════════════════════════════════════════════════");
-    for (const e of result.errors) {
-      logger.error(`  • ${e.issue}`);
-      logger.error(`    → ${e.hint}`);
-    }
-    logger.error("");
-    logger.error("  Set these in your .env file or environment.");
-    logger.error("  See .env.example for reference.");
-    logger.error("═══════════════════════════════════════════════════");
-    logger.error("");
-    process.exit(1);
-  }
 }

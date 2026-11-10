@@ -1,4 +1,5 @@
 import { CURSOR_CONFIG } from "../constants/oauth";
+import { getCursorUserAgent } from "@omniroute/open-sse/config/providerHeaderProfiles.ts";
 
 /**
  * Cursor IDE OAuth Service
@@ -13,6 +14,57 @@ import { CURSOR_CONFIG } from "../constants/oauth";
  * - cursorAuth/accessToken: The access token
  * - storage.serviceMachineId: Machine ID for checksum
  */
+
+/**
+ * Fallback lifetime used only when a Cursor token carries no usable `exp`
+ * claim (i.e. it is not a JWT, or the claim is missing/garbage).
+ */
+export const CURSOR_FALLBACK_TOKEN_TTL_SECONDS = 86400;
+
+/**
+ * Derive the remaining lifetime (in seconds) of a Cursor access token from its
+ * own JWT `exp` claim.
+ *
+ * Cursor tokens are Auth0 JWTs whose real lifetime is weeks, not hours — the
+ * observed `exp` on an imported IDE token was ~8 weeks out. Previously this
+ * value was hardcoded to 24h, which wrote a `expires_at` ~24h after import.
+ * Past that timestamp `/api/providers/[id]/test` (cursor is `checkExpiry: true`
+ * with no refresh token) reported a hard `401 "Token expired"` for a token that
+ * was still perfectly valid — a **false positive** that made a working provider
+ * look dead and pushed the operator into a re-import loop.
+ *
+ * Pure + exported so the behavior is unit-testable without a DB or network.
+ *
+ * @param accessToken Raw Cursor access token (JWT or opaque string).
+ * @param nowMs Injectable clock for deterministic tests.
+ * @returns Seconds until expiry — the real `exp` when decodable and still in
+ *   the future, otherwise {@link CURSOR_FALLBACK_TOKEN_TTL_SECONDS}.
+ */
+export function resolveCursorTokenTtlSeconds(
+  accessToken: string,
+  nowMs: number = Date.now()
+): number {
+  const parts = String(accessToken || "").split(".");
+  if (parts.length !== 3) return CURSOR_FALLBACK_TOKEN_TTL_SECONDS;
+  try {
+    let payload = parts[1];
+    while (payload.length % 4) payload += "=";
+    const decoded = JSON.parse(
+      Buffer.from(payload.replace(/-/g, "+").replace(/_/g, "/"), "base64").toString()
+    );
+    const exp = decoded?.exp;
+    if (typeof exp !== "number" || !Number.isFinite(exp)) {
+      return CURSOR_FALLBACK_TOKEN_TTL_SECONDS;
+    }
+    const ttl = Math.floor((exp * 1000 - nowMs) / 1000);
+    // An already-expired token must NOT be papered over with the fallback —
+    // returning the (non-positive) real value lets the caller persist an
+    // accurate `expires_at` so the test route reports a *true* expiry.
+    return ttl;
+  } catch {
+    return CURSOR_FALLBACK_TOKEN_TTL_SECONDS;
+  }
+}
 
 export class CursorService {
   config: any;
@@ -51,11 +103,13 @@ export class CursorService {
       Authorization: `Bearer ${accessToken}`,
       "Content-Type": "application/connect+proto",
       "Connect-Protocol-Version": "1",
+      "User-Agent": getCursorUserAgent(this.config.clientVersion),
       "x-cursor-client-version": this.config.clientVersion,
       "x-cursor-client-type": this.config.clientType,
       "x-cursor-client-os": this.detectOS(),
       "x-cursor-client-arch": this.detectArch(),
       "x-cursor-client-device-type": "desktop",
+      "x-cursor-user-agent": getCursorUserAgent(this.config.clientVersion),
       "x-cursor-checksum": checksum,
       "x-ghost-mode": ghostMode ? "true" : "false",
     };
@@ -88,20 +142,16 @@ export class CursorService {
   }
 
   /**
-   * Validate and import token from Cursor IDE
+   * Validate and import token from Cursor IDE or cursor-agent CLI.
    * Note: We skip API validation because Cursor API uses complex protobuf format.
    * Token will be validated when actually used for requests.
-   * @param {string} accessToken - Access token from state.vscdb
-   * @param {string} machineId - Machine ID from state.vscdb
+   * @param {string} accessToken - Access token from state.vscdb or auth.json
+   * @param {string} [machineId] - Machine ID from state.vscdb (optional for cursor-agent imports)
    */
-  async validateImportToken(accessToken: string, machineId: string) {
+  async validateImportToken(accessToken: string, machineId?: string) {
     // Basic validation
     if (!accessToken || typeof accessToken !== "string") {
       throw new Error("Access token is required");
-    }
-
-    if (!machineId || typeof machineId !== "string") {
-      throw new Error("Machine ID is required");
     }
 
     // Token format validation (Cursor tokens are typically long strings)
@@ -109,10 +159,12 @@ export class CursorService {
       throw new Error("Invalid token format. Token appears too short.");
     }
 
-    // Machine ID format validation (should be UUID-like)
-    const uuidRegex = /^[a-f0-9-]{32,}$/i;
-    if (!uuidRegex.test(machineId.replace(/-/g, ""))) {
-      throw new Error("Invalid machine ID format. Expected UUID format.");
+    // Machine ID format validation (only if provided — cursor-agent imports don't have one)
+    if (machineId) {
+      const uuidRegex = /^[a-f0-9-]{32,}$/i;
+      if (!uuidRegex.test(machineId.replace(/-/g, ""))) {
+        throw new Error("Invalid machine ID format. Expected UUID format.");
+      }
     }
 
     // Note: We don't validate against API because Cursor uses complex protobuf.
@@ -120,9 +172,9 @@ export class CursorService {
 
     return {
       accessToken,
-      machineId,
-      expiresIn: 86400, // Cursor tokens typically last 24 hours
-      authMethod: "imported",
+      machineId: machineId || null,
+      expiresIn: resolveCursorTokenTtlSeconds(accessToken), // real JWT `exp` (weeks), fallback 24h
+      authMethod: machineId ? "imported" : "cursor-agent",
     };
   }
 
@@ -142,8 +194,10 @@ export class CursorService {
         const decoded = JSON.parse(
           Buffer.from(payload.replace(/-/g, "+").replace(/_/g, "/"), "base64").toString()
         );
+        const email =
+          typeof decoded.email === "string" && decoded.email.includes("@") ? decoded.email : null;
         return {
-          email: decoded.email || decoded.sub,
+          email,
           userId: decoded.sub || decoded.user_id,
         };
       }
@@ -152,6 +206,41 @@ export class CursorService {
     }
 
     return null;
+  }
+
+  /**
+   * Fetch real user profile from cursor.com using the same WorkOS-session cookie
+   * format that powers the dashboard. Returns null on any failure so the import
+   * flow can fall back to whatever it can extract from the JWT.
+   */
+  async fetchUserInfo(
+    accessToken: string,
+    userId: string
+  ): Promise<{ email: string | null; name: string | null; sub: string | null } | null> {
+    if (!accessToken || !userId) return null;
+    try {
+      const response = await fetch("https://cursor.com/api/auth/me", {
+        method: "GET",
+        redirect: "manual",
+        headers: {
+          Cookie: `WorkosCursorSessionToken=${userId}::${accessToken}`,
+          Origin: "https://cursor.com",
+          Referer: "https://cursor.com/dashboard",
+          Accept: "application/json",
+          "User-Agent": getCursorUserAgent(this.config.clientVersion),
+        },
+      });
+
+      if (!response.ok) return null;
+      const data = (await response.json()) as Record<string, unknown>;
+      return {
+        email: typeof data.email === "string" ? data.email : null,
+        name: typeof data.name === "string" ? data.name : null,
+        sub: typeof data.sub === "string" ? data.sub : null,
+      };
+    } catch {
+      return null;
+    }
   }
 
   /**

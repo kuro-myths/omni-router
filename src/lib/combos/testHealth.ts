@@ -1,8 +1,8 @@
 type JsonRecord = Record<string, unknown>;
 
-const COMBO_TEST_MAX_TOKENS = 2048;
-const COMBO_TEST_OPERAND_MIN = 10000;
-const COMBO_TEST_OPERAND_RANGE = 90000;
+const COMBO_TEST_MAX_TOKENS = 64;
+const STREAMING_MODEL_TEST_MAX_TOKENS = 64;
+const COMBO_TEST_PROMPT = "Reply with exactly: pong";
 
 function asRecord(value: unknown): JsonRecord {
   return value && typeof value === "object" && !Array.isArray(value) ? (value as JsonRecord) : {};
@@ -12,18 +12,19 @@ function joinNonEmpty(parts: string[]) {
   return parts.filter(Boolean).join("\n").trim();
 }
 
-function extractTextFromContent(content: unknown): string {
-  if (typeof content === "string") return content.trim();
+function extractTextFromContent(content: unknown, preserveWhitespace = false): string {
+  if (typeof content === "string") return preserveWhitespace ? content : content.trim();
 
   if (!Array.isArray(content)) return "";
 
-  return content
+  const text = content
     .map((part) => {
-      if (typeof part === "string") return part.trim();
+      if (typeof part === "string") return preserveWhitespace ? part : part.trim();
 
       const block = asRecord(part);
       const blockType = typeof block.type === "string" ? block.type : "";
-      const blockText = typeof block.text === "string" ? block.text.trim() : "";
+      const blockText =
+        typeof block.text === "string" ? (preserveWhitespace ? block.text : block.text.trim()) : "";
 
       if (blockText && (blockType === "" || blockType === "text" || blockType === "output_text")) {
         return blockText;
@@ -32,8 +33,8 @@ function extractTextFromContent(content: unknown): string {
       return "";
     })
     .filter(Boolean)
-    .join("\n")
-    .trim();
+    .join(preserveWhitespace ? "" : "\n");
+  return preserveWhitespace ? text : text.trim();
 }
 
 function extractReasoningText(record: JsonRecord): string {
@@ -107,35 +108,149 @@ function hasReasoningOnlyCompletion(body: JsonRecord): boolean {
   });
 }
 
-function getRandomFiveDigitNumber() {
-  return COMBO_TEST_OPERAND_MIN + Math.floor(Math.random() * COMBO_TEST_OPERAND_RANGE);
+export function buildComboTestPrompt() {
+  return COMBO_TEST_PROMPT;
 }
 
-function buildComboTestPrompt() {
-  const left = getRandomFiveDigitNumber();
-  const right = getRandomFiveDigitNumber();
-
-  return `Calculate ${left}+${right}, and reply with the result only.`;
+function isGeminiComboProbe(modelStr: string) {
+  return /(?:^|\/)gemini(?:-|$)/i.test(modelStr);
 }
 
-export function buildComboTestRequestBody(modelStr: string) {
-  return {
+export function buildComboTestRequestBody(
+  modelStr: string,
+  isEmbedding: boolean = false,
+  options: { stream?: boolean; maxTokens?: number } = {}
+) {
+  if (isEmbedding) {
+    return {
+      model: modelStr,
+      input: "Hello World",
+    };
+  }
+
+  const body: {
+    model: string;
+    messages: { role: string; content: string }[];
+    max_tokens: number;
+    stream: boolean;
+    reasoning_effort?: "none";
+  } = {
     model: modelStr,
-    // Randomize the arithmetic prompt so upstream providers are less likely to
-    // satisfy the smoke test with cached completions.
     messages: [{ role: "user", content: buildComboTestPrompt() }],
-    // Give reasoning-heavy models enough headroom to finish the request and
-    // still emit a visible answer without immediate truncation.
-    max_tokens: COMBO_TEST_MAX_TOKENS,
-    stream: false,
+    // Keep the smoke probe short so reasoning-heavy models do not burn the
+    // health-check budget on arithmetic.
+    max_tokens:
+      options.maxTokens ??
+      (options.stream ? STREAMING_MODEL_TEST_MAX_TOKENS : COMBO_TEST_MAX_TOKENS),
+    stream: options.stream ?? false,
+  };
+  // Gemini 3.8 flash-high injects thinkingLevel=high unless the documented
+  // off-switch is set. Other providers must not see this field: some
+  // OpenAI-compatible endpoints 400 unknown parameters.
+  if (isGeminiComboProbe(modelStr)) {
+    body.reasoning_effort = "none";
+  }
+  return body;
+}
+
+export type ComboTestStreamResult = {
+  text: string;
+  error?: { message: string; statusCode?: number };
+};
+
+function extractStreamError(body: JsonRecord): ComboTestStreamResult["error"] {
+  const error = asRecord(body.error);
+  const message =
+    typeof error.message === "string"
+      ? error.message.trim()
+      : typeof body.message === "string"
+        ? body.message.trim()
+        : "";
+  if (!message) return undefined;
+
+  const status = error.status ?? error.statusCode ?? error.code ?? body.status ?? body.statusCode;
+  const statusCode =
+    typeof status === "number"
+      ? status
+      : typeof status === "string" && /^\d+$/.test(status)
+        ? Number(status)
+        : undefined;
+  return {
+    message,
+    ...(Number.isInteger(statusCode) ? { statusCode } : {}),
   };
 }
 
-export function extractComboTestResponseText(responseBody: unknown): string {
+function extractStreamPayload(
+  payload: string
+): (ComboTestStreamResult & { reasoning?: string }) | undefined {
+  try {
+    const body = JSON.parse(payload);
+    const error = extractStreamError(asRecord(body));
+    if (error) return { text: "", error };
+
+    const collected: string[] = [];
+    const reasoningParts: string[] = [];
+    const direct = extractComboTestResponseText(body, false);
+    if (direct) collected.push(direct);
+    else {
+      const fallback = extractComboTestResponseText(body);
+      if (fallback) reasoningParts.push(fallback);
+    }
+    for (const choice of Array.isArray(body?.choices) ? body.choices : []) {
+      const delta = asRecord(choice?.delta);
+      const content = extractTextFromContent(delta.content, true);
+      const reasoning = extractReasoningText(delta);
+      if (content) collected.push(content);
+      if (reasoning) reasoningParts.push(reasoning);
+    }
+    return { text: collected.join(""), reasoning: reasoningParts.join("") };
+  } catch {
+    // Ignore malformed/non-JSON SSE events; a later valid event can still
+    // prove that the model is healthy.
+    return undefined;
+  }
+}
+
+export function extractComboTestStreamResult(streamBody: string): ComboTestStreamResult {
+  const collected: string[] = [];
+  const reasoningParts: string[] = [];
+  let streamError: ComboTestStreamResult["error"];
+  for (const line of streamBody.split(/\r?\n/)) {
+    if (!line.startsWith("data:")) continue;
+    const payload = line.slice(5).trim();
+    if (!payload || payload === "[DONE]") continue;
+    const result = extractStreamPayload(payload);
+    if (!result) continue;
+    if (result.error) streamError = result.error;
+    else {
+      if (result.text) collected.push(result.text);
+      if (result.reasoning) reasoningParts.push(result.reasoning);
+    }
+  }
+  const content = collected.join("").trim();
+  return {
+    text: content || reasoningParts.join("").trim(),
+    ...(streamError ? { error: streamError } : {}),
+  };
+}
+
+export function extractComboTestStreamText(streamBody: string): string {
+  return extractComboTestStreamResult(streamBody).text;
+}
+
+export function extractComboTestResponseText(
+  responseBody: unknown,
+  includeReasoning = true
+): string {
   const body = asRecord(responseBody);
 
   if (typeof body.output_text === "string" && body.output_text.trim()) {
     return body.output_text.trim();
+  }
+
+  if (Array.isArray(body.data) && body.data[0]?.embedding) {
+    return "[Embedding generated successfully]";
   }
 
   if (Array.isArray(body.choices)) {
@@ -146,7 +261,7 @@ export function extractComboTestResponseText(responseBody: unknown): string {
       if (messageText) return messageText;
 
       const reasoningText = extractReasoningText(message);
-      if (reasoningText) return reasoningText;
+      if (includeReasoning && reasoningText) return reasoningText;
 
       if (typeof choiceRecord.text === "string" && choiceRecord.text.trim()) {
         return choiceRecord.text.trim();
@@ -161,7 +276,7 @@ export function extractComboTestResponseText(responseBody: unknown): string {
       if (contentText) return contentText;
 
       const reasoningText = extractReasoningText(itemRecord);
-      if (reasoningText) return reasoningText;
+      if (includeReasoning && reasoningText) return reasoningText;
     }
   }
 
@@ -169,9 +284,9 @@ export function extractComboTestResponseText(responseBody: unknown): string {
   if (topLevelText) return topLevelText;
 
   const topLevelReasoning = extractReasoningText(body);
-  if (topLevelReasoning) return topLevelReasoning;
+  if (includeReasoning && topLevelReasoning) return topLevelReasoning;
 
-  if (hasReasoningOnlyCompletion(body)) {
+  if (includeReasoning && hasReasoningOnlyCompletion(body)) {
     return "[reasoning-only completion]";
   }
 

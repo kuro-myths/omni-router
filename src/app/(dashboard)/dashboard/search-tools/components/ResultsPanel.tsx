@@ -1,11 +1,11 @@
 "use client";
 
 import { useState } from "react";
+import Link from "next/link";
 import { useTranslations } from "next-intl";
-import dynamic from "next/dynamic";
-import { Badge } from "@/shared/components";
-
-const Editor = dynamic(() => import("@monaco-editor/react"), { ssr: false });
+import { Badge, Button } from "@/shared/components";
+import Editor from "@/shared/components/MonacoEditor";
+import { Spinner } from "@/shared/components/Loading";
 
 interface SearchResult {
   title: string;
@@ -40,6 +40,8 @@ interface ResultsPanelProps {
   error: string;
   statusCode: number;
   duration: number;
+  /** If true, shows a CTA to configure providers in the empty state */
+  noProvidersConfigured?: boolean;
 }
 
 function formatBytes(bytes: number): string {
@@ -54,6 +56,7 @@ export default function ResultsPanel({
   error,
   statusCode,
   duration,
+  noProvidersConfigured,
 }: ResultsPanelProps) {
   const t = useTranslations("search");
   const [showJson, setShowJson] = useState(false);
@@ -65,9 +68,9 @@ export default function ResultsPanel({
   };
 
   const getScoreBg = (score: number) => {
-    if (score >= 0.9) return "bg-green-500/10";
-    if (score >= 0.7) return "bg-yellow-500/10";
-    return "bg-red-500/10";
+    if (score >= 0.9) return "bg-success-bg";
+    if (score >= 0.7) return "bg-warning-bg";
+    return "bg-error-bg";
   };
 
   const editorTheme =
@@ -94,26 +97,22 @@ export default function ResultsPanel({
         </div>
         {response && (
           <div className="flex gap-1">
-            <button
-              className={`text-xs px-3 py-1 rounded-md ${
-                !showJson
-                  ? "bg-primary/15 text-primary font-medium"
-                  : "bg-black/5 dark:bg-white/5 text-text-muted"
-              }`}
+            <Button
+              size="sm"
+              variant={!showJson ? "secondary" : "ghost"}
+              aria-pressed={!showJson}
               onClick={() => setShowJson(false)}
             >
               {t("formatted")}
-            </button>
-            <button
-              className={`text-xs px-3 py-1 rounded-md ${
-                showJson
-                  ? "bg-primary/15 text-primary font-medium"
-                  : "bg-black/5 dark:bg-white/5 text-text-muted"
-              }`}
+            </Button>
+            <Button
+              size="sm"
+              variant={showJson ? "secondary" : "ghost"}
+              aria-pressed={showJson}
               onClick={() => setShowJson(true)}
             >
               {t("rawJson")}
-            </button>
+            </Button>
           </div>
         )}
       </div>
@@ -121,9 +120,7 @@ export default function ResultsPanel({
       {/* Content */}
       {loading && (
         <div className="flex items-center justify-center py-20">
-          <span className="material-symbols-outlined text-[24px] text-primary animate-spin">
-            progress_activity
-          </span>
+          <Spinner size="md" />
         </div>
       )}
 
@@ -213,8 +210,30 @@ export default function ResultsPanel({
         </div>
       )}
 
-      {!loading && !error && !response && (
-        <div className="flex items-center justify-center py-20 text-text-muted text-sm">
+      {!loading && !error && !response && noProvidersConfigured && (
+        <div
+          className="flex flex-col items-center justify-center py-20 text-center"
+          data-testid="no-providers-cta"
+        >
+          <span className="text-2xl mb-3" aria-hidden="true">
+            🔌
+          </span>
+          <p className="text-sm text-text-muted mb-2">{t("noActiveProvider")}</p>
+          <Link
+            href="/dashboard/providers"
+            className="text-accent text-sm hover:underline font-medium"
+            data-testid="configure-providers-link"
+          >
+            {t("configureMoreProviders")} →
+          </Link>
+        </div>
+      )}
+
+      {!loading && !error && !response && !noProvidersConfigured && (
+        <div
+          className="flex items-center justify-center py-20 text-text-muted text-sm"
+          data-testid="empty-state"
+        >
           {t("emptyState")}
         </div>
       )}

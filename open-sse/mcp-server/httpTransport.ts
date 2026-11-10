@@ -11,6 +11,14 @@
 
 import { randomUUID } from "node:crypto";
 import { createMcpServer } from "./server.ts";
+import { resolveMcpCallerAuthInfo, withMcpHttpAuthContext } from "./httpAuthContext.ts";
+import { sanitizeErrorMessage } from "../utils/error.ts";
+import {
+  noteStreamableInflight,
+  noteStreamableOpenStream,
+  purgeStreamableActivity,
+  streamableActivity,
+} from "./sessionActivity.ts";
 import { WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 
@@ -23,9 +31,57 @@ type StreamableSession = {
   server: McpServer;
   transport: WebStandardStreamableHTTPServerTransport;
   startedAt: number;
+  lastActivityAt: number;
 };
 
 const _streamableSessions = new Map<string, StreamableSession>();
+
+const DEFAULT_MCP_SESSION_IDLE_MS = 5 * 60 * 1000;
+
+/**
+ * Streamable-HTTP session idle limit in ms, read from
+ * `OMNIROUTE_MCP_SESSION_IDLE_MS`. Non-numeric or non-positive values fall
+ * back to the historical five-minute default.
+ */
+export function resolveMcpSessionIdleMs(): number {
+  const raw = process.env.OMNIROUTE_MCP_SESSION_IDLE_MS;
+  if (raw === undefined) return DEFAULT_MCP_SESSION_IDLE_MS;
+  const parsed = Number(raw);
+  return Number.isInteger(parsed) && parsed > 0 ? parsed : DEFAULT_MCP_SESSION_IDLE_MS;
+}
+
+export function shouldReapSession(
+  session: { lastActivityAt: number; activeRequests?: number; openStreams?: number },
+  nowMs: number
+): boolean {
+  if ((session.activeRequests ?? 0) > 0) return false;
+  if ((session.openStreams ?? 0) > 0) return false;
+  return nowMs - session.lastActivityAt > resolveMcpSessionIdleMs();
+}
+
+const _mcpSessionSweep = setInterval(() => {
+  const now = Date.now();
+  for (const [sessionId, session] of _streamableSessions) {
+    const activity = streamableActivity(sessionId);
+    if (
+      shouldReapSession(
+        {
+          lastActivityAt: session.lastActivityAt,
+          activeRequests: activity.inflight,
+          openStreams: activity.openStreams,
+        },
+        now
+      )
+    ) {
+      try {
+        closeStreamableSession(sessionId);
+      } catch {}
+    }
+  }
+}, 60_000);
+if (typeof _mcpSessionSweep === "object" && "unref" in _mcpSessionSweep) {
+  (_mcpSessionSweep as { unref?: () => void }).unref?.();
+}
 
 function closeSseTransport(): void {
   if (_sseTransport) {
@@ -52,6 +108,7 @@ function closeStreamableSession(sessionId: string): void {
     // ignore shutdown errors
   }
   _streamableSessions.delete(sessionId);
+  purgeStreamableActivity(sessionId);
 }
 
 function closeAllStreamableSessions(): void {
@@ -67,8 +124,6 @@ function ensureSseServer(): {
   if (_sseServer && _sseTransport) {
     return { server: _sseServer, transport: _sseTransport };
   }
-
-  closeAllStreamableSessions();
 
   _sseServer = createMcpServer();
   _sseTransport = new WebStandardStreamableHTTPServerTransport({
@@ -95,6 +150,7 @@ function createStreamableSession(): StreamableSession {
     server,
     transport,
     startedAt: Date.now(),
+    lastActivityAt: Date.now(),
   };
 
   void server.connect(transport);
@@ -116,11 +172,41 @@ async function isInitializeRequest(request: Request): Promise<boolean> {
   }
 }
 
+/**
+ * Resolve the caller's per-key scopes (#7895) and hand the request to the
+ * transport with `authInfo` populated, so `extra.authInfo.scopes` reaching
+ * tool handlers reflects the real `api_keys.scopes` row instead of the
+ * `OMNIROUTE_MCP_SCOPES` env fallback. When no per-key auth can be resolved
+ * (no key, invalid key, stdio has no `Request` at all), `authInfo` stays
+ * `undefined` and `scopeEnforcement.ts` falls through to its existing
+ * meta/env chain unchanged.
+ */
+async function handleRequestWithAuthInfo(
+  transport: WebStandardStreamableHTTPServerTransport,
+  request: Request
+): Promise<Response> {
+  const authInfo = await resolveMcpCallerAuthInfo(request);
+  return transport.handleRequest(request, { authInfo });
+}
+
+/**
+ * JSON-RPC 2.0 transport-level error envelope.
+ *
+ * S-05 (#15159): this is NOT the canonical `errorResponse` from
+ * `open-sse/utils/error.ts` — it is a local builder for the JSON-RPC shape that MCP
+ * clients parse, so it cannot be replaced by the canonical helper without breaking
+ * the protocol. It did, however, interpolate `message` with no sanitization.
+ *
+ * Both current call sites pass static literals, so nothing leaks today — but the
+ * next caller forwarding an `err.message` would put it on the wire unredacted,
+ * reintroducing S-02's leak on the JSON-RPC surface. Sanitizing here makes the
+ * builder safe by default rather than safe by caller discipline.
+ */
 function errorResponse(message: string, code: number, status = 400): Response {
   return new Response(
     JSON.stringify({
       jsonrpc: "2.0",
-      error: { code, message },
+      error: { code, message: sanitizeErrorMessage(message) },
       id: null,
     }),
     {
@@ -128,6 +214,30 @@ function errorResponse(message: string, code: number, status = 400): Response {
       headers: { "Content-Type": "application/json" },
     }
   );
+}
+
+export function protectMcpSseResponse(request: Request, response: Response): Response {
+  if (
+    request.method !== "POST" ||
+    !response.headers.get("content-type")?.toLowerCase().includes("text/event-stream")
+  ) {
+    return response;
+  }
+
+  const headers = new Headers(response.headers);
+  const cacheControl = headers.get("cache-control");
+  if (!/(?:^|,)\s*no-transform(?:\s*(?:,|$))/i.test(cacheControl ?? "")) {
+    headers.set("cache-control", [cacheControl, "no-transform"].filter(Boolean).join(", "));
+  }
+  // Server-sent events behind a buffering reverse proxy stall tool calls for
+  // the proxy's buffer window on every event — carry the same no-buffering
+  // instruction the main chat SSE path sets.
+  headers.set("X-Accel-Buffering", "no");
+  return new Response(response.body, {
+    status: response.status,
+    statusText: response.statusText,
+    headers,
+  });
 }
 
 function withSessionHeader(response: Response, sessionId: string): Response {
@@ -144,17 +254,100 @@ function withSessionHeader(response: Response, sessionId: string): Response {
   });
 }
 
+/**
+ * Count an open SSE stream for a session while its body stays alive. The body
+ * is re-served through a pull-based ReadableStream so the counter is released
+ * exactly once, on natural end, consumer cancel, or body error. Idle time then
+ * counts from that moment, not from the request that opened the stream.
+ */
+function trackOpenSseStream(session: StreamableSession, response: Response): Response {
+  const { sessionId } = session;
+  noteStreamableOpenStream(sessionId, 1);
+  let released = false;
+  const release = () => {
+    if (released) return;
+    released = true;
+    session.lastActivityAt = Date.now();
+    noteStreamableOpenStream(sessionId, -1);
+  };
+  const reader = response.body!.getReader();
+  const body = new ReadableStream({
+    async pull(controller: ReadableStreamDefaultController<Uint8Array>) {
+      let result: ReadableStreamReadResult<Uint8Array>;
+      try {
+        result = await reader.read();
+      } catch (err) {
+        release();
+        controller.error(err);
+        return;
+      }
+      if (result.done) {
+        release();
+        controller.close();
+      } else {
+        controller.enqueue(result.value);
+      }
+    },
+    cancel() {
+      reader.cancel().catch((err: unknown) => {
+        console.error("[MCP] Failed to cancel upstream SSE body:", err);
+      });
+      release();
+    },
+  });
+  return new Response(body, {
+    status: response.status,
+    statusText: response.statusText,
+    headers: response.headers,
+  });
+}
+
 async function handleStreamableRequest(request: Request): Promise<Response> {
   const sessionId = request.headers.get("mcp-session-id");
 
   if (sessionId) {
     const session = _streamableSessions.get(sessionId);
     if (!session) {
-      return errorResponse("Bad Request: Unknown Mcp-Session-Id header", -32000);
+      // MCP spec (2025-03-26 / 2025-11-25, Session Management): once a session is
+      // terminated/unknown, the server MUST respond with HTTP 404 Not Found so the
+      // client re-initializes. A 400 here is non-recoverable for spec-compliant
+      // clients (they only re-init on 404). See issue #5169.
+      //
+      // Auto-recovery: if the client sends an initialize request with a stale session
+      // id (e.g. after a server restart or idle eviction), treat it as a fresh
+      // initialization rather than hard-failing with 404. This avoids requiring users
+      // to manually restart their MCP client after every server restart.
+      if (await isInitializeRequest(request)) {
+        const newSession = createStreamableSession();
+        try {
+          const response = await withMcpHttpAuthContext(request, () =>
+            handleRequestWithAuthInfo(newSession.transport, request)
+          );
+          return withSessionHeader(response, newSession.sessionId);
+        } catch (err) {
+          closeStreamableSession(newSession.sessionId);
+          console.error("[MCP] Streamable HTTP error during stale-session recovery:", err);
+          return new Response(JSON.stringify({ error: "MCP transport error" }), {
+            status: 500,
+            headers: { "Content-Type": "application/json" },
+          });
+        }
+      }
+      return errorResponse("Not Found: Unknown Mcp-Session-Id header", -32000, 404);
     }
 
+    noteStreamableInflight(sessionId, 1);
     try {
-      const response = await session.transport.handleRequest(request);
+      session.lastActivityAt = Date.now();
+      let response = await withMcpHttpAuthContext(request, () =>
+        handleRequestWithAuthInfo(session.transport, request)
+      );
+      // The SSE response body stays open until the JSON-RPC response is
+      // delivered (an in-flight tool call) or the GET subscription ends, so an
+      // open body is transport-level activity for both POST and GET.
+      if (response.headers.get("content-type")?.toLowerCase().includes("text/event-stream")) {
+        response = trackOpenSseStream(session, response);
+      }
       if (request.method === "DELETE") {
         closeStreamableSession(sessionId);
       }
@@ -168,6 +361,9 @@ async function handleStreamableRequest(request: Request): Promise<Response> {
         status: 500,
         headers: { "Content-Type": "application/json" },
       });
+    } finally {
+      session.lastActivityAt = Date.now();
+      noteStreamableInflight(sessionId, -1);
     }
   }
 
@@ -178,7 +374,9 @@ async function handleStreamableRequest(request: Request): Promise<Response> {
   const session = createStreamableSession();
 
   try {
-    const response = await session.transport.handleRequest(request);
+    const response = await withMcpHttpAuthContext(request, () =>
+      handleRequestWithAuthInfo(session.transport, request)
+    );
     return withSessionHeader(response, session.sessionId);
   } catch (err) {
     closeStreamableSession(session.sessionId);
@@ -195,7 +393,12 @@ async function handleStreamableRequest(request: Request): Promise<Response> {
  * Used by the Next.js route at /api/mcp/stream.
  */
 export async function handleMcpStreamableHTTP(request: Request): Promise<Response> {
-  return handleStreamableRequest(request);
+  return protectMcpSseResponse(request, await handleStreamableRequest(request));
+}
+
+interface RpcRequest {
+  method?: string;
+  [key: string]: unknown;
 }
 
 /**
@@ -204,10 +407,26 @@ export async function handleMcpStreamableHTTP(request: Request): Promise<Respons
  * and POST for messages (the Streamable HTTP transport supports both patterns).
  */
 export async function handleMcpSSE(request: Request): Promise<Response> {
+  if (request.method === "POST") {
+    try {
+      const body = await request.clone().json();
+      const isInitialize = Array.isArray(body)
+        ? body.some((req: RpcRequest) => req?.method === "initialize")
+        : (body as RpcRequest)?.method === "initialize";
+
+      if (isInitialize) {
+        console.log("[MCP] New client initialize detected, resetting SSE singleton...");
+        closeSseTransport();
+      }
+    } catch (err) {}
+  }
   const { transport } = ensureSseServer();
 
   try {
-    return await transport.handleRequest(request);
+    const response = await withMcpHttpAuthContext(request, () =>
+      handleRequestWithAuthInfo(transport, request)
+    );
+    return protectMcpSseResponse(request, response);
   } catch (err) {
     console.error("[MCP] SSE error:", err);
     return new Response(JSON.stringify({ error: "MCP SSE transport error" }), {
@@ -222,11 +441,13 @@ export function getMcpHttpStatus(): {
   transport: string | null;
   startedAt: number | null;
   uptime: string | null;
+  sessionCount: number;
+  oldestSessionAt: number | null;
+  newestSessionAt: number | null;
 } {
-  const streamableStartedAt =
-    _streamableSessions.size > 0
-      ? Math.min(...Array.from(_streamableSessions.values(), (session) => session.startedAt))
-      : null;
+  const startedAts = Array.from(_streamableSessions.values(), (session) => session.startedAt);
+  const streamableStartedAt = startedAts.length > 0 ? Math.min(...startedAts) : null;
+  const newestSessionAt = startedAts.length > 0 ? Math.max(...startedAts) : null;
   const startedAt = streamableStartedAt ?? _sseStartedAt;
   const transport = _streamableSessions.size > 0 ? "streamable-http" : _sseTransport ? "sse" : null;
   const online = transport !== null;
@@ -236,7 +457,17 @@ export function getMcpHttpStatus(): {
     transport,
     startedAt,
     uptime: startedAt ? `${Math.floor((Date.now() - startedAt) / 1000)}s` : null,
+    sessionCount: _streamableSessions.size,
+    oldestSessionAt: streamableStartedAt,
+    newestSessionAt,
   };
+}
+
+export function isMcpHttpTransportReady(
+  enabled: boolean,
+  transport: string | null | undefined
+): boolean {
+  return enabled && (transport === "sse" || transport === "streamable-http");
 }
 
 export function shutdownMcpHttp(): void {

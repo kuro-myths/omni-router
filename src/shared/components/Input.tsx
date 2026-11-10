@@ -1,97 +1,167 @@
 "use client";
 
-import { useId } from "react";
+import { forwardRef, useCallback, useId, useState } from "react";
+import { useTranslations } from "next-intl";
+import { Field } from "@omniroute/ui-kit/field";
+import { Input as KitInput, type InputSize } from "@omniroute/ui-kit/input";
 import { cn } from "@/shared/utils/cn";
+import Icon from "./Icon";
 
 interface InputProps extends Omit<React.InputHTMLAttributes<HTMLInputElement>, "size"> {
   label?: React.ReactNode;
   error?: React.ReactNode;
   hint?: React.ReactNode;
+  /** ICON_MAP name, rendered as a leading icon via <Icon>. */
   icon?: string;
+  /** ICON_MAP name, rendered as a trailing icon via <Icon>. Decorative (aria-hidden). */
+  trailingIcon?: string;
+  /** Decorative trailing content (a unit such as "ms" or "%"); wins over `trailingIcon`. */
+  suffix?: React.ReactNode;
+  /** Kit control height: `default` or the compact `sm`. */
+  size?: InputSize;
   inputClassName?: string;
 }
 
-export default function Input({
-  label,
-  type = "text",
-  placeholder,
-  value,
-  onChange,
-  error,
-  hint,
-  icon,
-  disabled = false,
-  required = false,
-  className,
-  inputClassName,
-  id: externalId,
-  ...props
-}: InputProps) {
+// Kit trailing slot: a decorative suffix wins over a trailing icon name.
+function trailingSlot(suffix: React.ReactNode, trailingIcon?: string): React.ReactNode {
+  if (suffix != null && suffix !== "") return suffix;
+  return trailingIcon ? <Icon name={trailingIcon} size={16} /> : undefined;
+}
+
+const Input = forwardRef<HTMLInputElement, InputProps>(function Input(
+  {
+    label,
+    type = "text",
+    placeholder,
+    value,
+    onChange,
+    error,
+    hint,
+    icon,
+    trailingIcon,
+    suffix,
+    size = "default",
+    disabled = false,
+    required = false,
+    className,
+    inputClassName,
+    id: externalId,
+    onKeyDown: externalOnKeyDown,
+    onKeyUp: externalOnKeyUp,
+    onFocus,
+    onBlur,
+    ...props
+  },
+  ref
+) {
+  const t = useTranslations("common");
   const generatedId = useId();
   const inputId = externalId || generatedId;
   const errorId = error ? `${inputId}-error` : undefined;
   const hintId = hint && !error ? `${inputId}-hint` : undefined;
-  const describedBy = [errorId, hintId].filter(Boolean).join(" ") || undefined;
+  const capsLockId = `${inputId}-capslock`;
+  const isPassword = type === "password";
+  const [capsLockOn, setCapsLockOn] = useState(false);
+  const [inputFocused, setInputFocused] = useState(false);
+
+  const detectCapsLock = useCallback(
+    (e: React.KeyboardEvent<HTMLInputElement>) => {
+      if (isPassword) {
+        setCapsLockOn(e.getModifierState("CapsLock"));
+      }
+    },
+    [isPassword]
+  );
+
+  const handleKeyDown = useCallback(
+    (e: React.KeyboardEvent<HTMLInputElement>) => {
+      detectCapsLock(e);
+      externalOnKeyDown?.(e);
+    },
+    [detectCapsLock, externalOnKeyDown]
+  );
+
+  const handleKeyUp = useCallback(
+    (e: React.KeyboardEvent<HTMLInputElement>) => {
+      detectCapsLock(e);
+      externalOnKeyUp?.(e);
+    },
+    [detectCapsLock, externalOnKeyUp]
+  );
+
+  const showCapsLock = isPassword && capsLockOn && inputFocused;
+  const describedBy =
+    [errorId, showCapsLock ? capsLockId : undefined, hintId].filter(Boolean).join(" ") || undefined;
+
+  const control = (
+    <KitInput
+      ref={ref}
+      id={inputId}
+      type={type}
+      placeholder={placeholder}
+      value={value}
+      onChange={onChange}
+      disabled={disabled}
+      required={required}
+      error={Boolean(error)}
+      aria-invalid={error ? true : undefined}
+      aria-describedby={describedBy}
+      size={size}
+      leadingIcon={icon ? <Icon name={icon} size={16} /> : undefined}
+      trailingIcon={trailingSlot(suffix, trailingIcon)}
+      className={inputClassName}
+      onKeyDown={handleKeyDown}
+      onKeyUp={handleKeyUp}
+      onFocus={(e) => {
+        setInputFocused(true);
+        onFocus?.(e);
+      }}
+      onBlur={(e) => {
+        setInputFocused(false);
+        setCapsLockOn(false);
+        onBlur?.(e);
+      }}
+      {...props}
+    />
+  );
+
+  // The kit Field's asterisk is plain text inside the <label>, so it would become part of the
+  // input's accessible name ("Email*"). Render the same `.ci-field__required` marker ourselves,
+  // aria-hidden like the legacy one; the native `required` attribute carries the semantics.
+  const fieldLabel =
+    label != null && label !== "" ? (
+      <>
+        {label}
+        {required && (
+          <span className="ci-field__required" aria-hidden="true">
+            *
+          </span>
+        )}
+      </>
+    ) : undefined;
 
   return (
-    <div className={cn("flex flex-col gap-1.5", className)}>
-      {label && (
-        <label htmlFor={inputId} className="text-sm font-medium text-text-main">
-          {label}
-          {required && (
-            <span className="text-red-500 ml-1" aria-hidden="true">
-              *
-            </span>
-          )}
-        </label>
-      )}
-      <div className="relative">
-        {icon && (
-          <div className="absolute inset-y-0 left-0 flex items-center pl-3 pointer-events-none text-text-muted">
-            <span className="material-symbols-outlined text-[20px]" aria-hidden="true">
-              {icon}
-            </span>
-          </div>
-        )}
-        <input
-          id={inputId}
-          type={type}
-          placeholder={placeholder}
-          value={value}
-          onChange={onChange}
-          disabled={disabled}
-          required={required}
-          aria-required={required || undefined}
-          aria-invalid={error ? true : undefined}
-          aria-describedby={describedBy}
-          className={cn(
-            "w-full py-2 px-3 text-sm text-text-main",
-            "bg-white dark:bg-white/5 border border-black/10 dark:border-white/10 rounded-md",
-            "placeholder-text-muted/60",
-            "focus:ring-1 focus:ring-primary/30 focus:border-primary/50 focus:outline-none",
-            "transition-all shadow-inner disabled:opacity-50 disabled:cursor-not-allowed",
-            // iOS zoom fix
-            "text-[16px] sm:text-sm",
-            icon && "pl-10",
-            error ? "border-red-500 focus:border-red-500 focus:ring-red-500/20" : "",
-            inputClassName
-          )}
-          {...props}
-        />
-      </div>
-      {error && (
-        <p id={errorId} className="text-xs text-red-500 flex items-center gap-1" role="alert">
-          <span className="material-symbols-outlined text-[14px]" aria-hidden="true">
-            error
+    <Field
+      htmlFor={inputId}
+      label={fieldLabel}
+      hint={hint && !error ? <span id={hintId}>{hint}</span> : undefined}
+      error={
+        error ? (
+          <span id={errorId} role="alert">
+            {error}
           </span>
-          {error}
-        </p>
+        ) : undefined
+      }
+      className={cn("gap-1.5", className)}
+    >
+      {control}
+      {showCapsLock && (
+        <span id={capsLockId} role="status" className="text-xs text-warning">
+          {t("capsLockOn")}
+        </span>
       )}
-      {hint && !error && (
-        <p id={hintId} className="text-xs text-text-muted">
-          {hint}
-        </p>
-      )}
-    </div>
+    </Field>
   );
-}
+});
+
+export default Input;

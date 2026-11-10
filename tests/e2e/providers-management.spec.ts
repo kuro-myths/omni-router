@@ -1,4 +1,5 @@
 import { expect, test, type Page } from "@playwright/test";
+import { gotoDashboardRoute } from "./helpers/dashboardAuth";
 
 const NAVIGATION_TIMEOUT_MS = 300_000;
 
@@ -27,6 +28,7 @@ async function installProviderFetchMock(page: Page) {
       retestCalls: 0,
       deleteCalls: 0,
       validationCalls: 0,
+      syncCalls: 0,
       forceInvalidValidation: false,
     };
 
@@ -103,6 +105,12 @@ async function installProviderFetchMock(page: Page) {
         state.validationCalls += 1;
         const valid = !state.forceInvalidValidation;
         return jsonResponse({ valid }, valid ? 200 : 400);
+      }
+
+      // Count (and stub) sync-models: with auto-fetch off (#11798) saving must not call it.
+      if (path.match(/^\/api\/providers\/[^/]+\/sync-models$/) && method === "POST") {
+        state.syncCalls += 1;
+        return jsonResponse({ syncedModels: 0, models: [], availableModelsCount: 0 });
       }
 
       const testMatch = path.match(/^\/api\/providers\/([^/]+)\/test$/);
@@ -223,34 +231,12 @@ async function readProviderMockState(page: Page) {
             retestCalls: number;
             deleteCalls: number;
             validationCalls: number;
+            syncCalls: number;
             forceInvalidValidation: boolean;
           };
         }
       ).__providersTestState
   );
-}
-
-async function gotoOrSkip(page: Page, url: string) {
-  let lastError: unknown;
-  for (let attempt = 0; attempt < 2; attempt += 1) {
-    try {
-      await page.goto(url, { waitUntil: "commit", timeout: NAVIGATION_TIMEOUT_MS });
-    } catch (error) {
-      lastError = error;
-    }
-    try {
-      await page.waitForURL(/\/(login|dashboard)(\/.*)?$/, { timeout: NAVIGATION_TIMEOUT_MS });
-      await page.locator("body").waitFor({ state: "visible", timeout: NAVIGATION_TIMEOUT_MS });
-      lastError = null;
-      break;
-    } catch (error) {
-      lastError = error;
-    }
-    await page.waitForTimeout(1000);
-  }
-  if (lastError) throw lastError;
-  const redirectedToLogin = page.url().includes("/login");
-  test.skip(redirectedToLogin, "Authentication enabled without a login fixture.");
 }
 
 test.describe("Providers management", () => {
@@ -261,7 +247,9 @@ test.describe("Providers management", () => {
   }) => {
     await installProviderFetchMock(page);
 
-    await gotoOrSkip(page, "/dashboard/providers");
+    await gotoDashboardRoute(page, "/dashboard/providers", {
+      timeoutMs: NAVIGATION_TIMEOUT_MS,
+    });
 
     const openAiCard = page.locator('a[href="/dashboard/providers/openai"]').first();
     await expect(openAiCard).toBeVisible();
@@ -281,6 +269,12 @@ test.describe("Providers management", () => {
       .toBeGreaterThan(0);
     await expect(page.getByText("Primary OpenAI")).toBeVisible();
     await expect.poll(async () => (await readProviderMockState(page)).connections.length).toBe(1);
+
+    // PR #11798: model auto-fetch is opt-in (`providerSpecificData.autoFetchModels`,
+    // default off). The add form does not opt in, so saving must NOT open the
+    // model-import modal nor call /sync-models — the add dialog just closes.
+    await expect(page.getByRole("dialog")).toHaveCount(0);
+    expect((await readProviderMockState(page)).syncCalls).toBe(0);
 
     await page.getByTitle(/^edit$/i).click();
     const editDialog = page.getByRole("dialog");
@@ -318,10 +312,14 @@ test.describe("Providers management", () => {
       ).__providersTestState.forceInvalidValidation = false;
     });
 
-    page.once("dialog", async (dialog) => {
-      await dialog.accept();
-    });
+    // #7361 replaced the native window.confirm() with a ConfirmModal, so the old
+    // page.once("dialog") handler never fires and the delete request was never sent.
     await page.getByTitle(/^delete$/i).click();
+    const confirmDialog = page
+      .getByRole("alertdialog")
+      .filter({ hasText: /delete this connection/i });
+    await expect(confirmDialog).toBeVisible({ timeout: 10000 });
+    await confirmDialog.getByRole("button", { name: /^delete$/i }).click();
 
     await expect.poll(async () => (await readProviderMockState(page)).deleteCalls).toBe(1);
     await expect(page.getByText("Primary OpenAI Edited")).toHaveCount(0);

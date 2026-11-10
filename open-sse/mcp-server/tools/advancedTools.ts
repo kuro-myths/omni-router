@@ -1,5 +1,5 @@
 /**
- * OmniRoute MCP Advanced Tools — 10 intelligence tools that differentiate
+ * OmniRoute MCP Advanced Tools — 13 intelligence tools that differentiate
  * OmniRoute from all other AI gateways.
  *
  * Tools:
@@ -12,30 +12,29 @@
  *   7. omniroute_best_combo_for_task — AI-powered combo recommendation
  *   8. omniroute_explain_route      — Post-hoc routing decision explainer
  *   9. omniroute_get_session_snapshot — Full session state snapshot
- *  10. omniroute_sync_pricing      — Sync provider pricing from external source
+ *  10. omniroute_db_health_check   — Diagnose and repair DB state drift
+ *  11. omniroute_sync_pricing      — Sync provider pricing from external source
  */
 
 import { logToolCall } from "../audit.ts";
+import { readAnalyticsTotals, readProviderMetrics } from "../analyticsShape.ts";
+import { toSafeMcpErrorMessage } from "../errorMessage.ts";
+// #15159 M-06: the hop lives in one place now. The private copy this replaced read
+// OMNIROUTE_API_KEY and the base URL at module load, so a key configured after import was
+// silently dropped; it also hardcoded a 30s timeout that ignored OMNIROUTE_MCP_FETCH_TIMEOUT_MS.
+import { omniRouteFetch as apiFetch } from "../internalFetch.ts";
+import { mcpFetchTimeoutSignal } from "../fetchTimeout.ts";
 import { normalizeQuotaResponse } from "../../../src/shared/contracts/quota.ts";
-import { resolveOmniRouteBaseUrl } from "../../../src/shared/utils/resolveOmniRouteBaseUrl.ts";
-
-const OMNIROUTE_BASE_URL = resolveOmniRouteBaseUrl();
-const OMNIROUTE_API_KEY = process.env.OMNIROUTE_API_KEY || "";
-
-async function apiFetch(path: string, options: RequestInit = {}): Promise<unknown> {
-  const url = `${OMNIROUTE_BASE_URL}${path}`;
-  const headers: Record<string, string> = {
-    "Content-Type": "application/json",
-    ...(OMNIROUTE_API_KEY ? { Authorization: `Bearer ${OMNIROUTE_API_KEY}` } : {}),
-    ...((options.headers as Record<string, string>) || {}),
-  };
-  const response = await fetch(url, { ...options, headers, signal: AbortSignal.timeout(30000) });
-  if (!response.ok) {
-    const text = await response.text().catch(() => "Unknown error");
-    throw new Error(`API [${response.status}]: ${text}`);
-  }
-  return response.json();
-}
+import {
+  getComboModelProvider,
+  getComboModelString,
+  getComboStepTarget,
+} from "../../../src/lib/combos/steps.ts";
+import type {
+  AutoRoutingStrategyValue,
+  RoutingStrategyValue,
+} from "../../../src/shared/constants/routingStrategies.ts";
+import { normalizeRoutingStrategy } from "../../../src/shared/constants/routingStrategies.ts";
 
 type JsonRecord = Record<string, unknown>;
 
@@ -80,8 +79,8 @@ function getComboModels(combo: JsonRecord): ComboModel[] {
   const nestedModels = toArrayOfRecords(toRecord(combo.data).models);
   const sourceModels = directModels.length > 0 ? directModels : nestedModels;
   return sourceModels.map((model) => ({
-    provider: toString(model.provider, "unknown"),
-    model: toString(model.model, ""),
+    provider: getComboModelProvider(model) || (getComboModelString(model) ? "unknown" : "combo"),
+    model: getComboModelString(model) || getComboStepTarget(model) || "",
     inputCostPer1M: toNumber(model.inputCostPer1M, 3.0),
   }));
 }
@@ -106,97 +105,121 @@ interface BudgetGuardState {
 let activeBudgetGuard: BudgetGuardState | null = null;
 
 type ResilienceProfileConfig = {
-  profiles: {
+  requestQueue: {
+    requestsPerMinute: number;
+    minTimeBetweenRequestsMs: number;
+    concurrentRequests: number;
+  };
+  connectionCooldown: {
     oauth: {
-      transientCooldown: number;
-      rateLimitCooldown: number;
-      maxBackoffLevel: number;
-      circuitBreakerThreshold: number;
-      circuitBreakerReset: number;
+      baseCooldownMs: number;
+      useUpstreamRetryHints: boolean;
+      maxBackoffSteps: number;
     };
     apikey: {
-      transientCooldown: number;
-      rateLimitCooldown: number;
-      maxBackoffLevel: number;
-      circuitBreakerThreshold: number;
-      circuitBreakerReset: number;
+      baseCooldownMs: number;
+      useUpstreamRetryHints: boolean;
+      maxBackoffSteps: number;
     };
   };
-  defaults: {
-    requestsPerMinute: number;
-    minTimeBetweenRequests: number;
-    concurrentRequests: number;
+  providerBreaker: {
+    oauth: {
+      failureThreshold: number;
+      resetTimeoutMs: number;
+    };
+    apikey: {
+      failureThreshold: number;
+      resetTimeoutMs: number;
+    };
   };
 };
 
 const RESILIENCE_PROFILES = {
   aggressive: {
-    profiles: {
+    requestQueue: {
+      requestsPerMinute: 180,
+      minTimeBetweenRequestsMs: 100,
+      concurrentRequests: 16,
+    },
+    connectionCooldown: {
       oauth: {
-        transientCooldown: 3000,
-        rateLimitCooldown: 30000,
-        maxBackoffLevel: 4,
-        circuitBreakerThreshold: 2,
-        circuitBreakerReset: 30000,
+        baseCooldownMs: 30000,
+        useUpstreamRetryHints: false,
+        maxBackoffSteps: 4,
       },
       apikey: {
-        transientCooldown: 2000,
-        rateLimitCooldown: 0,
-        maxBackoffLevel: 3,
-        circuitBreakerThreshold: 3,
-        circuitBreakerReset: 15000,
+        baseCooldownMs: 2000,
+        useUpstreamRetryHints: true,
+        maxBackoffSteps: 3,
       },
     },
-    defaults: {
-      requestsPerMinute: 180,
-      minTimeBetweenRequests: 100,
-      concurrentRequests: 16,
+    providerBreaker: {
+      oauth: {
+        failureThreshold: 2,
+        resetTimeoutMs: 30000,
+      },
+      apikey: {
+        failureThreshold: 3,
+        resetTimeoutMs: 15000,
+      },
     },
   },
   balanced: {
-    profiles: {
+    requestQueue: {
+      requestsPerMinute: 100,
+      minTimeBetweenRequestsMs: 200,
+      concurrentRequests: 10,
+    },
+    connectionCooldown: {
       oauth: {
-        transientCooldown: 5000,
-        rateLimitCooldown: 60000,
-        maxBackoffLevel: 8,
-        circuitBreakerThreshold: 3,
-        circuitBreakerReset: 60000,
+        baseCooldownMs: 60000,
+        useUpstreamRetryHints: false,
+        maxBackoffSteps: 8,
       },
       apikey: {
-        transientCooldown: 3000,
-        rateLimitCooldown: 0,
-        maxBackoffLevel: 5,
-        circuitBreakerThreshold: 5,
-        circuitBreakerReset: 30000,
+        baseCooldownMs: 3000,
+        useUpstreamRetryHints: true,
+        maxBackoffSteps: 5,
       },
     },
-    defaults: {
-      requestsPerMinute: 100,
-      minTimeBetweenRequests: 200,
-      concurrentRequests: 10,
+    providerBreaker: {
+      oauth: {
+        failureThreshold: 3,
+        resetTimeoutMs: 60000,
+      },
+      apikey: {
+        failureThreshold: 5,
+        resetTimeoutMs: 30000,
+      },
     },
   },
   conservative: {
-    profiles: {
+    requestQueue: {
+      requestsPerMinute: 60,
+      minTimeBetweenRequestsMs: 350,
+      concurrentRequests: 6,
+    },
+    connectionCooldown: {
       oauth: {
-        transientCooldown: 8000,
-        rateLimitCooldown: 120000,
-        maxBackoffLevel: 10,
-        circuitBreakerThreshold: 8,
-        circuitBreakerReset: 120000,
+        baseCooldownMs: 120000,
+        useUpstreamRetryHints: false,
+        maxBackoffSteps: 10,
       },
       apikey: {
-        transientCooldown: 5000,
-        rateLimitCooldown: 30000,
-        maxBackoffLevel: 8,
-        circuitBreakerThreshold: 8,
-        circuitBreakerReset: 60000,
+        baseCooldownMs: 30000,
+        useUpstreamRetryHints: false,
+        maxBackoffSteps: 8,
       },
     },
-    defaults: {
-      requestsPerMinute: 60,
-      minTimeBetweenRequests: 350,
-      concurrentRequests: 6,
+    providerBreaker: {
+      oauth: {
+        failureThreshold: 8,
+        resetTimeoutMs: 120000,
+      },
+      apikey: {
+        failureThreshold: 8,
+        resetTimeoutMs: 60000,
+      },
     },
   },
 } satisfies Record<"aggressive" | "balanced" | "conservative", ResilienceProfileConfig>;
@@ -282,7 +305,7 @@ export async function handleSimulateRoute(args: {
     await logToolCall("omniroute_simulate_route", args, result, Date.now() - start, true);
     return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
   } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
+    const msg = toSafeMcpErrorMessage(err);
     await logToolCall("omniroute_simulate_route", args, null, Date.now() - start, false, msg);
     return { content: [{ type: "text" as const, text: `Error: ${msg}` }], isError: true };
   }
@@ -298,8 +321,8 @@ export async function handleSetBudgetGuard(args: {
     // Get current session cost
     let spent = 0;
     try {
-      const analytics = toRecord(await apiFetch("/api/usage/analytics?period=session"));
-      spent = toNumber(analytics.totalCost, 0);
+      const analytics = toRecord(await apiFetch("/api/usage/analytics?range=1d"));
+      spent = readAnalyticsTotals(analytics).totalCost;
     } catch {
       /* ignore if analytics not available */
     }
@@ -332,7 +355,7 @@ export async function handleSetBudgetGuard(args: {
     );
     return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
   } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
+    const msg = toSafeMcpErrorMessage(err);
     await logToolCall("omniroute_set_budget_guard", args, null, Date.now() - start, false, msg);
     return { content: [{ type: "text" as const, text: `Error: ${msg}` }], isError: true };
   }
@@ -340,17 +363,8 @@ export async function handleSetBudgetGuard(args: {
 
 export async function handleSetRoutingStrategy(args: {
   comboId: string;
-  strategy:
-    | "priority"
-    | "weighted"
-    | "round-robin"
-    | "context-relay"
-    | "strict-random"
-    | "random"
-    | "least-used"
-    | "cost-optimized"
-    | "auto";
-  autoRoutingStrategy?: "rules" | "cost" | "eco" | "latency" | "fast";
+  strategy: RoutingStrategyValue;
+  autoRoutingStrategy?: AutoRoutingStrategyValue;
 }) {
   const start = Date.now();
   try {
@@ -392,19 +406,20 @@ export async function handleSetRoutingStrategy(args: {
       Object.keys(toRecord(combo.config)).length > 0 ? combo.config : comboData.config
     );
 
+    const normalizedStrategy = normalizeRoutingStrategy(args.strategy);
     let nextConfig: JsonRecord | undefined = undefined;
-    if (args.strategy === "auto" && args.autoRoutingStrategy) {
+    if (normalizedStrategy === "auto" && args.autoRoutingStrategy) {
       const currentAutoConfig = toRecord(currentConfig.auto);
       nextConfig = {
         ...currentConfig,
         auto: {
           ...currentAutoConfig,
-          routingStrategy: args.autoRoutingStrategy,
+          routerStrategy: args.autoRoutingStrategy,
         },
       };
     }
 
-    const payload: JsonRecord = { strategy: args.strategy };
+    const payload: JsonRecord = { strategy: normalizedStrategy };
     if (nextConfig && Object.keys(nextConfig).length > 0) {
       payload.config = nextConfig;
     }
@@ -418,24 +433,26 @@ export async function handleSetRoutingStrategy(args: {
 
     const updatedConfig = toRecord(updatedCombo.config);
     const resolvedAutoStrategy =
-      toString(toRecord(updatedConfig.auto).routingStrategy) ||
-      (args.strategy === "auto" ? (args.autoRoutingStrategy ?? "rules") : "");
+      toString(toRecord(updatedConfig.auto).routerStrategy) ||
+      (normalizedStrategy === "auto" ? (args.autoRoutingStrategy ?? "rules") : "");
 
     const result = {
       success: true,
       combo: {
         id: toString(updatedCombo.id, comboId),
         name: toString(updatedCombo.name, toString(combo.name, comboId)),
-        strategy: toString(updatedCombo.strategy, args.strategy),
+        strategy: toString(updatedCombo.strategy, normalizedStrategy),
         autoRoutingStrategy:
-          toString(updatedCombo.strategy, args.strategy) === "auto" ? resolvedAutoStrategy : null,
+          toString(updatedCombo.strategy, normalizedStrategy) === "auto"
+            ? resolvedAutoStrategy
+            : null,
       },
     };
 
     await logToolCall("omniroute_set_routing_strategy", args, result, Date.now() - start, true);
     return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
   } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
+    const msg = toSafeMcpErrorMessage(err);
     await logToolCall("omniroute_set_routing_strategy", args, null, Date.now() - start, false, msg);
     return { content: [{ type: "text" as const, text: `Error: ${msg}` }], isError: true };
   }
@@ -454,13 +471,10 @@ export async function handleSetResilienceProfile(args: {
       };
     }
 
-    // Apply to OmniRoute via API (contract: PATCH + { profiles, defaults })
+    // Apply to OmniRoute via API using the plan-aligned resilience structure.
     await apiFetch("/api/resilience", {
       method: "PATCH",
-      body: JSON.stringify({
-        profiles: settings.profiles,
-        defaults: settings.defaults,
-      }),
+      body: JSON.stringify(settings),
     });
 
     const result = { applied: true, profile: args.profile, settings };
@@ -468,7 +482,7 @@ export async function handleSetResilienceProfile(args: {
     await logToolCall("omniroute_set_resilience_profile", args, result, Date.now() - start, true);
     return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
   } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
+    const msg = toSafeMcpErrorMessage(err);
     await logToolCall(
       "omniroute_set_resilience_profile",
       args,
@@ -518,8 +532,14 @@ export async function handleTestCombo(args: { comboId: string; testPrompt: strin
                 messages: [{ role: "user", content: prompt }],
                 max_tokens: 50,
                 stream: false,
-                "x-provider": model.provider,
               }),
+              // #15159 M-06 + #9717: this is the one hop in this module that waits on an
+              // upstream provider — every provider in the combo is probed in parallel, so a
+              // cold or slow one easily outlives the management-read budget. The module's
+              // deleted private copy hardcoded 30s; inheriting the shared hop would have
+              // silently dropped it to MCP_FETCH_TIMEOUT_MS (10s) and aborted live probes,
+              // which is exactly the failure #9717 was filed for on `route_request`.
+              signal: mcpFetchTimeoutSignal("upstream"),
             })
           );
           const usage = toRecord(resp.usage);
@@ -540,7 +560,7 @@ export async function handleTestCombo(args: { comboId: string; testPrompt: strin
             latencyMs: Date.now() - providerStart,
             cost: 0,
             tokenCount: 0,
-            error: err instanceof Error ? err.message : String(err),
+            error: toSafeMcpErrorMessage(err),
           };
         }
       })
@@ -582,7 +602,7 @@ export async function handleTestCombo(args: { comboId: string; testPrompt: strin
     );
     return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
   } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
+    const msg = toSafeMcpErrorMessage(err);
     await logToolCall("omniroute_test_combo", args, null, Date.now() - start, false, msg);
     return { content: [{ type: "text" as const, text: `Error: ${msg}` }], isError: true };
   }
@@ -594,7 +614,7 @@ export async function handleGetProviderMetrics(args: { provider: string }) {
     const [healthRaw, quotaRaw, analyticsRaw] = await Promise.allSettled([
       apiFetch("/api/monitoring/health"),
       apiFetch(`/api/usage/quota?provider=${encodeURIComponent(args.provider)}`),
-      apiFetch(`/api/usage/analytics?period=session&provider=${encodeURIComponent(args.provider)}`),
+      apiFetch(`/api/usage/analytics?range=1d&provider=${encodeURIComponent(args.provider)}`),
     ]);
 
     const health = healthRaw.status === "fulfilled" ? toRecord(healthRaw.value) : {};
@@ -609,11 +629,13 @@ export async function handleGetProviderMetrics(args: { provider: string }) {
     );
     const providerQuota = quota.providers.find((p) => p.provider === args.provider) || null;
 
+    const providerMetrics = readProviderMetrics(analytics, args.provider);
+
     const result = {
       provider: args.provider,
-      successRate: toNumber(analytics.successRate, 1.0),
-      requestCount: toNumber(analytics.requestCount, 0),
-      avgLatencyMs: toNumber(analytics.avgLatencyMs, 0),
+      successRate: providerMetrics.successRate,
+      requestCount: providerMetrics.requestCount,
+      avgLatencyMs: providerMetrics.avgLatencyMs,
       p50LatencyMs: toNumber(analytics.p50LatencyMs, 0),
       p95LatencyMs: toNumber(analytics.p95LatencyMs, 0),
       p99LatencyMs: toNumber(analytics.p99LatencyMs, 0),
@@ -632,7 +654,7 @@ export async function handleGetProviderMetrics(args: { provider: string }) {
     await logToolCall("omniroute_get_provider_metrics", args, result, Date.now() - start, true);
     return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
   } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
+    const msg = toSafeMcpErrorMessage(err);
     await logToolCall("omniroute_get_provider_metrics", args, null, Date.now() - start, false, msg);
     return { content: [{ type: "text" as const, text: `Error: ${msg}` }], isError: true };
   }
@@ -715,7 +737,7 @@ export async function handleBestComboForTask(args: {
     );
     return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
   } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
+    const msg = toSafeMcpErrorMessage(err);
     await logToolCall("omniroute_best_combo_for_task", args, null, Date.now() - start, false, msg);
     return { content: [{ type: "text" as const, text: `Error: ${msg}` }], isError: true };
   }
@@ -778,7 +800,7 @@ export async function handleExplainRoute(args: { requestId: string }) {
     );
     return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
   } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
+    const msg = toSafeMcpErrorMessage(err);
     await logToolCall("omniroute_explain_route", args, null, Date.now() - start, false, msg);
     return { content: [{ type: "text" as const, text: `Error: ${msg}` }], isError: true };
   }
@@ -800,7 +822,7 @@ export async function handleSyncPricing(args: { sources?: string[]; dryRun?: boo
     await logToolCall("omniroute_sync_pricing", args, result, Date.now() - start, true);
     return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
   } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
+    const msg = toSafeMcpErrorMessage(err);
     await logToolCall("omniroute_sync_pricing", args, null, Date.now() - start, false, msg);
     return { content: [{ type: "text" as const, text: `Error: ${msg}` }], isError: true };
   }
@@ -809,21 +831,19 @@ export async function handleSyncPricing(args: { sources?: string[]; dryRun?: boo
 export async function handleGetSessionSnapshot() {
   const start = Date.now();
   try {
-    const analytics = toRecord(
-      await apiFetch("/api/usage/analytics?period=session").catch(() => ({}))
-    );
-    const tokenCount = toRecord(analytics.tokenCount);
+    const analytics = toRecord(await apiFetch("/api/usage/analytics?range=1d").catch(() => ({})));
+    const totals = readAnalyticsTotals(analytics);
     const byModel = toArrayOfRecords(analytics.byModel);
     const byProvider = toArrayOfRecords(analytics.byProvider);
 
     const result = {
       sessionStart: toString(analytics.sessionStart, new Date().toISOString()),
       duration: toString(analytics.duration, "unknown"),
-      requestCount: toNumber(analytics.requestCount, 0),
-      costTotal: toNumber(analytics.totalCost, 0),
+      requestCount: totals.requestCount,
+      costTotal: totals.totalCost,
       tokenCount: {
-        prompt: toNumber(tokenCount.prompt, 0),
-        completion: toNumber(tokenCount.completion, 0),
+        prompt: totals.promptTokens,
+        completion: totals.completionTokens,
       },
       topModels: byModel.slice(0, 5).map((model) => ({
         model: toString(model.model, "unknown"),
@@ -853,8 +873,237 @@ export async function handleGetSessionSnapshot() {
     );
     return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
   } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
+    const msg = toSafeMcpErrorMessage(err);
     await logToolCall("omniroute_get_session_snapshot", {}, null, Date.now() - start, false, msg);
+    return { content: [{ type: "text" as const, text: `Error: ${msg}` }], isError: true };
+  }
+}
+
+export async function handleDbHealthCheck(args: { autoRepair?: boolean }) {
+  const start = Date.now();
+  const autoRepair = args.autoRepair === true;
+
+  try {
+    const { runManagedDbHealthCheck } = await import("../../../src/lib/db/core.ts");
+    const result = await runManagedDbHealthCheck({ autoRepair });
+
+    await logToolCall(
+      "omniroute_db_health_check",
+      args,
+      {
+        isHealthy: toBoolean(result.isHealthy, false),
+        repairedCount: toNumber(result.repairedCount, 0),
+      },
+      Date.now() - start,
+      true
+    );
+
+    return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
+  } catch (err) {
+    const msg = toSafeMcpErrorMessage(err);
+    await logToolCall("omniroute_db_health_check", args, null, Date.now() - start, false, msg);
+    return { content: [{ type: "text" as const, text: `Error: ${msg}` }], isError: true };
+  }
+}
+
+export async function handleCacheStats() {
+  const start = Date.now();
+  try {
+    const raw = toRecord(await apiFetch("/api/cache"));
+    const semanticCache = toRecord(raw.semanticCache);
+    const promptCache = raw.promptCache ? toRecord(raw.promptCache) : null;
+    const idempotency = toRecord(raw.idempotency);
+    const config = raw.config ? toRecord(raw.config) : null;
+
+    const result = {
+      semanticCache: {
+        memoryEntries: toNumber(semanticCache.memoryEntries, 0),
+        dbEntries: toNumber(semanticCache.dbEntries, 0),
+        hits: toNumber(semanticCache.hits, 0),
+        misses: toNumber(semanticCache.misses, 0),
+        hitRate: toString(semanticCache.hitRate, "0%"),
+        tokensSaved: toNumber(semanticCache.tokensSaved, 0),
+      },
+      promptCache: promptCache
+        ? {
+            totalRequests: toNumber(promptCache.totalRequests, 0),
+            requestsWithCacheControl: toNumber(promptCache.requestsWithCacheControl, 0),
+            totalInputTokens: toNumber(promptCache.totalInputTokens, 0),
+            totalCachedTokens: toNumber(promptCache.totalCachedTokens, 0),
+            totalCacheCreationTokens: toNumber(promptCache.totalCacheCreationTokens, 0),
+            tokensSaved: toNumber(promptCache.tokensSaved, 0),
+            estimatedCostSaved: toNumber(promptCache.estimatedCostSaved, 0),
+          }
+        : null,
+      idempotency: {
+        activeKeys: toNumber(idempotency.activeKeys, 0),
+        windowMs: toNumber(idempotency.windowMs, 0),
+      },
+      config: config
+        ? {
+            semanticCacheEnabled: toBoolean(config.semanticCacheEnabled, true),
+          }
+        : undefined,
+    };
+
+    await logToolCall("omniroute_cache_stats", {}, result, Date.now() - start, true);
+    return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
+  } catch (err) {
+    const msg = toSafeMcpErrorMessage(err);
+    await logToolCall("omniroute_cache_stats", {}, null, Date.now() - start, false, msg);
+    return { content: [{ type: "text" as const, text: `Error: ${msg}` }], isError: true };
+  }
+}
+
+export async function handleCacheFlush(args: { signature?: string; model?: string }) {
+  const start = Date.now();
+  try {
+    const params = new URLSearchParams();
+    let scope = "all";
+
+    if (args.signature) {
+      params.set("signature", args.signature);
+      scope = "signature";
+    } else if (args.model) {
+      params.set("model", args.model);
+      scope = "model";
+    }
+
+    const query = params.toString();
+    const path = query ? `/api/cache?${query}` : "/api/cache";
+    const raw = toRecord(
+      await apiFetch(path, {
+        method: "DELETE",
+      })
+    );
+
+    const result = {
+      ok: toBoolean(raw.ok, true),
+      invalidated: toNumber(raw.invalidated ?? raw.cleared, 0),
+      scope,
+    };
+
+    await logToolCall("omniroute_cache_flush", args, result, Date.now() - start, true);
+    return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
+  } catch (err) {
+    const msg = toSafeMcpErrorMessage(err);
+    await logToolCall("omniroute_cache_flush", args, null, Date.now() - start, false, msg);
+    return { content: [{ type: "text" as const, text: `Error: ${msg}` }], isError: true };
+  }
+}
+
+// ============ 1proxy Tools ============
+
+export async function handleOneproxyFetch(
+  args: { protocol?: string; countryCode?: string; minQuality?: number; limit?: number } = {}
+) {
+  const start = Date.now();
+  try {
+    const params = new URLSearchParams();
+    if (args.protocol) params.set("protocol", args.protocol);
+    if (args.countryCode) params.set("countryCode", args.countryCode);
+    if (args.minQuality) params.set("minQuality", String(args.minQuality));
+    if (args.limit) params.set("limit", String(args.limit));
+
+    const query = params.toString();
+    const path = query ? `/api/settings/oneproxy?${query}` : "/api/settings/oneproxy";
+    const raw = toRecord(await apiFetch(path));
+
+    const items = toArrayOfRecords(raw.items).map((r) => ({
+      id: toString(r.id, ""),
+      host: toString(r.host, ""),
+      port: toNumber(r.port, 0),
+      type: toString(r.type, "http"),
+      countryCode: typeof r.country_code === "string" ? r.country_code : null,
+      qualityScore: r.quality_score != null ? toNumber(r.quality_score) : null,
+      latencyMs: r.latency_ms != null ? toNumber(r.latency_ms) : null,
+      anonymity: typeof r.anonymity === "string" ? r.anonymity : null,
+      googleAccess: r.google_access === 1 || r.google_access === true,
+      status: toString(r.status, "active"),
+    }));
+
+    const result = { items, total: toNumber(raw.total, items.length) };
+    await logToolCall("omniroute_oneproxy_fetch", args, result, Date.now() - start, true);
+    return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
+  } catch (err) {
+    const msg = toSafeMcpErrorMessage(err);
+    await logToolCall("omniroute_oneproxy_fetch", args, null, Date.now() - start, false, msg);
+    return { content: [{ type: "text" as const, text: `Error: ${msg}` }], isError: true };
+  }
+}
+
+export async function handleOneproxyRotate(
+  args: { strategy?: "random" | "quality" | "sequential" } = {}
+) {
+  const start = Date.now();
+  try {
+    const body: Record<string, unknown> = {};
+    if (args.strategy) body.strategy = args.strategy;
+
+    const raw = toRecord(
+      await apiFetch("/api/settings/oneproxy/rotate", {
+        method: "POST",
+        body: JSON.stringify(body),
+      })
+    );
+
+    const result = {
+      id: toString(raw.id, ""),
+      host: toString(raw.host, ""),
+      port: toNumber(raw.port, 0),
+      type: toString(raw.type, "http"),
+      countryCode: typeof raw.country_code === "string" ? raw.country_code : null,
+      qualityScore: raw.quality_score != null ? toNumber(raw.quality_score) : null,
+      latencyMs: raw.latency_ms != null ? toNumber(raw.latency_ms) : null,
+    };
+
+    await logToolCall("omniroute_oneproxy_rotate", args, result, Date.now() - start, true);
+    return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
+  } catch (err) {
+    const msg = toSafeMcpErrorMessage(err);
+    await logToolCall("omniroute_oneproxy_rotate", args, null, Date.now() - start, false, msg);
+    return { content: [{ type: "text" as const, text: `Error: ${msg}` }], isError: true };
+  }
+}
+
+export async function handleOneproxyStats(args: Record<string, never> = {}) {
+  const start = Date.now();
+  try {
+    const raw = toRecord(await apiFetch("/api/settings/oneproxy?action=stats"));
+
+    const statsRaw = toRecord(raw.stats);
+    const statusRaw = toRecord(raw.status);
+
+    const stats = {
+      total: toNumber(statsRaw.total, 0),
+      active: toNumber(statsRaw.active, 0),
+      avgQuality: statsRaw.avg_quality != null ? toNumber(statsRaw.avg_quality) : null,
+      lastValidated: typeof statsRaw.last_validated === "string" ? statsRaw.last_validated : null,
+      byProtocol: toArrayOfRecords(statsRaw.by_protocol || statsRaw.byProtocol).map((r) => ({
+        protocol: toString(r.protocol, ""),
+        count: toNumber(r.count, 0),
+      })),
+      byCountry: toArrayOfRecords(statsRaw.by_country || statsRaw.byCountry).map((r) => ({
+        countryCode: toString(r.countryCode || r.country_code, ""),
+        count: toNumber(r.count, 0),
+      })),
+    };
+
+    const status = {
+      lastSyncSuccess: toBoolean(statusRaw.last_sync_success, false),
+      lastSyncError:
+        typeof statusRaw.last_sync_error === "string" ? statusRaw.last_sync_error : null,
+      lastSyncAt: typeof statusRaw.last_sync_at === "string" ? statusRaw.last_sync_at : null,
+      lastSyncCount: toNumber(statusRaw.last_sync_count, 0),
+      consecutiveFailures: toNumber(statusRaw.consecutive_failures, 0),
+    };
+
+    const result = { stats, status };
+    await logToolCall("omniroute_oneproxy_stats", args, result, Date.now() - start, true);
+    return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
+  } catch (err) {
+    const msg = toSafeMcpErrorMessage(err);
+    await logToolCall("omniroute_oneproxy_stats", args, null, Date.now() - start, false, msg);
     return { content: [{ type: "text" as const, text: `Error: ${msg}` }], isError: true };
   }
 }

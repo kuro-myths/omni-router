@@ -3,6 +3,7 @@
 import { NextResponse } from "next/server";
 import fs from "fs/promises";
 import path from "path";
+import { requireCliToolsAuth } from "@/lib/api/requireCliToolsAuth";
 import {
   ensureCliConfigWriteAllowed,
   getCliPrimaryConfigPath,
@@ -12,22 +13,23 @@ import { createBackup } from "@/shared/services/backupService";
 import { saveCliToolLastConfigured, deleteCliToolLastConfigured } from "@/lib/db/cliToolState";
 import { cliModelConfigSchema } from "@/shared/validation/schemas";
 import { isValidationFailure, validateBody } from "@/shared/validation/helpers";
-import { getApiKeyById } from "@/lib/localDb";
+import { resolveApiKey } from "@/shared/services/apiKeyResolver";
+import { readJsoncConfig } from "../_lib/jsoncConfig";
+import { cliModelLabel } from "../_lib/modelLabel";
+import {
+  configClobberRefusalResponse,
+  parseJsoncObject,
+  readExistingConfig,
+} from "../_lib/readExistingConfig";
 
 const getOpenClawSettingsPath = () => getCliPrimaryConfigPath("openclaw");
 const getOpenClawDir = () => path.dirname(getOpenClawSettingsPath());
 
-// Read current settings.json
-const readSettings = async () => {
-  try {
-    const settingsPath = getOpenClawSettingsPath();
-    const content = await fs.readFile(settingsPath, "utf-8");
-    return JSON.parse(content);
-  } catch (error: any) {
-    if (error.code === "ENOENT") return null;
-    throw error;
-  }
-};
+// Read current settings.json.
+// Ported from upstream decolua/9router@6c10edf8: tolerate JSONC (trailing
+// commas) and return null on any parse error so the dashboard renders
+// "installed but not configured" instead of a 500 misread as "not installed".
+const readSettings = async () => readJsoncConfig(getOpenClawSettingsPath());
 
 // Check if settings has OmniRoute config
 const hasOmniRouteConfig = (settings: any) => {
@@ -36,7 +38,10 @@ const hasOmniRouteConfig = (settings: any) => {
 };
 
 // GET - Check openclaw CLI and read current settings
-export async function GET() {
+export async function GET(request: Request) {
+  const authError = await requireCliToolsAuth(request);
+  if (authError) return authError;
+
   try {
     const runtime = await getCliRuntimeStatus("openclaw");
 
@@ -77,6 +82,9 @@ export async function GET() {
 
 // POST - Update OmniRoute settings (merge with existing settings)
 export async function POST(request: Request) {
+  const authError = await requireCliToolsAuth(request);
+  if (authError) return authError;
+
   let rawBody;
   try {
     rawBody = await request.json();
@@ -98,22 +106,15 @@ export async function POST(request: Request) {
       return NextResponse.json({ error: writeGuard }, { status: 403 });
     }
 
+    // (#526) Extract keyId BEFORE validation — Zod strips unknown fields!
+    const keyId = typeof rawBody?.keyId === "string" ? rawBody.keyId.trim() : null;
+
     const validation = validateBody(cliModelConfigSchema, rawBody);
     if (isValidationFailure(validation)) {
       return NextResponse.json({ error: validation.error }, { status: 400 });
     }
-    let { baseUrl, apiKey, model } = validation.data;
-
-    // (#526) Resolve real key from DB if keyId was provided
-    const keyId = typeof rawBody?.keyId === "string" ? rawBody.keyId.trim() : null;
-    if (keyId) {
-      try {
-        const keyRecord = await getApiKeyById(keyId);
-        if (keyRecord?.key) apiKey = keyRecord.key as string;
-      } catch {
-        /* non-critical */
-      }
-    }
+    let { baseUrl, model } = validation.data;
+    let apiKey = await resolveApiKey(keyId, validation.data.apiKey);
 
     const openclawDir = getOpenClawDir();
     const settingsPath = getOpenClawSettingsPath();
@@ -124,14 +125,10 @@ export async function POST(request: Request) {
     // Backup current settings before modifying
     await createBackup("openclaw", settingsPath);
 
-    // Read existing settings or create new
-    let settings: Record<string, any> = {};
-    try {
-      const existingSettings = await fs.readFile(settingsPath, "utf-8");
-      settings = JSON.parse(existingSettings);
-    } catch {
-      /* No existing settings */
-    }
+    // Read existing settings or create new. Only a missing file starts fresh —
+    // an unreadable/unparsable one is refused (409) instead of being replaced.
+    const settings: Record<string, any> =
+      (await readExistingConfig(settingsPath, parseJsoncObject)) ?? {};
 
     // Ensure structure exists
     if (!settings.agents) settings.agents = {};
@@ -154,7 +151,7 @@ export async function POST(request: Request) {
       models: [
         {
           id: model,
-          name: model.split("/").pop() || model,
+          name: cliModelLabel(model),
         },
       ],
     };
@@ -175,13 +172,18 @@ export async function POST(request: Request) {
       settingsPath,
     });
   } catch (error) {
+    const refusal = configClobberRefusalResponse(error);
+    if (refusal) return refusal;
     console.log("Error updating openclaw settings:", error);
     return NextResponse.json({ error: "Failed to update openclaw settings" }, { status: 500 });
   }
 }
 
 // DELETE - Remove OmniRoute settings only (keep other settings)
-export async function DELETE() {
+export async function DELETE(request: Request) {
+  const authError = await requireCliToolsAuth(request);
+  if (authError) return authError;
+
   try {
     const writeGuard = ensureCliConfigWriteAllowed();
     if (writeGuard) {

@@ -5,178 +5,152 @@
  * Each provider has its own request format and endpoint.
  */
 
-export const IMAGE_PROVIDERS = {
-  openai: {
-    id: "openai",
-    baseUrl: "https://api.openai.com/v1/images/generations",
-    authType: "apikey",
-    authHeader: "bearer",
-    format: "openai", // native OpenAI format
-    models: [
-      { id: "gpt-image-1", name: "GPT Image 1" },
-      { id: "dall-e-3", name: "DALL-E 3" },
-      { id: "dall-e-2", name: "DALL-E 2" },
-    ],
-    supportedSizes: ["1024x1024", "1024x1792", "1792x1024", "256x256", "512x512"],
-  },
+import { resolveRegisteredFeatureFlag } from "@/shared/utils/featureFlagResolverBridge.ts";
+import { hasUnsafeModelIdSyntax } from "../utils/modelIdSafety.ts";
+import { getModelsByProviderId } from "./providerModels.ts";
+import {
+  type ImageModelEntry,
+  type ImageProviderConfig,
+  type ImageModelAliasEntry,
+  type ImageCatalogModelEntry,
+  XAI_IMAGE_CONFIG,
+  XAI_API_KEY_IMAGE_PROVIDER,
+  XAI_SUBSCRIPTION_IMAGE_PROVIDERS,
+  IMAGE_MODEL_ALIASES,
+  IMAGE_PROVIDERS,
+} from "./imageRegistryData.ts";
 
-  xai: {
-    id: "xai",
-    baseUrl: "https://api.x.ai/v1/images/generations",
-    authType: "apikey",
-    authHeader: "bearer",
-    format: "openai",
-    models: [{ id: "grok-2-image-1212", name: "Grok 2 Image" }],
-    supportedSizes: ["1024x1024"],
-  },
-
-  together: {
-    id: "together",
-    baseUrl: "https://api.together.xyz/v1/images/generations",
-    authType: "apikey",
-    authHeader: "bearer",
-    format: "openai",
-    models: [
-      { id: "black-forest-labs/FLUX.1.1-pro", name: "FLUX 1.1 Pro" },
-      { id: "black-forest-labs/FLUX.1-schnell-Free", name: "FLUX 1 Schnell (Free)" },
-      { id: "stabilityai/stable-diffusion-xl-base-1.0", name: "SDXL Base 1.0" },
-    ],
-    supportedSizes: ["1024x1024", "512x512"],
-  },
-
-  fireworks: {
-    id: "fireworks",
-    baseUrl: "https://api.fireworks.ai/inference/v1/images/generations",
-    authType: "apikey",
-    authHeader: "bearer",
-    format: "openai",
-    models: [
-      { id: "accounts/fireworks/models/flux-1-dev-fp8", name: "FLUX 1 Dev FP8" },
-      { id: "accounts/fireworks/models/stable-diffusion-xl-1024-v1-0", name: "SDXL 1024 v1.0" },
-    ],
-    supportedSizes: ["1024x1024", "512x512"],
-  },
-
-  antigravity: {
-    id: "antigravity",
-    baseUrl: "https://generativelanguage.googleapis.com/v1beta/models",
-    authType: "oauth",
-    authHeader: "bearer",
-    format: "gemini-image", // Special format: uses Gemini generateContent API
-    models: [],
-    supportedSizes: ["1024x1024"],
-  },
-
-  nebius: {
-    id: "nebius",
-    baseUrl: "https://api.tokenfactory.nebius.com/v1/images/generations",
-    fallbackUrl: "https://api.studio.nebius.com/v1/images/generations",
-    authType: "apikey",
-    authHeader: "bearer",
-    format: "openai",
-    models: [
-      { id: "black-forest-labs/flux-schnell", name: "FLUX.1 Schnell" },
-      { id: "black-forest-labs/flux-dev", name: "FLUX.1 Dev" },
-    ],
-    supportedSizes: ["1024x1024", "512x512"],
-  },
-
-  hyperbolic: {
-    id: "hyperbolic",
-    baseUrl: "https://api.hyperbolic.xyz/v1/image/generation",
-    authType: "apikey",
-    authHeader: "bearer",
-    format: "hyperbolic", // custom: uses model_name, returns base64 images
-    models: [
-      { id: "SDXL1.0-base", name: "SDXL 1.0 Base" },
-      { id: "SD2", name: "Stable Diffusion 2" },
-      { id: "FLUX.1-dev", name: "FLUX.1 Dev" },
-    ],
-    supportedSizes: ["1024x1024", "512x512"],
-  },
-
-  nanobanana: {
-    id: "nanobanana",
-    baseUrl: "https://api.nanobananaapi.ai/api/v1/nanobanana/generate",
-    proUrl: "https://api.nanobananaapi.ai/api/v1/nanobanana/generate-pro",
-    statusUrl: "https://api.nanobananaapi.ai/api/v1/nanobanana/record-info",
-    authType: "apikey",
-    authHeader: "bearer",
-    format: "nanobanana", // custom format (async: submit task, then poll)
-    models: [
-      { id: "nanobanana-flash", name: "NanoBanana Flash (Gemini 2.5 Flash)" },
-      { id: "nanobanana-pro", name: "NanoBanana Pro (Gemini 3 Pro)" },
-    ],
-    supportedSizes: ["1024x1024", "1024x1280", "1024x1536", "1536x1024", "1280x1024"],
-  },
-
-  sdwebui: {
-    id: "sdwebui",
-    baseUrl: "http://localhost:7860/sdapi/v1/txt2img",
-    authType: "none",
-    authHeader: "none",
-    format: "sdwebui",
-    models: [
-      { id: "stable-diffusion-v1-5", name: "Stable Diffusion v1.5" },
-      { id: "sdxl-base-1.0", name: "SDXL Base 1.0" },
-    ],
-    supportedSizes: ["512x512", "768x768", "1024x1024"],
-  },
-
-  comfyui: {
-    id: "comfyui",
-    baseUrl: "http://localhost:8188",
-    authType: "none",
-    authHeader: "none",
-    format: "comfyui",
-    models: [
-      { id: "flux-dev", name: "FLUX Dev" },
-      { id: "sdxl", name: "SDXL" },
-    ],
-    supportedSizes: ["512x512", "768x768", "1024x1024"],
-  },
-
-  openrouter: {
-    id: "openrouter",
-    baseUrl: "https://openrouter.ai/api/v1/images/generations",
-    authType: "apikey",
-    authHeader: "bearer",
-    format: "openai",
-    models: [
-      { id: "openai/dall-e-3", name: "DALL-E 3 (via OpenRouter)" },
-      { id: "openai/gpt-image-1", name: "GPT Image 1 (via OpenRouter)" },
-      { id: "google/imagen-3.0-generate-002", name: "Imagen 3 (via OpenRouter)" },
-      { id: "black-forest-labs/FLUX.1-schnell", name: "FLUX.1 Schnell (via OpenRouter)" },
-    ],
-    supportedSizes: ["1024x1024", "1024x1792", "1792x1024", "256x256", "512x512"],
-  },
+export {
+  type ImageModelEntry,
+  type ImageProviderConfig,
+  type ImageModelAliasEntry,
+  type ImageCatalogModelEntry,
+  XAI_IMAGE_CONFIG,
+  XAI_API_KEY_IMAGE_PROVIDER,
+  XAI_SUBSCRIPTION_IMAGE_PROVIDERS,
+  IMAGE_PROVIDERS,
 };
+
+export function isGrokSubscriptionImagesEnabled(): boolean {
+  try {
+    return resolveRegisteredFeatureFlag("GROK_SUBSCRIPTION_IMAGES_ENABLED");
+  } catch (error) {
+    console.error(
+      "[imageRegistry] Failed to resolve GROK_SUBSCRIPTION_IMAGES_ENABLED, defaulting to disabled:",
+      error instanceof Error ? error.message : error
+    );
+    const envValue = process.env.GROK_SUBSCRIPTION_IMAGES_ENABLED;
+    return envValue === "true" || envValue === "1" || envValue === "yes";
+  }
+}
+
+function visibleImageProviders(): Record<string, ImageProviderConfig> {
+  if (!isGrokSubscriptionImagesEnabled()) return IMAGE_PROVIDERS;
+  return { ...IMAGE_PROVIDERS, ...XAI_SUBSCRIPTION_IMAGE_PROVIDERS };
+}
+
+function resolveImageModelAlias(modelStr: string) {
+  const alias = IMAGE_MODEL_ALIASES[modelStr];
+  return alias ? { provider: alias.provider, model: alias.model } : null;
+}
+
+// A bare alias may only rewrite a provider-prefixed model when it stays on the
+// SAME provider (e.g. `antigravity/gemini-3.1-flash-image-preview` →
+// antigravity's callable `gemini-3.1-flash-image`). A cross-provider bare alias
+// must NOT override an explicit prefix — #9982 removed the unconditional bare
+// fallback because `fal-ai/flux-2-max` was being hijacked to black-forest-labs
+// by the bare `flux-2-max` alias.
+function resolveSameProviderBareAlias(providerId: string, model: string) {
+  const aliased = resolveImageModelAlias(model);
+  return aliased && aliased.provider === providerId ? aliased : null;
+}
+
+function findImageModelConfig(providerId: string, modelId: string): ImageModelEntry | null {
+  const provider = visibleImageProviders()[providerId];
+  if (!provider) return null;
+  return (
+    provider.models.find((model) => model.id === modelId || model.catalogId === modelId) || null
+  );
+}
+
+function resolveImageProviderModelId(providerId: string, modelId: string): string {
+  // Fal owns both the OmniRoute provider label and some native endpoint owners.
+  // Retained native registry IDs must survive removal of the outer selection prefix.
+  if (providerId === "fal-ai") {
+    const native = findImageModelConfig(providerId, `fal-ai/${modelId}`);
+    if (native) return native.id;
+  }
+  return findImageModelConfig(providerId, modelId)?.id || modelId;
+}
+
+// Kept out of getImageModelEntry() (which sits at the complexity-ratchet cap) — an
+// alias can override imageRequired directly, else it falls back to its target
+// model's own flag. Consumers coerce the result with Boolean(), so no `?? false`.
+function resolveAliasImageRequired(
+  alias: ImageModelAliasEntry,
+  modelConfig: ImageModelEntry | null
+) {
+  return alias.imageRequired ?? modelConfig?.imageRequired;
+}
 
 /**
  * Get image provider config by ID
  */
-export function getImageProvider(providerId) {
-  return IMAGE_PROVIDERS[providerId] || null;
+export function getImageProvider(providerId: string): ImageProviderConfig | null {
+  const providers = visibleImageProviders();
+  if (providers[providerId]) return providers[providerId];
+  if (!providerId) return null;
+  for (const config of Object.values(providers)) {
+    if (config.alias === providerId) return config;
+  }
+  return null;
 }
 
 /**
  * Parse image model string (format: "provider/model")
  * Returns { provider, model }
  */
-export function parseImageModel(modelStr) {
-  if (!modelStr) return { provider: null, model: null };
+export function parseImageModel(modelStr: string) {
+  if (!modelStr || hasUnsafeModelIdSyntax(modelStr)) return { provider: null, model: null };
+
+  const directAlias = resolveImageModelAlias(modelStr);
+  if (directAlias) {
+    return directAlias;
+  }
 
   // Try each provider prefix
-  for (const [providerId, config] of Object.entries(IMAGE_PROVIDERS)) {
+  for (const [providerId, config] of Object.entries(visibleImageProviders())) {
     if (modelStr.startsWith(providerId + "/")) {
-      return { provider: providerId, model: modelStr.slice(providerId.length + 1) };
+      const model = modelStr.slice(providerId.length + 1);
+      const aliased =
+        resolveImageModelAlias(`${providerId}/${model}`) ||
+        resolveSameProviderBareAlias(providerId, model);
+      return (
+        aliased || { provider: providerId, model: resolveImageProviderModelId(providerId, model) }
+      );
+    }
+    // Check alias if available
+    if (config.alias && modelStr.startsWith(config.alias + "/")) {
+      const model = modelStr.slice(config.alias.length + 1);
+      const aliased =
+        resolveImageModelAlias(`${providerId}/${model}`) ||
+        resolveSameProviderBareAlias(providerId, model);
+      return (
+        aliased || { provider: providerId, model: resolveImageProviderModelId(providerId, model) }
+      );
     }
   }
 
-  // No provider prefix — try to find the model in every provider
-  for (const [providerId, config] of Object.entries(IMAGE_PROVIDERS)) {
-    if (config.models.some((m) => m.id === modelStr)) {
-      return { provider: providerId, model: modelStr };
+  // No provider prefix — try to find the model in every provider, excluding cookie-auth (web) bridges
+  for (const [providerId, config] of Object.entries(visibleImageProviders())) {
+    const modelConfig = config.models.find(
+      (model) => model.id === modelStr || model.catalogId === modelStr
+    );
+    if (
+      config.authHeader !== "cookie" &&
+      (config.routingAliases?.includes(modelStr) || modelConfig)
+    ) {
+      return { provider: providerId, model: modelConfig?.id || modelStr };
     }
   }
 
@@ -186,17 +160,117 @@ export function parseImageModel(modelStr) {
 /**
  * Get all image models as a flat list
  */
-export function getAllImageModels() {
-  const models = [];
-  for (const [providerId, config] of Object.entries(IMAGE_PROVIDERS)) {
-    for (const model of config.models) {
-      models.push({
-        id: `${providerId}/${model.id}`,
-        name: model.name,
-        provider: providerId,
-        supportedSizes: config.supportedSizes,
-      });
-    }
+function imageProviderCatalogEntries(
+  providerId: string,
+  config: ImageProviderConfig
+): ImageCatalogModelEntry[] {
+  return config.models.map((model) => ({
+    id: `${providerId}/${model.catalogId || model.id}`,
+    name: model.name,
+    provider: providerId,
+    supportedSizes: model.supportedSizes || config.supportedSizes,
+    inputModalities: model.inputModalities || ["text"],
+    description: model.description || undefined,
+    mediaCapabilities: model.mediaCapabilities,
+  }));
+}
+
+function imageAliasCatalogEntry(
+  alias: string,
+  target: ImageModelAliasEntry
+): ImageCatalogModelEntry | null {
+  if (!target.listInCatalog) return null;
+
+  const providerConfig = visibleImageProviders()[target.provider];
+  const modelConfig = findImageModelConfig(target.provider, target.model);
+  return {
+    id: alias,
+    name: target.name || modelConfig?.name || alias,
+    provider: target.provider,
+    supportedSizes: providerConfig?.supportedSizes || [],
+    inputModalities: target.inputModalities || modelConfig?.inputModalities || ["text"],
+    description: target.description || modelConfig?.description || undefined,
+  };
+}
+
+export function getAllImageModels(): ImageCatalogModelEntry[] {
+  const providerModels = Object.entries(visibleImageProviders()).flatMap(([providerId, config]) =>
+    imageProviderCatalogEntries(providerId, config)
+  );
+  const aliasModels = Object.entries(IMAGE_MODEL_ALIASES).flatMap(([alias, target]) => {
+    const entry = imageAliasCatalogEntry(alias, target);
+    return entry ? [entry] : [];
+  });
+  return [...providerModels, ...aliasModels];
+}
+
+export function getImageModelAliases() {
+  return IMAGE_MODEL_ALIASES;
+}
+
+/**
+ * #6457 — precise provider+modelId membership check against the image registry.
+ * Unlike getImageModelEntry() (which also resolves bare aliases and unprefixed
+ * ids by scanning every provider), this only answers "is `modelId` registered
+ * as an image model under this exact `providerId`?" — used by the chat catalog
+ * builder to keep upstream-discovered models (e.g. HuggingFace's live
+ * `/v1/models`, which returns image/diffusion models with no modality field)
+ * out of the chat listing when they are already known image-only models.
+ */
+export function isRegisteredImageModel(providerId: string, modelId: string): boolean {
+  return Boolean(findImageModelConfig(providerId, modelId));
+}
+
+export function getImageModelEntry(modelStr: string) {
+  if (!modelStr) return null;
+
+  const alias = IMAGE_MODEL_ALIASES[modelStr];
+  if (alias) {
+    const modelConfig = findImageModelConfig(alias.provider, alias.model);
+    return {
+      provider: alias.provider,
+      model: alias.model,
+      inputModalities: alias.inputModalities || modelConfig?.inputModalities || ["text"],
+      imageRequired: resolveAliasImageRequired(alias, modelConfig),
+      description: alias.description || modelConfig?.description || undefined,
+    };
   }
-  return models;
+
+  const { provider, model } = parseImageModel(modelStr);
+  if (!provider || !model) return null;
+
+  const modelConfig = findImageModelConfig(provider, model);
+  if (!modelConfig) return null;
+
+  return {
+    provider,
+    model,
+    inputModalities: modelConfig.inputModalities || ["text"],
+    imageRequired: modelConfig.imageRequired,
+    description: modelConfig.description || undefined,
+  };
+}
+
+/**
+ * Image-registry model whose provider/model pair the chat catalog does not also list, so
+ * /v1/chat/completions cannot serve it (#6457). Dual-purpose models (e.g. Codex GPT-5.5)
+ * are in both and stay chat-capable — unless every chat-catalog model of the provider is
+ * an image model: Leonardo and Ideogram have no chat API, and their chat rows exist only
+ * so the provider page lists the models.
+ */
+export function isImageOnlyModel(modelStr: string): boolean {
+  const entry = getImageModelEntry(modelStr);
+  if (!entry) return false;
+  const chatModels = getModelsByProviderId(entry.provider);
+  if (!chatModels.some((model) => model.id === entry.model)) return true;
+  const imageModelIds = new Set(
+    (getImageProvider(entry.provider)?.models ?? []).map((model) => model.id)
+  );
+  return chatModels.every((model) => imageModelIds.has(model.id));
+}
+
+/** Image input is mandatory only for edit-only models (`["image"]`, no `"text"`). Dual-modality models also accept pure t2i. */
+export function modalitiesRequireImageInput(inputModalities: unknown): boolean {
+  const list = Array.isArray(inputModalities) ? inputModalities : ["text"];
+  return list.includes("image") && !list.includes("text");
 }

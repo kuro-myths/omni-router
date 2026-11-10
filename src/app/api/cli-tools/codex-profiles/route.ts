@@ -3,8 +3,10 @@
 import { NextResponse } from "next/server";
 import fs from "fs/promises";
 import path from "path";
+import { requireCliToolsAuth } from "@/lib/api/requireCliToolsAuth";
 import { ensureCliConfigWriteAllowed, getCliConfigPaths } from "@/shared/services/cliRuntime";
 import { resolveDataDir } from "@/lib/dataPaths";
+import { compareTr } from "@/shared/utils/turkishText";
 import { codexProfileIdSchema, codexProfileNameSchema } from "@/shared/validation/schemas";
 import { isValidationFailure, validateBody } from "@/shared/validation/helpers";
 
@@ -52,7 +54,10 @@ function extractAuthLabel(authJson) {
 }
 
 // GET - List all saved profiles
-export async function GET() {
+export async function GET(request: Request) {
+  const authError = await requireCliToolsAuth(request);
+  if (authError) return authError;
+
   try {
     await ensureProfilesDir();
 
@@ -84,7 +89,7 @@ export async function GET() {
     }
 
     // Sort by name
-    profiles.sort((a, b) => a.name.localeCompare(b.name));
+    profiles.sort((a, b) => compareTr(a.name, b.name));
     return NextResponse.json({ profiles });
   } catch (error) {
     console.log("Error listing codex profiles:", error.message);
@@ -94,6 +99,9 @@ export async function GET() {
 
 // POST - Save current config as a named profile
 export async function POST(request) {
+  const authError = await requireCliToolsAuth(request);
+  if (authError) return authError;
+
   let rawBody;
   try {
     rawBody = await request.json();
@@ -164,7 +172,7 @@ export async function POST(request) {
     };
 
     await ensureProfilesDir();
-    const profilePath = path.join(PROFILES_DIR, `${profileId}.json`);
+    const profilePath = safeProfilePath(`${profileId}.json`);
     await fs.writeFile(profilePath, JSON.stringify(profile, null, 2));
 
     return NextResponse.json({
@@ -180,6 +188,9 @@ export async function POST(request) {
 
 // PUT - Activate a saved profile (restore its config + auth)
 export async function PUT(request) {
+  const authError = await requireCliToolsAuth(request);
+  if (authError) return authError;
+
   let rawBody;
   try {
     rawBody = await request.json();
@@ -207,7 +218,7 @@ export async function PUT(request) {
     }
     const { profileId } = validation.data;
 
-    const profilePath = path.join(PROFILES_DIR, `${profileId}.json`);
+    const profilePath = safeProfilePath(`${profileId}.json`);
     let profile;
     try {
       const raw = await fs.readFile(profilePath, "utf-8");
@@ -251,6 +262,9 @@ export async function PUT(request) {
 
 // DELETE - Remove a saved profile
 export async function DELETE(request) {
+  const authError = await requireCliToolsAuth(request);
+  if (authError) return authError;
+
   let rawBody;
   try {
     rawBody = await request.json();
@@ -273,7 +287,7 @@ export async function DELETE(request) {
     }
     const { profileId } = validation.data;
 
-    const profilePath = path.join(PROFILES_DIR, `${profileId}.json`);
+    const profilePath = safeProfilePath(`${profileId}.json`);
     try {
       await fs.unlink(profilePath);
     } catch (err) {

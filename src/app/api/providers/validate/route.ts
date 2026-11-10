@@ -1,4 +1,7 @@
 import { NextResponse } from "next/server";
+import { sanitizeErrorMessage } from "@omniroute/open-sse/utils/errorSanitization.ts";
+import { requireManagementAuth } from "@/lib/api/requireManagementAuth";
+import { getAuditRequestContext, logAuditEvent } from "@/lib/compliance/index";
 import { getProviderNodeById } from "@/models";
 import {
   isClaudeCodeCompatibleProvider,
@@ -6,13 +9,31 @@ import {
   isAnthropicCompatibleProvider,
 } from "@/shared/constants/providers";
 import { validateProviderApiKey } from "@/lib/providers/validation";
-import { getProxyForLevel } from "@/lib/localDb";
+import { getRequestPeerLocality } from "@/shared/utils/apiAuth";
+import { projectProviderValidationResultForPublicResponse } from "@/lib/providers/validation/transport";
+import { getProxyForLevel } from "@/lib/db/settings";
+import { resolveProxyForProvider } from "@/lib/db/proxies";
 import { validateProviderApiKeySchema } from "@/shared/validation/schemas";
 import { isValidationFailure, validateBody } from "@/shared/validation/helpers";
-import { runWithProxyContext } from "@omniroute/open-sse/utils/proxyFetch.ts";
+import { runWithProxyContextOrDirect } from "@omniroute/open-sse/utils/proxyFetch.ts";
+import { rejectRetiredCommonChatGptWebProvider } from "@/lib/providers/chatgptWebRetirementResponse";
+
+function sanitizeAuditUrl(url: string | null | undefined) {
+  if (!url) return null;
+  try {
+    const parsed = new URL(url);
+    return `${parsed.origin}${parsed.pathname}`.replace(/\/$/, "") || parsed.origin;
+  } catch {
+    return String(url);
+  }
+}
 
 // POST /api/providers/validate - Validate API key with provider
 export async function POST(request) {
+  const authError = await requireManagementAuth(request);
+  if (authError) return authError;
+
+  const auditContext = getAuditRequestContext(request);
   let rawBody;
   try {
     rawBody = await request.json();
@@ -33,12 +54,48 @@ export async function POST(request) {
     if (isValidationFailure(validation)) {
       return NextResponse.json({ error: validation.error }, { status: 400 });
     }
-    const { provider, apiKey, validationModelId, customUserAgent, baseUrl: bodyBaseUrl } = validation.data;
+    const {
+      provider,
+      apiKey,
+      validationModelId,
+      customUserAgent,
+      baseUrl: bodyBaseUrl,
+      region,
+      accessKeyId,
+      sessionToken,
+      cx,
+      runtimeKey,
+      tunnelId,
+      connectorName,
+      zdrEnabled,
+    } = validation.data;
+
+    const retirementResponse = rejectRetiredCommonChatGptWebProvider(provider);
+    if (retirementResponse) return retirementResponse;
 
     let providerSpecificData: any = { validationModelId };
     if (customUserAgent) {
       providerSpecificData.customUserAgent = customUserAgent;
     }
+    if (bodyBaseUrl) {
+      providerSpecificData.baseUrl = bodyBaseUrl;
+    }
+    if (region) {
+      providerSpecificData.region = region;
+    }
+    if (accessKeyId) {
+      providerSpecificData.accessKeyId = accessKeyId;
+    }
+    if (sessionToken) {
+      providerSpecificData.sessionToken = sessionToken;
+    }
+    if (cx) {
+      providerSpecificData.cx = cx;
+    }
+    if (runtimeKey) providerSpecificData.runtimeKey = runtimeKey;
+    if (tunnelId) providerSpecificData.tunnelId = tunnelId;
+    if (connectorName) providerSpecificData.connectorName = connectorName;
+    if (zdrEnabled === true) providerSpecificData.zdrEnabled = true;
 
     if (isOpenAICompatibleProvider(provider) || isAnthropicCompatibleProvider(provider)) {
       const node: any = await getProviderNodeById(provider);
@@ -62,19 +119,61 @@ export async function POST(request) {
       };
     }
 
-    const providerProxy = await getProxyForLevel("provider", provider);
-    const globalProxy = providerProxy ? null : await getProxyForLevel("global");
+    const registryProxy = await resolveProxyForProvider(provider);
+    let proxyToUse = registryProxy;
 
-    const result = await runWithProxyContext(providerProxy || globalProxy || null, () =>
-      validateProviderApiKey({
-        provider,
-        apiKey,
-        providerSpecificData,
-      })
+    if (!proxyToUse) {
+      const providerProxy = await getProxyForLevel("provider", provider);
+      const globalProxy = providerProxy ? null : await getProxyForLevel("global");
+      proxyToUse = providerProxy || globalProxy || null;
+    }
+
+    const result = projectProviderValidationResultForPublicResponse(
+      await runWithProxyContextOrDirect(proxyToUse || null, () =>
+        validateProviderApiKey({
+          provider,
+          apiKey,
+          providerSpecificData,
+          // S-01 (#15159, #15766 shape): the devin CLI-spawn fallback inside the
+          // dispatch may only run for loopback/LAN peers — the trusted
+          // peer-locality header, never a client-supplied value.
+          allowLocalSpawn: getRequestPeerLocality(request) !== "remote",
+        })
+      )
     );
 
     if (result.unsupported) {
-      return NextResponse.json({ error: "Provider validation not supported" }, { status: 400 });
+      // #5565/#5567: surface `unsupported` so the dashboard can treat "validation
+      // not supported" as a non-blocking warning (allow Save) instead of a hard
+      // "Invalid" block — providers like lmarena / piapi have no live validator.
+      return NextResponse.json(
+        { error: "Provider validation not supported", unsupported: true },
+        { status: 400 }
+      );
+    }
+
+    if (!result.valid && typeof result.statusCode === "number") {
+      if (result.securityBlocked) {
+        logAuditEvent({
+          action: "provider.validation.ssrf_blocked",
+          actor: "admin",
+          target: provider,
+          resourceType: "provider_validation",
+          status: "blocked",
+          ipAddress: auditContext.ipAddress || undefined,
+          requestId: auditContext.requestId,
+          metadata: {
+            provider,
+            route: "/api/providers/validate",
+            reason: result.error || "Blocked provider validation target",
+            baseUrl: sanitizeAuditUrl(bodyBaseUrl || providerSpecificData?.baseUrl),
+          },
+        });
+      }
+      return NextResponse.json(
+        { error: result.error || "Validation failed" },
+        { status: result.statusCode }
+      );
     }
 
     return NextResponse.json({
@@ -82,9 +181,11 @@ export async function POST(request) {
       error: result.valid ? null : result.error || "Invalid API key",
       warning: result.warning || null,
       method: result.method || null,
+      capabilities: result.capabilities || null,
+      providerSpecificData: result.providerSpecificData || null,
     });
   } catch (error) {
-    console.log("Error validating API key:", error);
+    console.log("Error validating API key:", sanitizeErrorMessage(error) || "Validation failed");
     return NextResponse.json({ error: "Validation failed" }, { status: 500 });
   }
 }

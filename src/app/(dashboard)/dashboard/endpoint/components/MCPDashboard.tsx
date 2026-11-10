@@ -1,12 +1,29 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { Card, Button } from "@/shared/components";
+import {
+  Table,
+  TableBody,
+  TableCell,
+  TableHead,
+  TableHeader,
+  TableRow,
+} from "@omniroute/ui-kit/table";
+import Button from "@/shared/components/Button";
+import Card from "@/shared/components/Card";
+import Input from "@/shared/components/Input";
+import Select from "@/shared/components/Select";
 import { useTranslations } from "next-intl";
+import { useConfirmDialog } from "@/shared/hooks/useConfirmDialog";
+
+type McpTransport = "stdio" | "sse" | "streamable-http";
 
 type McpStatusResponse = {
   status: "online" | "offline";
   online: boolean;
+  enabled: boolean;
+  transport: McpTransport;
+  scopesEnforced?: boolean;
   heartbeatPath: string;
   heartbeat: {
     pid: number;
@@ -21,6 +38,12 @@ type McpStatusResponse = {
     heartbeatAgeMs: number | null;
     uptimeMs: number | null;
   } | null;
+  httpTransport: {
+    online: boolean;
+    transport: "sse" | "streamable-http" | null;
+    startedAt: number | null;
+    uptime: string | null;
+  };
   activity: {
     totalCalls24h: number;
     successRate: number;
@@ -69,72 +92,90 @@ const AUDIT_PAGE_SIZE = 20;
 
 const RESILIENCE_PRESETS = {
   aggressive: {
-    profiles: {
+    requestQueue: {
+      requestsPerMinute: 180,
+      minTimeBetweenRequestsMs: 100,
+      concurrentRequests: 16,
+    },
+    connectionCooldown: {
       oauth: {
-        transientCooldown: 3000,
-        rateLimitCooldown: 30000,
-        maxBackoffLevel: 4,
-        circuitBreakerThreshold: 2,
-        circuitBreakerReset: 30000,
+        baseCooldownMs: 30000,
+        useUpstreamRetryHints: false,
+        maxBackoffSteps: 4,
       },
       apikey: {
-        transientCooldown: 2000,
-        rateLimitCooldown: 0,
-        maxBackoffLevel: 3,
-        circuitBreakerThreshold: 3,
-        circuitBreakerReset: 15000,
+        baseCooldownMs: 2000,
+        useUpstreamRetryHints: true,
+        maxBackoffSteps: 3,
       },
     },
-    defaults: {
-      requestsPerMinute: 180,
-      minTimeBetweenRequests: 100,
-      concurrentRequests: 16,
+    providerBreaker: {
+      oauth: {
+        failureThreshold: 2,
+        resetTimeoutMs: 30000,
+      },
+      apikey: {
+        failureThreshold: 3,
+        resetTimeoutMs: 15000,
+      },
     },
   },
   balanced: {
-    profiles: {
+    requestQueue: {
+      requestsPerMinute: 100,
+      minTimeBetweenRequestsMs: 200,
+      concurrentRequests: 10,
+    },
+    connectionCooldown: {
       oauth: {
-        transientCooldown: 5000,
-        rateLimitCooldown: 60000,
-        maxBackoffLevel: 8,
-        circuitBreakerThreshold: 3,
-        circuitBreakerReset: 60000,
+        baseCooldownMs: 60000,
+        useUpstreamRetryHints: false,
+        maxBackoffSteps: 8,
       },
       apikey: {
-        transientCooldown: 3000,
-        rateLimitCooldown: 0,
-        maxBackoffLevel: 5,
-        circuitBreakerThreshold: 5,
-        circuitBreakerReset: 30000,
+        baseCooldownMs: 3000,
+        useUpstreamRetryHints: true,
+        maxBackoffSteps: 5,
       },
     },
-    defaults: {
-      requestsPerMinute: 100,
-      minTimeBetweenRequests: 200,
-      concurrentRequests: 10,
+    providerBreaker: {
+      oauth: {
+        failureThreshold: 3,
+        resetTimeoutMs: 60000,
+      },
+      apikey: {
+        failureThreshold: 5,
+        resetTimeoutMs: 30000,
+      },
     },
   },
   conservative: {
-    profiles: {
+    requestQueue: {
+      requestsPerMinute: 60,
+      minTimeBetweenRequestsMs: 350,
+      concurrentRequests: 6,
+    },
+    connectionCooldown: {
       oauth: {
-        transientCooldown: 8000,
-        rateLimitCooldown: 120000,
-        maxBackoffLevel: 10,
-        circuitBreakerThreshold: 8,
-        circuitBreakerReset: 120000,
+        baseCooldownMs: 120000,
+        useUpstreamRetryHints: false,
+        maxBackoffSteps: 10,
       },
       apikey: {
-        transientCooldown: 5000,
-        rateLimitCooldown: 30000,
-        maxBackoffLevel: 8,
-        circuitBreakerThreshold: 8,
-        circuitBreakerReset: 60000,
+        baseCooldownMs: 30000,
+        useUpstreamRetryHints: false,
+        maxBackoffSteps: 8,
       },
     },
-    defaults: {
-      requestsPerMinute: 60,
-      minTimeBetweenRequests: 350,
-      concurrentRequests: 6,
+    providerBreaker: {
+      oauth: {
+        failureThreshold: 8,
+        resetTimeoutMs: 120000,
+      },
+      apikey: {
+        failureThreshold: 8,
+        resetTimeoutMs: 60000,
+      },
     },
   },
 } as const;
@@ -152,6 +193,7 @@ function formatPercent(value: number | null | undefined) {
 
 export default function McpDashboardPage() {
   const t = useTranslations("mcpDashboard");
+  const { requestConfirm, confirmDialog } = useConfirmDialog();
   const [loading, setLoading] = useState(true);
   const [status, setStatus] = useState<McpStatusResponse | null>(null);
   const [tools, setTools] = useState<McpTool[]>([]);
@@ -237,13 +279,19 @@ export default function McpDashboardPage() {
   }, [auditOffset, toolFilter, successFilter, apiKeyFilter]);
 
   useEffect(() => {
-    refreshSummary();
+    // Async continuation — see react-hooks/set-state-in-effect.
+    void (async () => {
+      await refreshSummary();
+    })();
     const interval = setInterval(refreshSummary, 30000);
     return () => clearInterval(interval);
   }, [refreshSummary]);
 
   useEffect(() => {
-    refreshAudit();
+    // Async continuation — see react-hooks/set-state-in-effect.
+    void (async () => {
+      await refreshAudit();
+    })();
   }, [refreshAudit]);
 
   const handleSwitchCombo = async () => {
@@ -251,9 +299,11 @@ export default function McpDashboardPage() {
     const nextState = selectedCombo.isActive === false;
     const confirmLabel = nextState ? t("activate") : t("deactivate");
     if (
-      !globalThis.confirm(
-        t("confirmSwitchCombo", { action: confirmLabel, combo: selectedCombo.name })
-      )
+      !(await requestConfirm({
+        message: t("confirmSwitchCombo", { action: confirmLabel, combo: selectedCombo.name }),
+        confirmText: confirmLabel,
+        variant: nextState ? "primary" : "danger",
+      }))
     )
       return;
 
@@ -287,7 +337,13 @@ export default function McpDashboardPage() {
       conservative: t("profileConservative"),
     };
     const profileLabel = profileLabelById[selectedProfile];
-    if (!globalThis.confirm(t("confirmApplyProfile", { profile: profileLabel }))) return;
+    if (
+      !(await requestConfirm({
+        message: t("confirmApplyProfile", { profile: profileLabel }),
+        variant: "primary",
+      }))
+    )
+      return;
 
     setActionBusy("resilience");
     setActionMessage("");
@@ -312,7 +368,7 @@ export default function McpDashboardPage() {
   };
 
   const handleResetCircuitBreakers = async () => {
-    if (!globalThis.confirm(t("confirmResetBreakers"))) return;
+    if (!(await requestConfirm(t("confirmResetBreakers")))) return;
 
     setActionBusy("reset");
     setActionMessage("");
@@ -335,28 +391,25 @@ export default function McpDashboardPage() {
   const totalPages = Math.max(1, Math.ceil((auditData.total || 0) / AUDIT_PAGE_SIZE));
   const currentPage = Math.floor((auditData.offset || 0) / AUDIT_PAGE_SIZE) + 1;
   const topTools = status?.activity?.topTools || [];
+  const runtimeTransport = status?.transport || status?.heartbeat?.transport || "—";
+  const runtimeUptime =
+    status?.transport === "stdio"
+      ? formatDuration(status?.heartbeat?.uptimeMs ?? null)
+      : status?.httpTransport?.uptime || "—";
+  const heartbeatLabel =
+    status?.transport === "stdio" ? formatDuration(status?.heartbeat?.heartbeatAgeMs ?? null) : "—";
 
   if (loading) {
-    return (
-      <div className="p-6 max-w-7xl mx-auto">
-        <div className="text-sm text-text-muted">{t("loading")}</div>
-      </div>
-    );
+    return <div className="text-sm text-text-muted">{t("loading")}</div>;
   }
 
   return (
-    <div className="p-6 max-w-7xl mx-auto space-y-6">
+    <div className="space-y-6">
       <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-4 gap-4">
         <StatCard label={t("processStatus")} value={status?.online ? t("online") : t("offline")} />
         <StatCard label={t("pid")} value={status?.heartbeat?.pid ?? "—"} />
-        <StatCard
-          label={t("sessionUptime")}
-          value={formatDuration(status?.heartbeat?.uptimeMs ?? null)}
-        />
-        <StatCard
-          label={t("lastHeartbeat")}
-          value={formatDuration(status?.heartbeat?.heartbeatAgeMs ?? null)}
-        />
+        <StatCard label={t("sessionUptime")} value={runtimeUptime} />
+        <StatCard label={t("lastHeartbeat")} value={heartbeatLabel} />
       </div>
 
       <Card className="p-5">
@@ -394,13 +447,14 @@ export default function McpDashboardPage() {
             <h3 className="text-sm font-semibold mb-2">{t("runtimeDetails")}</h3>
             <div className="text-sm space-y-1">
               <p>
-                {t("transport")}:{" "}
-                <span className="font-mono">{status?.heartbeat?.transport || "—"}</span>
+                {t("transport")}: <span className="font-mono">{runtimeTransport}</span>
               </p>
               <p>
                 {t("scopesEnforced")}:{" "}
                 <span className="font-semibold">
-                  {status?.heartbeat?.scopesEnforced ? t("yes") : t("no")}
+                  {(status?.scopesEnforced ?? status?.heartbeat?.scopesEnforced)
+                    ? t("yes")
+                    : t("no")}
                 </span>
               </p>
               <p>
@@ -426,8 +480,8 @@ export default function McpDashboardPage() {
         <div className="grid grid-cols-1 xl:grid-cols-3 gap-4">
           <div className="rounded-lg border border-border p-3 space-y-3">
             <p className="text-sm font-semibold">{t("switchCombo")}</p>
-            <select
-              className="w-full rounded-lg border border-border bg-bg px-3 py-2 text-sm"
+            <Select
+              aria-label={t("switchCombo")}
               value={selectedComboId}
               onChange={(event) => setSelectedComboId(event.target.value)}
             >
@@ -436,7 +490,7 @@ export default function McpDashboardPage() {
                   {combo.name} ({combo.isActive === false ? t("inactive") : t("active")})
                 </option>
               ))}
-            </select>
+            </Select>
             <Button
               size="sm"
               variant="secondary"
@@ -449,8 +503,8 @@ export default function McpDashboardPage() {
 
           <div className="rounded-lg border border-border p-3 space-y-3">
             <p className="text-sm font-semibold">{t("applyResilienceProfile")}</p>
-            <select
-              className="w-full rounded-lg border border-border bg-bg px-3 py-2 text-sm"
+            <Select
+              aria-label={t("applyResilienceProfile")}
               value={selectedProfile}
               onChange={(event) =>
                 setSelectedProfile(event.target.value as keyof typeof RESILIENCE_PRESETS)
@@ -459,7 +513,7 @@ export default function McpDashboardPage() {
               <option value="aggressive">{t("profileAggressive")}</option>
               <option value="balanced">{t("profileBalanced")}</option>
               <option value="conservative">{t("profileConservative")}</option>
-            </select>
+            </Select>
             <Button
               size="sm"
               variant="secondary"
@@ -476,7 +530,7 @@ export default function McpDashboardPage() {
             <Button
               size="sm"
               onClick={handleResetCircuitBreakers}
-              className="bg-red-500! hover:bg-red-600! text-white!"
+              variant="danger"
               disabled={actionBusy === "reset"}
             >
               {t("resetAllBreakers")}
@@ -489,26 +543,26 @@ export default function McpDashboardPage() {
       <Card className="p-5">
         <h2 className="text-lg font-semibold mb-4">{t("toolsAndScopes")}</h2>
         <div className="overflow-x-auto">
-          <table className="w-full text-sm">
-            <thead>
-              <tr className="border-b border-border">
-                <th className="text-left py-2 pr-2">{t("tableTool")}</th>
-                <th className="text-left py-2 pr-2">{t("tableScopes")}</th>
-                <th className="text-left py-2 pr-2">{t("tablePhase")}</th>
-                <th className="text-left py-2">{t("tableAudit")}</th>
-              </tr>
-            </thead>
-            <tbody>
+          <Table scrollbarLabel={t("toolsAndScopes")}>
+            <TableHeader>
+              <TableRow>
+                <TableHead>{t("tableTool")}</TableHead>
+                <TableHead>{t("tableScopes")}</TableHead>
+                <TableHead>{t("tablePhase")}</TableHead>
+                <TableHead>{t("tableAudit")}</TableHead>
+              </TableRow>
+            </TableHeader>
+            <TableBody>
               {tools.map((tool) => (
-                <tr key={tool.name} className="border-b border-border/40">
-                  <td className="py-2 pr-2 font-mono text-xs">{tool.name}</td>
-                  <td className="py-2 pr-2 text-xs">{tool.scopes.join(", ") || "—"}</td>
-                  <td className="py-2 pr-2">{tool.phase}</td>
-                  <td className="py-2">{tool.auditLevel}</td>
-                </tr>
+                <TableRow key={tool.name}>
+                  <TableCell className="font-mono">{tool.name}</TableCell>
+                  <TableCell>{tool.scopes.join(", ") || "—"}</TableCell>
+                  <TableCell>{tool.phase}</TableCell>
+                  <TableCell>{tool.auditLevel}</TableCell>
+                </TableRow>
               ))}
-            </tbody>
-          </table>
+            </TableBody>
+          </Table>
         </div>
       </Card>
 
@@ -521,8 +575,8 @@ export default function McpDashboardPage() {
             </p>
           </div>
           <div className="flex flex-wrap gap-2">
-            <select
-              className="rounded-lg border border-border bg-bg px-3 py-2 text-sm"
+            <Select
+              aria-label={t("tableTool")}
               value={toolFilter}
               onChange={(event) => {
                 setAuditOffset(0);
@@ -535,9 +589,9 @@ export default function McpDashboardPage() {
                   {tool.name}
                 </option>
               ))}
-            </select>
-            <select
-              className="rounded-lg border border-border bg-bg px-3 py-2 text-sm"
+            </Select>
+            <Select
+              aria-label={t("tableResult")}
               value={successFilter}
               onChange={(event) => {
                 setAuditOffset(0);
@@ -547,9 +601,9 @@ export default function McpDashboardPage() {
               <option value="all">{t("allResults")}</option>
               <option value="true">{t("success")}</option>
               <option value="false">{t("failure")}</option>
-            </select>
-            <input
-              className="rounded-lg border border-border bg-bg px-3 py-2 text-sm"
+            </Select>
+            <Input
+              aria-label={t("apiKeyIdPlaceholder")}
               placeholder={t("apiKeyIdPlaceholder")}
               value={apiKeyFilter}
               onChange={(event) => {
@@ -566,34 +620,32 @@ export default function McpDashboardPage() {
           <p className="text-sm text-text-muted">{t("noAuditEntriesForFilters")}</p>
         ) : (
           <div className="overflow-x-auto">
-            <table className="w-full text-sm">
-              <thead>
-                <tr className="border-b border-border">
-                  <th className="text-left py-2 pr-2">{t("tableTimestamp")}</th>
-                  <th className="text-left py-2 pr-2">{t("tableTool")}</th>
-                  <th className="text-left py-2 pr-2">{t("tableDuration")}</th>
-                  <th className="text-left py-2 pr-2">{t("tableResult")}</th>
-                  <th className="text-left py-2">{t("tableApiKey")}</th>
-                </tr>
-              </thead>
-              <tbody>
+            <Table scrollbarLabel={t("auditLog")}>
+              <TableHeader>
+                <TableRow>
+                  <TableHead>{t("tableTimestamp")}</TableHead>
+                  <TableHead>{t("tableTool")}</TableHead>
+                  <TableHead>{t("tableDuration")}</TableHead>
+                  <TableHead>{t("tableResult")}</TableHead>
+                  <TableHead>{t("tableApiKey")}</TableHead>
+                </TableRow>
+              </TableHeader>
+              <TableBody>
                 {auditData.entries.map((entry) => (
-                  <tr key={entry.id} className="border-b border-border/40">
-                    <td className="py-2 pr-2 text-xs">
-                      {new Date(entry.createdAt).toLocaleString()}
-                    </td>
-                    <td className="py-2 pr-2 font-mono text-xs">{entry.toolName}</td>
-                    <td className="py-2 pr-2">{entry.durationMs}ms</td>
-                    <td className="py-2 pr-2">
-                      <span className={entry.success ? "text-green-500" : "text-red-500"}>
+                  <TableRow key={entry.id}>
+                    <TableCell>{new Date(entry.createdAt).toLocaleString()}</TableCell>
+                    <TableCell className="font-mono">{entry.toolName}</TableCell>
+                    <TableCell>{entry.durationMs}ms</TableCell>
+                    <TableCell>
+                      <span className={entry.success ? "text-success" : "text-error"}>
                         {entry.success ? t("success") : entry.errorCode || t("failed")}
                       </span>
-                    </td>
-                    <td className="py-2">{entry.apiKeyId || "—"}</td>
-                  </tr>
+                    </TableCell>
+                    <TableCell>{entry.apiKeyId || "—"}</TableCell>
+                  </TableRow>
                 ))}
-              </tbody>
-            </table>
+              </TableBody>
+            </Table>
           </div>
         )}
 
@@ -620,6 +672,7 @@ export default function McpDashboardPage() {
           </Button>
         </div>
       </Card>
+      {confirmDialog}
     </div>
   );
 }

@@ -1,4 +1,5 @@
 import { test, expect } from "@playwright/test";
+import { gotoDashboardRoute } from "./helpers/dashboardAuth";
 
 type ProxyStub = {
   id: string;
@@ -171,11 +172,9 @@ test.describe("Proxy Registry smoke flow", () => {
       });
     });
 
-    await page.goto("/dashboard/settings?tab=advanced");
-    await page.waitForLoadState("networkidle");
-
-    const redirectedToLogin = page.url().includes("/login");
-    test.skip(redirectedToLogin, "Authentication enabled without a login fixture.");
+    // The proxy registry now lives under the "Proxy Pool" sub-tab of the proxy
+    // settings page; navigate directly to it so the heading renders.
+    await gotoDashboardRoute(page, "/dashboard/system/proxy?tab=proxy-pool");
 
     await expect(page.getByRole("heading", { name: "Proxy Registry" })).toBeVisible();
 
@@ -186,19 +185,28 @@ test.describe("Proxy Registry smoke flow", () => {
     await createDialog.getByTestId("proxy-registry-host-input").fill("smoke.local");
     await createDialog.getByRole("button", { name: "Save" }).click();
 
-    await expect(page.locator("table")).toContainText("Registry Smoke Proxy");
-    await expect(page.locator("table")).toContainText("http://smoke.local:8080");
+    const registryTable = page.getByRole("table").filter({
+      has: page.getByRole("columnheader", { name: "Name", exact: true }),
+    });
+    await expect(registryTable).toHaveCount(1);
+    await expect(registryTable).toContainText("Registry Smoke Proxy");
+    await expect(registryTable).toContainText("http://smoke.local:8080");
 
-    const row = page.locator("tr", { hasText: "Registry Smoke Proxy" });
+    const row = registryTable.getByRole("row", { name: /Registry Smoke Proxy/ });
     await row.getByRole("button", { name: "Edit" }).click();
     const editDialog = page.getByRole("dialog");
     await expect(editDialog.getByText("Edit Proxy")).toBeVisible();
     await editDialog.getByTestId("proxy-registry-host-input").fill("smoke-updated.local");
     await editDialog.getByRole("button", { name: "Save" }).click();
 
-    await expect(page.locator("table")).toContainText("http://smoke-updated.local:8080");
+    await expect(registryTable).toContainText("http://smoke-updated.local:8080");
 
-    await page.getByTestId("proxy-registry-open-bulk").click();
+    // Bulk assign moved into the toolbar's "More actions" (⋯) overflow menu in
+    // #9870 — the menu only renders its items once opened, so open it first.
+    await page.getByTestId("proxy-registry-more-actions").click();
+    const actionsMenu = page.getByRole("menu");
+    await expect(actionsMenu).toBeVisible();
+    await actionsMenu.getByTestId("proxy-registry-open-bulk").click();
     const bulkDialog = page.getByRole("dialog");
     await expect(bulkDialog.getByText("Bulk Proxy Assignment")).toBeVisible();
     await bulkDialog.getByTestId("proxy-registry-bulk-scopeids-input").fill("openai,anthropic");

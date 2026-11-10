@@ -8,13 +8,65 @@ type ReadTimeoutOptions = {
 
 export const DEFAULT_FETCH_TIMEOUT_MS = 600_000;
 export const DEFAULT_STREAM_IDLE_TIMEOUT_MS = 600_000;
+// Hard cap on a connected stream's TOTAL lifetime (it never resets on bytes,
+// unlike STREAM_IDLE_TIMEOUT_MS). When STREAM_ACTIVE_TIMEOUT_MS is unset, each
+// stream gets this default, raised for a target that declares a longer budget
+// of its own (connection, per-model or provider-level `timeoutMs`) to that
+// budget plus the margin, so a model allowed to run for its full budget is not
+// killed mid-answer. A positive STREAM_ACTIVE_TIMEOUT_MS is a hard cap that no
+// declared budget can raise; 0 disables the cap. See
+// resolveStreamActiveTimeoutMs in open-sse/handlers/chatCore/upstreamTimeouts.ts.
+// The default is the largest per-model budget (1_200_000ms, the Codex models in
+// open-sse/config/providers/registry/codex) plus a one-minute margin.
+// tests/unit/stream-active-timeout-covers-model-budgets.test.ts re-derives both
+// from the registry (#12913).
+export const MAX_REGISTERED_MODEL_TIMEOUT_MARGIN_MS = 60_000;
+export const DEFAULT_STREAM_ACTIVE_TIMEOUT_MS = 1_260_000;
+export const MAX_TIMER_TIMEOUT_MS = 2_147_483_647;
+export const DEFAULT_SSE_HEARTBEAT_INTERVAL_MS = 15_000;
+export const DEFAULT_STREAM_READINESS_TIMEOUT_MS = 80_000;
+export const DEFAULT_STREAM_READINESS_MAX_TIMEOUT_MS = 180_000;
 export const DEFAULT_FETCH_CONNECT_TIMEOUT_MS = 30_000;
 export const DEFAULT_FETCH_KEEPALIVE_TIMEOUT_MS = 4_000;
-export const DEFAULT_API_BRIDGE_PROXY_TIMEOUT_MS = 30_000;
+export const DEFAULT_API_BRIDGE_PROXY_TIMEOUT_MS = 600_000;
 export const DEFAULT_API_BRIDGE_SERVER_REQUEST_TIMEOUT_MS = 300_000;
 export const DEFAULT_API_BRIDGE_SERVER_HEADERS_TIMEOUT_MS = 60_000;
 export const DEFAULT_API_BRIDGE_SERVER_KEEPALIVE_TIMEOUT_MS = 5_000;
 export const DEFAULT_API_BRIDGE_SERVER_SOCKET_TIMEOUT_MS = 0;
+// Node's http.Server default keepAliveTimeout is 5_000ms with no Keep-Alive
+// response header hint. Pooled keep-alive clients that don't race that exact
+// window (e.g. the JVM java.net.http.HttpClient used by JetBrains AI
+// Assistant) can reuse a socket the server has already torn down, getting 0
+// response bytes back (#7003). Raise both well above any realistic client
+// idle-pool window, mirroring the API bridge server's pattern.
+export const DEFAULT_MAIN_SERVER_KEEPALIVE_TIMEOUT_MS = 65_000;
+export const DEFAULT_MAIN_SERVER_HEADERS_TIMEOUT_MS = 66_000;
+export const DEFAULT_MAIN_SERVER_TCP_KEEPALIVE_MS = 30_000;
+// A client that closes its connection right after reading a fully-completed
+// SSE stream can race OmniRoute's own completion bookkeeping (#9653): the
+// bytes already reached the client, but the disconnect handler can fire
+// before the stream's own completion callback finishes recording it,
+// persisting a false 499 with zero token usage. Before committing to that
+// failure, wait this long for the real completion to land. Set to 0 to
+// disable and restore the old immediate-fail behavior.
+export const DEFAULT_STREAM_DISCONNECT_GRACE_PERIOD_MS = 10_000;
+// #12656 — the wreq-js TLS-fingerprint transport resolves the Response as
+// soon as upstream headers arrive; the only timing guard on the body itself
+// was TlsClient's flat `timeout` (defaults to DEFAULT_FETCH_TIMEOUT_MS =
+// 600_000ms), matching the reporter's observed 90-600s stall range exactly.
+// This bounds time-to-first-byte specifically for that transport so a wedged
+// wreq body falls back fast instead of riding the 10-minute ceiling. Set to
+// 0 to disable the watchdog entirely.
+export const DEFAULT_TLS_FIRST_BYTE_WATCHDOG_MS = 10_000;
+// A streamed Responses request opens with a lifecycle event (response.created) before any
+// generation, so a 2xx Responses stream that stays silent past this window is stalled rather than
+// thinking. Executors that can rotate accounts use it to move on instead of waiting for the
+// readiness timeout. Set to 0 to disable.
+export const DEFAULT_RESPONSES_FIRST_BYTE_TIMEOUT_MS = 15_000;
+// Suggested operator value when enabling the Responses headers-wait bound below.
+// Not an active default: the getters read 0 (off) unless the operator sets the env var.
+export const SUGGESTED_OPENCODE_RESPONSES_HEADERS_WAIT_MS = 30_000;
+export const DEFAULT_OPENCODE_RESPONSES_HEADERS_WAIT_MAX_ROTATIONS = 2;
 
 function hasEnvValue(env: EnvSource, name: string): boolean {
   const raw = env[name];
@@ -24,10 +76,15 @@ function hasEnvValue(env: EnvSource, name: string): boolean {
 export type UpstreamTimeoutConfig = {
   fetchTimeoutMs: number;
   streamIdleTimeoutMs: number;
+  streamActiveTimeoutMs: number;
+  sseHeartbeatIntervalMs: number;
+  streamReadinessTimeoutMs: number;
+  streamReadinessMaxTimeoutMs: number;
   fetchHeadersTimeoutMs: number;
   fetchBodyTimeoutMs: number;
   fetchConnectTimeoutMs: number;
   fetchKeepAliveTimeoutMs: number;
+  streamDisconnectGracePeriodMs: number;
 };
 
 export type TlsClientTimeoutConfig = {
@@ -40,6 +97,12 @@ export type ApiBridgeTimeoutConfig = {
   serverHeadersTimeoutMs: number;
   serverKeepAliveTimeoutMs: number;
   serverSocketTimeoutMs: number;
+};
+
+export type MainServerTimeoutConfig = {
+  keepAliveTimeoutMs: number;
+  headersTimeoutMs: number;
+  tcpKeepAliveInitialDelayMs: number;
 };
 
 function readTimeoutMs(
@@ -58,6 +121,21 @@ function readTimeoutMs(
     return defaultValue;
   }
 
+  return Math.floor(parsed);
+}
+
+/**
+ * The operator's own STREAM_ACTIVE_TIMEOUT_MS, or undefined when it is unset or
+ * invalid (an invalid value falls back to the default, so it counts as unset).
+ * 0 means disabled. Lets the stream resolver tell "operator chose a cap" apart
+ * from "default cap", which getUpstreamTimeoutConfig folds together.
+ */
+export function readStreamActiveTimeoutOverrideMs(
+  env: EnvSource = process.env
+): number | undefined {
+  if (!hasEnvValue(env, "STREAM_ACTIVE_TIMEOUT_MS")) return undefined;
+  const parsed = Number(env.STREAM_ACTIVE_TIMEOUT_MS);
+  if (!Number.isFinite(parsed) || parsed < 0) return undefined;
   return Math.floor(parsed);
 }
 
@@ -89,10 +167,60 @@ export function getUpstreamTimeoutConfig(
       logger,
     }
   );
+  const streamActiveTimeoutMs = readTimeoutMs(
+    env,
+    "STREAM_ACTIVE_TIMEOUT_MS",
+    DEFAULT_STREAM_ACTIVE_TIMEOUT_MS,
+    {
+      allowZero: true,
+      logger,
+    }
+  );
+  const streamReadinessTimeoutMs = readTimeoutMs(
+    env,
+    "STREAM_READINESS_TIMEOUT_MS",
+    sharedRequestTimeoutMs ?? DEFAULT_STREAM_READINESS_TIMEOUT_MS,
+    {
+      allowZero: true,
+      logger,
+    }
+  );
+  const streamReadinessMaxTimeoutMs = readTimeoutMs(
+    env,
+    "STREAM_READINESS_MAX_TIMEOUT_MS",
+    DEFAULT_STREAM_READINESS_MAX_TIMEOUT_MS,
+    {
+      allowZero: true,
+      logger,
+    }
+  );
+  const sseHeartbeatIntervalMs = readTimeoutMs(
+    env,
+    "SSE_HEARTBEAT_INTERVAL_MS",
+    DEFAULT_SSE_HEARTBEAT_INTERVAL_MS,
+    {
+      allowZero: true,
+      logger,
+    }
+  );
+  const streamDisconnectGracePeriodMs = readTimeoutMs(
+    env,
+    "STREAM_DISCONNECT_GRACE_PERIOD_MS",
+    DEFAULT_STREAM_DISCONNECT_GRACE_PERIOD_MS,
+    {
+      allowZero: true,
+      logger,
+    }
+  );
 
   return {
     fetchTimeoutMs,
     streamIdleTimeoutMs,
+    streamActiveTimeoutMs,
+    streamReadinessTimeoutMs,
+    streamReadinessMaxTimeoutMs,
+    sseHeartbeatIntervalMs,
+    streamDisconnectGracePeriodMs,
     fetchHeadersTimeoutMs: readTimeoutMs(env, "FETCH_HEADERS_TIMEOUT_MS", fetchTimeoutMs, {
       allowZero: true,
       logger,
@@ -121,6 +249,14 @@ export function getUpstreamTimeoutConfig(
   };
 }
 
+export function getStainlessTimeoutSeconds(
+  env: EnvSource = process.env,
+  logger?: TimeoutLogger
+): number {
+  const { fetchTimeoutMs } = getUpstreamTimeoutConfig(env, logger);
+  return Math.max(1, Math.ceil(fetchTimeoutMs / 1_000));
+}
+
 export function getTlsClientTimeoutConfig(
   env: EnvSource = process.env,
   logger?: TimeoutLogger
@@ -133,6 +269,53 @@ export function getTlsClientTimeoutConfig(
       logger,
     }),
   };
+}
+
+export function getTlsFirstByteWatchdogMs(
+  env: EnvSource = process.env,
+  logger?: TimeoutLogger
+): number {
+  return readTimeoutMs(env, "TLS_FIRST_BYTE_WATCHDOG_MS", DEFAULT_TLS_FIRST_BYTE_WATCHDOG_MS, {
+    allowZero: true,
+    logger,
+  });
+}
+
+export function getResponsesFirstByteTimeoutMs(
+  env: EnvSource = process.env,
+  logger?: TimeoutLogger
+): number {
+  return readTimeoutMs(
+    env,
+    "RESPONSES_FIRST_BYTE_TIMEOUT_MS",
+    DEFAULT_RESPONSES_FIRST_BYTE_TIMEOUT_MS,
+    { allowZero: true, logger }
+  );
+}
+
+// Bound on waiting for upstream response headers on streamed Responses calls
+// before moving to the next account. Off by default: the read default is 0
+// (unchanged behavior) — SUGGESTED_… is only the documented starting value.
+export function getOpencodeResponsesHeadersWaitMs(
+  env: EnvSource = process.env,
+  logger?: TimeoutLogger
+): number {
+  return readTimeoutMs(env, "OPENCODE_RESPONSES_HEADERS_WAIT_MS", 0, {
+    allowZero: true,
+    logger,
+  });
+}
+
+export function getOpencodeResponsesHeadersWaitMaxRotations(
+  env: EnvSource = process.env,
+  logger?: TimeoutLogger
+): number {
+  return readTimeoutMs(
+    env,
+    "OPENCODE_RESPONSES_HEADERS_WAIT_MAX_ROTATIONS",
+    DEFAULT_OPENCODE_RESPONSES_HEADERS_WAIT_MAX_ROTATIONS,
+    { allowZero: true, logger }
+  );
 }
 
 export function getApiBridgeTimeoutConfig(
@@ -158,6 +341,12 @@ export function getApiBridgeTimeoutConfig(
     proxyTimeoutMs > 0
       ? Math.max(proxyTimeoutMs, DEFAULT_API_BRIDGE_SERVER_REQUEST_TIMEOUT_MS)
       : DEFAULT_API_BRIDGE_SERVER_REQUEST_TIMEOUT_MS;
+  const serverRequestDefaultMs =
+    sharedRequestTimeoutMs !== undefined
+      ? sharedRequestTimeoutMs > 0
+        ? Math.max(sharedRequestTimeoutMs, derivedRequestTimeoutMs)
+        : 0
+      : derivedRequestTimeoutMs;
   const serverKeepAliveTimeoutMs = readTimeoutMs(
     env,
     "API_BRIDGE_SERVER_KEEPALIVE_TIMEOUT_MS",
@@ -182,9 +371,7 @@ export function getApiBridgeTimeoutConfig(
     serverRequestTimeoutMs: readTimeoutMs(
       env,
       "API_BRIDGE_SERVER_REQUEST_TIMEOUT_MS",
-      sharedRequestTimeoutMs
-        ? Math.max(sharedRequestTimeoutMs, derivedRequestTimeoutMs)
-        : derivedRequestTimeoutMs,
+      serverRequestDefaultMs,
       {
         allowZero: true,
         logger,
@@ -204,5 +391,50 @@ export function getApiBridgeTimeoutConfig(
         logger,
       }
     ),
+  };
+}
+
+export function getMainServerTimeoutConfig(
+  env: EnvSource = process.env,
+  logger?: TimeoutLogger
+): MainServerTimeoutConfig {
+  const keepAliveTimeoutMs = readTimeoutMs(
+    env,
+    "MAIN_SERVER_KEEPALIVE_TIMEOUT_MS",
+    DEFAULT_MAIN_SERVER_KEEPALIVE_TIMEOUT_MS,
+    {
+      allowZero: true,
+      logger,
+    }
+  );
+  const headersTimeoutMs = readTimeoutMs(
+    env,
+    "MAIN_SERVER_HEADERS_TIMEOUT_MS",
+    DEFAULT_MAIN_SERVER_HEADERS_TIMEOUT_MS,
+    {
+      allowZero: true,
+      logger,
+    }
+  );
+
+  const tcpKeepAliveInitialDelayMs = readTimeoutMs(
+    env,
+    "MAIN_SERVER_TCP_KEEPALIVE_MS",
+    DEFAULT_MAIN_SERVER_TCP_KEEPALIVE_MS,
+    {
+      allowZero: true,
+      logger,
+    }
+  );
+
+  return {
+    keepAliveTimeoutMs,
+    // Node requires headersTimeout > keepAliveTimeout to avoid its internal
+    // race-condition warning; keep both configurable but always coherent.
+    headersTimeoutMs:
+      headersTimeoutMs > 0 && keepAliveTimeoutMs > 0
+        ? Math.max(headersTimeoutMs, keepAliveTimeoutMs + 1_000)
+        : headersTimeoutMs,
+    tcpKeepAliveInitialDelayMs,
   };
 }

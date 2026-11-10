@@ -1,24 +1,57 @@
-import { KIMI_CODING_CONFIG } from "../constants/oauth";
 import { randomUUID } from "crypto";
-import { hostname } from "os";
+import fs from "fs";
+import { hostname, release } from "os";
+import path from "path";
+import {
+  buildKimiCodeIdentityHeaders,
+  normalizeKimiDeviceId,
+  sanitizeKimiHeaderValue,
+} from "@omniroute/open-sse/config/providers/registry/kimi/coding/runtime.ts";
+import { getKimiDeviceModel } from "@omniroute/open-sse/utils/kimiDevice.ts";
+import { resolveDataDir } from "../../dataPaths";
+import { KIMI_CODING_CONFIG } from "../constants/oauth";
 
-// Generate device ID (persistent per installation)
-const DEVICE_ID = randomUUID();
-const PLATFORM = "omniroute";
-const VERSION = "2.1.2";
-const DEVICE_NAME = hostname();
-const DEVICE_MODEL = `${process.platform} ${process.arch}`;
+const DEVICE_ID_FILE = "kimi-coding-device-id";
+
+function generateDeviceId() {
+  return randomUUID();
+}
+
+function getKimiDeviceId() {
+  const configured = process.env.KIMI_CODING_DEVICE_ID?.trim();
+  if (configured) return configured;
+
+  try {
+    const oauthDir = path.join(resolveDataDir(), "oauth");
+    const devicePath = path.join(oauthDir, DEVICE_ID_FILE);
+    if (fs.existsSync(devicePath)) {
+      const existing = fs.readFileSync(devicePath, "utf8").trim();
+      if (existing) return normalizeKimiDeviceId(existing);
+    }
+
+    fs.mkdirSync(oauthDir, { recursive: true });
+    const deviceId = generateDeviceId();
+    fs.writeFileSync(devicePath, deviceId, { encoding: "utf8", mode: 0o600 });
+    try {
+      fs.chmodSync(devicePath, 0o600);
+    } catch {}
+    return deviceId;
+  } catch {
+    return generateDeviceId();
+  }
+}
 
 // Custom headers required by Kimi OAuth
 function getKimiOAuthHeaders() {
   return {
     "Content-Type": "application/x-www-form-urlencoded",
     Accept: "application/json",
-    "X-Msh-Platform": PLATFORM,
-    "X-Msh-Version": VERSION,
-    "X-Msh-Device-Name": DEVICE_NAME,
-    "X-Msh-Device-Model": DEVICE_MODEL,
-    "X-Msh-Device-Id": DEVICE_ID,
+    ...buildKimiCodeIdentityHeaders({
+      deviceId: getKimiDeviceId(),
+      deviceName: hostname(),
+      deviceModel: getKimiDeviceModel(),
+      osVersion: release(),
+    }),
   };
 }
 
@@ -40,13 +73,16 @@ export const kimiCoding = {
     }
 
     const data = await response.json();
+    if (!data?.device_code) throw new Error("Device authorization response missing device_code");
+    if (!data?.user_code) throw new Error("Device authorization response missing user_code");
+    if (!data?.verification_uri_complete) {
+      throw new Error("Device authorization response missing verification_uri_complete");
+    }
     return {
       device_code: data.device_code,
       user_code: data.user_code,
-      verification_uri: data.verification_uri || `https://auth.kimi.com/activate`,
-      verification_uri_complete:
-        data.verification_uri_complete ||
-        `https://auth.kimi.com/activate?user_code=${data.user_code}`,
+      verification_uri: data.verification_uri || "",
+      verification_uri_complete: data.verification_uri_complete,
       expires_in: data.expires_in,
       interval: data.interval || 5,
     };
@@ -62,11 +98,14 @@ export const kimiCoding = {
       }),
     });
 
+    // Read the body once: after a failed response.json() the stream is already
+    // consumed, so a fallback response.text() would throw "Body is unusable"
+    // and reject pollToken instead of surfacing the upstream error page.
+    const text = await response.text();
     let data;
     try {
-      data = await response.json();
-    } catch (e) {
-      const text = await response.text();
+      data = JSON.parse(text);
+    } catch {
       data = { error: "invalid_response", error_description: text };
     }
 
@@ -81,5 +120,16 @@ export const kimiCoding = {
     expiresIn: tokens.expires_in,
     tokenType: tokens.token_type,
     scope: tokens.scope,
+    // Persist the device identity at login so refreshes use the SAME deviceId
+    // the device-code grant was issued against. Without this, tokenRefresh.ts
+    // falls back to pbkdf2(refresh_token, ...) — and Kimi rotates refresh_tokens
+    // per refresh, so the derived id changes every cycle and the anti-bot
+    // pipeline treats each refresh as a new device.
+    providerSpecificData: {
+      deviceId: getKimiDeviceId(),
+      deviceName: sanitizeKimiHeaderValue(hostname()),
+      deviceModel: sanitizeKimiHeaderValue(getKimiDeviceModel()),
+      osVersion: sanitizeKimiHeaderValue(release()),
+    },
   }),
 };

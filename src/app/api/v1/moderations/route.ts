@@ -1,17 +1,24 @@
-import { CORS_ORIGIN } from "@/shared/utils/cors";
 import { handleModeration } from "@omniroute/open-sse/handlers/moderations.ts";
 import {
-  getProviderCredentials,
+  getProviderCredentialsWithQuotaPreflight,
   clearRecoveredProviderState,
-  extractApiKey,
-  isValidApiKey,
 } from "@/sse/services/auth";
+import { withInjectionGuard } from "@/middleware/promptInjectionGuard";
 import { parseModerationModel } from "@omniroute/open-sse/config/moderationRegistry.ts";
 import { errorResponse } from "@omniroute/open-sse/utils/error.ts";
 import { HTTP_STATUS } from "@omniroute/open-sse/config/constants.ts";
 import { enforceApiKeyPolicy } from "@/shared/utils/apiKeyPolicy";
+import {
+  isKeyScopeBlockedCredentials,
+  keyScopeBlockedResponse,
+  resolveKeyConnectionScope,
+} from "@/sse/services/keyConnectionScope";
 import { v1ModerationSchema } from "@/shared/validation/schemas";
 import { isValidationFailure, validateBody } from "@/shared/validation/helpers";
+import {
+  isAllRateLimitedCredentials,
+  rateLimitedProviderResponse,
+} from "@/app/api/v1/_shared/rateLimit";
 
 /**
  * Handle CORS preflight
@@ -19,7 +26,6 @@ import { isValidationFailure, validateBody } from "@/shared/validation/helpers";
 export async function OPTIONS() {
   return new Response(null, {
     headers: {
-      "Access-Control-Allow-Origin": CORS_ORIGIN,
       "Access-Control-Allow-Methods": "POST, OPTIONS",
       "Access-Control-Allow-Headers": "*",
     },
@@ -30,14 +36,7 @@ export async function OPTIONS() {
  * POST /v1/moderations — content moderation
  * OpenAI Moderations API compatible.
  */
-export async function POST(request) {
-  if (process.env.REQUIRE_API_KEY === "true") {
-    const apiKey = extractApiKey(request);
-    if (!apiKey) return errorResponse(HTTP_STATUS.UNAUTHORIZED, "Missing API key");
-    const valid = await isValidApiKey(apiKey);
-    if (!valid) return errorResponse(HTTP_STATUS.UNAUTHORIZED, "Invalid API key");
-  }
-
+async function postHandler(request, context) {
   let rawBody;
   try {
     rawBody = await request.json();
@@ -56,22 +55,38 @@ export async function POST(request) {
   // Enforce API key policies (model restrictions + budget limits)
   const policy = await enforceApiKeyPolicy(request, model);
   if (policy.rejection) return policy.rejection;
+  // GHSA-3w2r: credential selection stays inside the key's connection scope,
+  // the same scope chat applies.
+  const scope = await resolveKeyConnectionScope(policy.apiKeyInfo);
+  if (scope.rejection) return scope.rejection;
 
   const { provider } = parseModerationModel(model);
 
   // Default to openai if no provider prefix
   const resolvedProvider = provider || "openai";
-  const credentials = await getProviderCredentials(resolvedProvider);
+  const credentials = await getProviderCredentialsWithQuotaPreflight(
+    resolvedProvider,
+    null,
+    scope.allowedConnections
+  );
   if (!credentials) {
     return errorResponse(
       HTTP_STATUS.BAD_REQUEST,
       `No credentials for provider: ${resolvedProvider}`
     );
   }
+  if (isKeyScopeBlockedCredentials(credentials)) {
+    return keyScopeBlockedResponse(resolvedProvider, credentials);
+  }
+  if (isAllRateLimitedCredentials(credentials)) {
+    return rateLimitedProviderResponse(resolvedProvider, credentials);
+  }
 
   const response = await handleModeration({ body: { ...body, model }, credentials });
   if (response?.ok) {
-    await clearRecoveredProviderState(credentials);
+    await clearRecoveredProviderState(credentials as Record<string, unknown>);
   }
   return response;
 }
+
+export const POST = withInjectionGuard(postHandler);

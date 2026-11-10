@@ -1,8 +1,42 @@
 "use client";
 
-import { useState, useEffect, useRef } from "react";
-import { Card, Button, Badge } from "@/shared/components";
+import { useState, useEffect, useCallback, useRef } from "react";
 import { useLocale, useTranslations } from "next-intl";
+import { Card, Button, Badge, Checkbox, ConfirmModal, Input, Select } from "@/shared/components";
+import Icon from "@/shared/components/Icon";
+import { Spinner } from "@/shared/components/Loading";
+import DatabaseBackupRetentionCard from "./DatabaseBackupRetentionCard";
+import ProviderTransferPanel from "./ProviderTransferPanel";
+import {
+  fetchDatabaseSettingsData,
+  isAuthRequiredResponse,
+  AuthRequiredBanner,
+} from "./systemStorageAuth";
+import { extractApiErrorMessage } from "@/shared/http/apiErrorMessage";
+
+// Whitelist mirrored from src/lib/db/cleanup.ts::RESET_USAGE_HISTORY_PERIODS.
+const RESET_USAGE_PERIOD_VALUES = [
+  "5m",
+  "1h",
+  "3h",
+  "6h",
+  "12h",
+  "1d",
+  "7d",
+  "30d",
+  "all",
+] as const;
+
+async function fetchStorageHealthData() {
+  try {
+    const res = await fetch("/api/storage/health");
+    if (!res.ok) return null;
+    return await res.json();
+  } catch (err) {
+    console.error("Failed to fetch storage health:", err);
+    return null;
+  }
+}
 
 export default function SystemStorageTab() {
   const [backups, setBackups] = useState([]);
@@ -22,6 +56,25 @@ export default function SystemStorageTab() {
   const [clearCacheStatus, setClearCacheStatus] = useState({ type: "", message: "" });
   const [purgeLogsLoading, setPurgeLogsLoading] = useState(false);
   const [purgeLogsStatus, setPurgeLogsStatus] = useState({ type: "", message: "" });
+  const [manualVacuumLoading, setManualVacuumLoading] = useState(false);
+  const [manualVacuumStatus, setManualVacuumStatus] = useState({ type: "", message: "" });
+  const [cleanupBackupsLoading, setCleanupBackupsLoading] = useState(false);
+  const [cleanupBackupsStatus, setCleanupBackupsStatus] = useState({ type: "", message: "" });
+  const [saveBackupRetentionLoading, setSaveBackupRetentionLoading] = useState(false);
+  const [backupRetentionStatus, setBackupRetentionStatus] = useState({ type: "", message: "" });
+  const [purgeQuotaSnapshotsLoading, setPurgeQuotaSnapshotsLoading] = useState(false);
+  const [purgeQuotaSnapshotsStatus, setPurgeQuotaSnapshotsStatus] = useState({
+    type: "",
+    message: "",
+  });
+  const [purgeCallLogsLoading, setPurgeCallLogsLoading] = useState(false);
+  const [purgeCallLogsStatus, setPurgeCallLogsStatus] = useState({ type: "", message: "" });
+  const [purgeDetailedLogsLoading, setPurgeDetailedLogsLoading] = useState(false);
+  const [purgeDetailedLogsStatus, setPurgeDetailedLogsStatus] = useState({ type: "", message: "" });
+  const [resetUsageModalOpen, setResetUsageModalOpen] = useState(false);
+  const [resetUsagePeriod, setResetUsagePeriod] = useState("all");
+  const [resetUsageLoading, setResetUsageLoading] = useState(false);
+  const [resetUsageStatus, setResetUsageStatus] = useState({ type: "", message: "" });
   const fileInputRef = useRef<HTMLInputElement>(null);
   const jsonInputRef = useRef<HTMLInputElement>(null);
   const locale = useLocale();
@@ -39,8 +92,24 @@ export default function SystemStorageTab() {
       callLogs: 100000,
       proxyLogs: 100000,
     },
+    backupCount: 0,
+    backupRetention: {
+      maxFiles: 20,
+      days: 0,
+    },
     lastBackupAt: null,
   });
+  const [backupCleanupOptions, setBackupCleanupOptions] = useState({
+    keepLatest: 20,
+    retentionDays: 0,
+  });
+
+  // Database settings state (tasks 23-26)
+  const [dbSettings, setDbSettings] = useState<any>(null);
+  const [dbSettingsLoading, setDbSettingsLoading] = useState(true);
+  const [dbSettingsAuthRequired, setDbSettingsAuthRequired] = useState(false);
+  const [dbSettingsSaving, setDbSettingsSaving] = useState(false);
+  const [dbStatsRefreshing, setDbStatsRefreshing] = useState(false);
 
   const loadBackups = async () => {
     setBackupsLoading(true);
@@ -55,14 +124,310 @@ export default function SystemStorageTab() {
     }
   };
 
+  const applyStorageHealth = useCallback((data) => {
+    if (!data) return;
+    setStorageHealth((prev) => ({ ...prev, ...data }));
+    setBackupCleanupOptions({
+      keepLatest: data.backupRetention?.maxFiles || 20,
+      retentionDays: data.backupRetention?.days || 0,
+    });
+  }, []);
+
   const loadStorageHealth = async () => {
+    applyStorageHealth(await fetchStorageHealthData());
+  };
+
+  const applyDatabaseSettings = useCallback((result: { data: any; authRequired: boolean }) => {
+    if (result.data) setDbSettings(result.data);
+    setDbSettingsAuthRequired(result.authRequired);
+    setDbSettingsLoading(false);
+  }, []);
+
+  const loadDatabaseSettings = async () => {
+    setDbSettingsLoading(true);
+    applyDatabaseSettings(await fetchDatabaseSettingsData());
+  };
+
+  const saveDatabaseSettings = async () => {
+    if (!dbSettings) return;
+    setDbSettingsSaving(true);
     try {
-      const res = await fetch("/api/storage/health");
-      if (!res.ok) return;
-      const data = await res.json();
-      setStorageHealth((prev) => ({ ...prev, ...data }));
+      const { logs, backup, cache, retention, aggregation, optimization } = dbSettings;
+      const res = await fetch("/api/settings/database", {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ logs, backup, cache, retention, aggregation, optimization }),
+      });
+      if (res.ok) {
+        await loadDatabaseSettings();
+      }
     } catch (err) {
-      console.error("Failed to fetch storage health:", err);
+      console.error("Failed to save database settings:", err);
+    } finally {
+      setDbSettingsSaving(false);
+    }
+  };
+
+  const refreshDatabaseStats = async () => {
+    setDbStatsRefreshing(true);
+    try {
+      await fetch("/api/settings/database/refresh-stats", { method: "POST" });
+      await loadDatabaseSettings();
+    } catch (err) {
+      console.error("Failed to refresh database stats:", err);
+    } finally {
+      setDbStatsRefreshing(false);
+    }
+  };
+
+  const handleSaveBackupRetention = async () => {
+    setSaveBackupRetentionLoading(true);
+    setBackupRetentionStatus({ type: "", message: "" });
+    try {
+      const res = await fetch("/api/db-backups", {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(backupCleanupOptions),
+      });
+      const data = await res.json();
+      if (res.ok) {
+        setBackupRetentionStatus({
+          type: "success",
+          message: t("backupRetentionSaved"),
+        });
+        await loadStorageHealth();
+      } else {
+        setBackupRetentionStatus({
+          type: "error",
+          message: extractApiErrorMessage(data, t("backupRetentionSaveFailed")),
+        });
+      }
+    } catch {
+      setBackupRetentionStatus({ type: "error", message: t("errorOccurred") });
+    } finally {
+      setSaveBackupRetentionLoading(false);
+    }
+  };
+
+  const handleCleanupBackups = async () => {
+    setCleanupBackupsLoading(true);
+    setCleanupBackupsStatus({ type: "", message: "" });
+    try {
+      const res = await fetch("/api/db-backups", {
+        method: "DELETE",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(backupCleanupOptions),
+      });
+      const data = await res.json();
+      if (res.ok) {
+        setCleanupBackupsStatus({
+          type: "success",
+          message: t("backupCleanupSuccess", {
+            backups: data.deletedBackupFamilies,
+            files: data.deletedFiles,
+          }),
+        });
+        await loadStorageHealth();
+        if (backupsExpanded) await loadBackups();
+      } else {
+        setCleanupBackupsStatus({
+          type: "error",
+          message: extractApiErrorMessage(data, t("backupCleanupFailed")),
+        });
+      }
+    } catch {
+      setCleanupBackupsStatus({ type: "error", message: t("errorOccurred") });
+    } finally {
+      setCleanupBackupsLoading(false);
+    }
+  };
+
+  const handleClearCache = async () => {
+    setClearCacheLoading(true);
+    setClearCacheStatus({ type: "", message: "" });
+    try {
+      const res = await fetch("/api/cache", { method: "DELETE" });
+      const data = await res.json().catch(() => null);
+      if (res.ok) {
+        setClearCacheStatus({
+          type: "success",
+          message: t("cacheCleared"),
+        });
+      } else {
+        setClearCacheStatus({
+          type: "error",
+          message: extractApiErrorMessage(data, t("clearCacheFailed")),
+        });
+      }
+    } catch {
+      setClearCacheStatus({ type: "error", message: t("errorOccurred") });
+    } finally {
+      setClearCacheLoading(false);
+    }
+  };
+
+  const handlePurgeExpiredLogs = async () => {
+    setPurgeLogsLoading(true);
+    setPurgeLogsStatus({ type: "", message: "" });
+    try {
+      const res = await fetch("/api/settings/purge-logs", { method: "POST" });
+      const data = await res.json().catch(() => null);
+      if (res.ok) {
+        const deleted = data?.deleted ?? 0;
+        setPurgeLogsStatus({
+          type: "success",
+          message: t("logsDeleted", { count: deleted }),
+        });
+      } else {
+        setPurgeLogsStatus({
+          type: "error",
+          message: extractApiErrorMessage(data, t("purgeLogsFailed")),
+        });
+      }
+    } catch {
+      setPurgeLogsStatus({ type: "error", message: t("errorOccurred") });
+    } finally {
+      setPurgeLogsLoading(false);
+    }
+  };
+
+  const handlePurgeQuotaSnapshots = async () => {
+    setPurgeQuotaSnapshotsLoading(true);
+    setPurgeQuotaSnapshotsStatus({ type: "", message: "" });
+    try {
+      const res = await fetch("/api/settings/purge-quota-snapshots", { method: "POST" });
+      const data = await res.json();
+      if (res.ok) {
+        setPurgeQuotaSnapshotsStatus({
+          type: "success",
+          message: t("purgeQuotaSnapshotsSuccess", { count: data.deleted }),
+        });
+      } else {
+        setPurgeQuotaSnapshotsStatus({
+          type: "error",
+          message: extractApiErrorMessage(data, t("purgeQuotaSnapshotsFailed")),
+        });
+      }
+    } catch {
+      setPurgeQuotaSnapshotsStatus({ type: "error", message: t("errorOccurred") });
+    } finally {
+      setPurgeQuotaSnapshotsLoading(false);
+    }
+  };
+
+  const handlePurgeCallLogs = async () => {
+    setPurgeCallLogsLoading(true);
+    setPurgeCallLogsStatus({ type: "", message: "" });
+    try {
+      const res = await fetch("/api/settings/purge-call-logs", { method: "POST" });
+      const data = await res.json();
+      if (res.ok) {
+        setPurgeCallLogsStatus({
+          type: "success",
+          message: t("purgeCallLogsSuccess", { count: data.deleted }),
+        });
+      } else {
+        setPurgeCallLogsStatus({
+          type: "error",
+          message: extractApiErrorMessage(data, t("purgeCallLogsFailed")),
+        });
+      }
+    } catch {
+      setPurgeCallLogsStatus({ type: "error", message: t("errorOccurred") });
+    } finally {
+      setPurgeCallLogsLoading(false);
+    }
+  };
+
+  const handlePurgeDetailedLogs = async () => {
+    setPurgeDetailedLogsLoading(true);
+    setPurgeDetailedLogsStatus({ type: "", message: "" });
+    try {
+      const res = await fetch("/api/settings/purge-detailed-logs", { method: "POST" });
+      const data = await res.json();
+      if (res.ok) {
+        setPurgeDetailedLogsStatus({
+          type: "success",
+          message: t("purgeDetailedLogsSuccess", { count: data.deleted }),
+        });
+      } else {
+        setPurgeDetailedLogsStatus({
+          type: "error",
+          message: extractApiErrorMessage(data, t("purgeDetailedLogsFailed")),
+        });
+      }
+    } catch {
+      setPurgeDetailedLogsStatus({ type: "error", message: t("errorOccurred") });
+    } finally {
+      setPurgeDetailedLogsLoading(false);
+    }
+  };
+
+  const handleResetUsageHistory = async () => {
+    setResetUsageLoading(true);
+    setResetUsageStatus({ type: "", message: "" });
+    try {
+      const res = await fetch("/api/settings/purge-usage-history", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ period: resetUsagePeriod }),
+      });
+      const data = await res.json().catch(() => null);
+      if (res.ok) {
+        const deleted = data?.deleted ?? 0;
+        setResetUsageStatus({
+          type: "success",
+          message:
+            t("resetUsageSuccess", { count: deleted }) ||
+            `Usage data reset (${deleted} row(s) deleted).`,
+        });
+        setResetUsageModalOpen(false);
+      } else {
+        setResetUsageStatus({
+          type: "error",
+          message:
+            data?.error?.message ||
+            (typeof data?.error === "string" ? data.error : null) ||
+            t("resetUsageFailed") ||
+            "Failed to reset usage data",
+        });
+      }
+    } catch {
+      setResetUsageStatus({ type: "error", message: t("errorOccurred") });
+    } finally {
+      setResetUsageLoading(false);
+    }
+  };
+
+  const openResetUsageModal = () => {
+    setResetUsagePeriod("all");
+    setResetUsageStatus({ type: "", message: "" });
+    setResetUsageModalOpen(true);
+  };
+
+  const handleManualVacuum = async () => {
+    setManualVacuumLoading(true);
+    setManualVacuumStatus({ type: "", message: "" });
+    try {
+      const res = await fetch("/api/settings/database/vacuum", { method: "POST" });
+      const data = await res.json().catch(() => null);
+      if (res.ok && data?.success !== false) {
+        setManualVacuumStatus({
+          type: "success",
+          message: data?.message || t("vacuumCompleted"),
+        });
+        await loadDatabaseSettings();
+        await loadStorageHealth();
+      } else {
+        setManualVacuumStatus({
+          type: "error",
+          message: extractApiErrorMessage(data, t("vacuumFailed")),
+        });
+      }
+    } catch {
+      setManualVacuumStatus({ type: "error", message: t("errorOccurred") });
+    } finally {
+      setManualVacuumLoading(false);
     }
   };
 
@@ -87,7 +452,10 @@ export default function SystemStorageTab() {
         await loadStorageHealth();
         if (backupsExpanded) await loadBackups();
       } else {
-        setManualBackupStatus({ type: "error", message: data.error || t("backupFailed") });
+        setManualBackupStatus({
+          type: "error",
+          message: extractApiErrorMessage(data, t("backupFailed")),
+        });
       }
     } catch {
       setManualBackupStatus({ type: "error", message: t("errorOccurred") });
@@ -119,7 +487,10 @@ export default function SystemStorageTab() {
         await loadBackups();
         await loadStorageHealth();
       } else {
-        setRestoreStatus({ type: "error", message: data.error || t("restoreFailed") });
+        setRestoreStatus({
+          type: "error",
+          message: extractApiErrorMessage(data, t("restoreFailed")),
+        });
       }
     } catch {
       setRestoreStatus({ type: "error", message: t("errorDuringRestore") });
@@ -130,8 +501,19 @@ export default function SystemStorageTab() {
   };
 
   useEffect(() => {
-    loadStorageHealth();
-  }, []);
+    let cancelled = false;
+    void (async () => {
+      const data = await fetchStorageHealthData();
+      if (!cancelled) applyStorageHealth(data);
+    })();
+    void (async () => {
+      const data = await fetchDatabaseSettingsData();
+      if (!cancelled) applyDatabaseSettings(data);
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [applyStorageHealth, applyDatabaseSettings]);
 
   /** Triggers a browser file download from an existing Blob. */
   const triggerDownload = (blob: Blob, filename: string) => {
@@ -154,7 +536,7 @@ export default function SystemStorageTab() {
     const res = await fetch(apiUrl);
     if (!res.ok) {
       const data = await res.json().catch(() => ({}));
-      throw new Error((data as { error?: string }).error || errorMessage);
+      throw new Error(extractApiErrorMessage(data, errorMessage));
     }
     const blob = await res.blob();
     const disposition = res.headers.get("Content-Disposition") || "";
@@ -168,7 +550,7 @@ export default function SystemStorageTab() {
       await fetchAndDownload(
         "/api/settings/export-json",
         `omniroute-legacy-backup-${new Date().toISOString().replace(/[:.]/g, "-")}.json`,
-        "JSON Export failed"
+        t("jsonExportFailed")
       );
     } catch (err) {
       console.error("Export JSON failed:", err);
@@ -191,7 +573,7 @@ export default function SystemStorageTab() {
     if (!file.name.endsWith(".json")) {
       setImportStatus({
         type: "error",
-        message: "Invalid file type. Only .json allowed.",
+        message: t("invalidJsonFileType"),
       });
       return;
     }
@@ -210,15 +592,20 @@ export default function SystemStorageTab() {
         if (res.ok) {
           setImportStatus({
             type: "success",
-            message: data.message || "Legacy JSON imported successfully!",
+            message: data.message || t("legacyJsonImportSuccess"),
           });
           await loadStorageHealth();
           if (backupsExpanded) await loadBackups();
+        } else if (isAuthRequiredResponse(res.status, data)) {
+          setImportStatus({ type: "error", message: t("jsonImportAuthRequired") });
         } else {
-          setImportStatus({ type: "error", message: data.error || "Failed to import JSON" });
+          setImportStatus({
+            type: "error",
+            message: extractApiErrorMessage(data, t("jsonImportFailed")),
+          });
         }
-      } catch (err) {
-        setImportStatus({ type: "error", message: "Error during JSON import" });
+      } catch {
+        setImportStatus({ type: "error", message: t("jsonImportError") });
       } finally {
         setImportLoading(false);
         if (jsonInputRef.current) jsonInputRef.current.value = "";
@@ -294,7 +681,10 @@ export default function SystemStorageTab() {
         await loadStorageHealth();
         if (backupsExpanded) await loadBackups();
       } else {
-        setImportStatus({ type: "error", message: data.error || t("importFailed") });
+        setImportStatus({
+          type: "error",
+          message: extractApiErrorMessage(data, t("importFailed")),
+        });
       }
     } catch {
       setImportStatus({ type: "error", message: t("errorDuringImport") });
@@ -336,25 +726,501 @@ export default function SystemStorageTab() {
     return reason;
   };
 
+  const renderStatusAlert = (status, index) => {
+    if (!status.message) return null;
+    const isInfo = status.type === "info";
+    const isSuccess = status.type === "success";
+    const className =
+      "p-3 rounded-lg text-sm " +
+      (isSuccess
+        ? "bg-success/10 text-success border border-success/20"
+        : isInfo
+          ? "bg-info/10 text-info border border-info/20"
+          : "bg-error/10 text-error border border-error/20");
+
+    return (
+      <div key={index} className={className} role="alert">
+        <div className="flex items-center gap-2">
+          <Icon name={isSuccess ? "check_circle" : isInfo ? "info" : "error"} size={16} />
+          {status.message}
+        </div>
+      </div>
+    );
+  };
+
+  const renderDatabaseStatistics = () => {
+    if (dbSettingsLoading || !dbSettings?.stats) return null;
+
+    return (
+      <div className="mb-4 p-4 rounded-lg border border-border bg-bg">
+        <div className="flex items-center justify-between gap-3 mb-3">
+          <h4 className="text-sm font-semibold flex items-center gap-2">
+            <Icon name="analytics" size={18} />
+            {t("storageDatabaseStatistics")}
+          </h4>
+          <Button
+            icon="refresh"
+            variant="outline"
+            size="sm"
+            onClick={refreshDatabaseStats}
+            loading={dbStatsRefreshing}
+          >
+            {t("refresh")}
+          </Button>
+        </div>
+        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
+          <div className="p-3 rounded-lg bg-bg-subtle">
+            <p className="text-xs text-text-muted mb-1">{t("storageDatabaseSize")}</p>
+            <p className="text-sm font-semibold">
+              {formatBytes(dbSettings.stats.databaseSizeBytes)}
+            </p>
+          </div>
+          <div className="p-3 rounded-lg bg-bg-subtle">
+            <p className="text-xs text-text-muted mb-1">{t("storagePageCount")}</p>
+            <p className="text-sm font-semibold">{dbSettings.stats.pageCount.toLocaleString()}</p>
+          </div>
+          <div className="p-3 rounded-lg bg-bg-subtle">
+            <p className="text-xs text-text-muted mb-1">{t("storageFreelistCount")}</p>
+            <p className="text-sm font-semibold">
+              {dbSettings.stats.freelistCount.toLocaleString()}
+            </p>
+          </div>
+          <div className="p-3 rounded-lg bg-bg-subtle">
+            <p className="text-xs text-text-muted mb-1">{t("storageLastVacuum")}</p>
+            <p className="text-sm font-semibold">
+              {dbSettings.stats.lastVacuumAt
+                ? new Date(dbSettings.stats.lastVacuumAt).toLocaleString(locale)
+                : t("never")}
+            </p>
+          </div>
+          <div className="p-3 rounded-lg bg-bg-subtle">
+            <p className="text-xs text-text-muted mb-1">{t("storageLastOptimization")}</p>
+            <p className="text-sm font-semibold">
+              {dbSettings.stats.lastOptimizationAt
+                ? new Date(dbSettings.stats.lastOptimizationAt).toLocaleString(locale)
+                : t("never")}
+            </p>
+          </div>
+          <div className="p-3 rounded-lg bg-bg-subtle">
+            <p className="text-xs text-text-muted mb-1">{t("storageIntegrityCheck")}</p>
+            <p className="text-sm font-semibold">
+              {dbSettings.stats.integrityCheck === "ok" ? (
+                <span className="text-success">{t("storageIntegrityOk")}</span>
+              ) : dbSettings.stats.integrityCheck === "error" ? (
+                <span className="text-error">{t("storageIntegrityError")}</span>
+              ) : (
+                t("storageIntegrityNotChecked")
+              )}
+            </p>
+          </div>
+        </div>
+      </div>
+    );
+  };
+
+  const renderBackupList = () => {
+    if (!backupsExpanded) return null;
+
+    return (
+      <div className="flex flex-col gap-2 mt-3">
+        {backupsLoading ? (
+          <div role="status" className="flex items-center justify-center py-6 text-text-muted">
+            <Spinner decorative size="sm" className="mr-2" />
+            {t("loadingBackups")}
+          </div>
+        ) : backups.length === 0 ? (
+          <div className="text-center py-6 text-text-muted text-sm">
+            <Icon name="folder_off" size={32} className="mb-2 block opacity-40" />
+            {t("noBackupsYet")}
+          </div>
+        ) : (
+          <>
+            <div className="flex items-center justify-between mb-1">
+              <span className="text-xs text-text-muted">
+                {t("backupsAvailable", { count: backups.length })}
+              </span>
+              <Button variant="ghost" size="sm" icon="refresh" onClick={loadBackups}>
+                {t("refresh")}
+              </Button>
+            </div>
+            {backups.map((backup) => (
+              <div
+                key={backup.id}
+                className="flex items-center justify-between p-3 rounded-lg bg-bg-subtle border border-border/50 hover:border-border transition-colors"
+              >
+                <div className="flex-1 min-w-0">
+                  <div className="flex items-center gap-2 mb-1">
+                    <Icon name="description" size={16} className="text-warning" />
+                    <span className="text-sm font-medium truncate">
+                      {new Date(backup.createdAt).toLocaleString(locale)}
+                    </span>
+                    <Badge
+                      variant={
+                        backup.reason === "pre-restore"
+                          ? "warning"
+                          : backup.reason === "manual"
+                            ? "success"
+                            : "default"
+                      }
+                      size="sm"
+                    >
+                      {formatBackupReason(backup.reason)}
+                    </Badge>
+                  </div>
+                  <div className="flex items-center gap-3 text-xs text-text-muted ml-6">
+                    <span>{t("connectionsCount", { count: backup.connectionCount })}</span>
+                    <span>•</span>
+                    <span>{formatBytes(backup.size)}</span>
+                  </div>
+                </div>
+                <div className="flex items-center gap-2 ml-3">
+                  {confirmRestoreId === backup.id ? (
+                    <>
+                      <span className="text-xs text-warning font-medium">{t("confirm")}</span>
+                      <Button
+                        variant="warning"
+                        size="sm"
+                        onClick={() => handleRestore(backup.id)}
+                        loading={restoringId === backup.id}
+                      >
+                        {t("yes")}
+                      </Button>
+                      <Button variant="outline" size="sm" onClick={() => setConfirmRestoreId(null)}>
+                        {t("no")}
+                      </Button>
+                    </>
+                  ) : (
+                    <Button
+                      icon="restore"
+                      variant="outline"
+                      size="sm"
+                      onClick={() => setConfirmRestoreId(backup.id)}
+                    >
+                      {t("restore")}
+                    </Button>
+                  )}
+                </div>
+              </div>
+            ))}
+          </>
+        )}
+      </div>
+    );
+  };
+
+  const renderRetentionSettings = () => {
+    if (dbSettingsLoading || !dbSettings) return null;
+
+    const retentionFields = [
+      ["quotaSnapshots", t("retentionQuotaSnapshots"), 7],
+      ["compressionAnalytics", t("retentionCompressionAnalytics"), 30],
+      ["mcpAudit", t("retentionMcpAudit"), 30],
+      ["a2aEvents", t("retentionA2aEvents"), 30],
+      ["callLogs", t("retentionCallLogs"), 30],
+      ["conversationTurnNodes", t("retentionConversationTurnNodes"), 30],
+      ["usageHistory", t("retentionUsageHistory"), 30],
+      ["memoryEntries", t("retentionMemoryEntries"), 30],
+      ["xpAuditLog", t("retentionXpAuditLog"), 30],
+    ];
+
+    return (
+      <div className="mt-6 p-4 rounded-lg border border-border bg-bg">
+        <div className="flex items-start justify-between gap-3 flex-wrap mb-3">
+          <div>
+            <h4 className="text-sm font-semibold flex items-center gap-2">
+              <Icon name="schedule" size={18} />
+              {t("storageRetentionCleanup")}
+            </h4>
+            <p className="mt-1 text-xs text-text-muted">{t("storageRetentionCleanupDesc")}</p>
+          </div>
+          <div className="flex items-center gap-2">
+            <Badge variant="default" size="sm">
+              {t("retentionCallDays", { count: storageHealth.retentionDays.call })}
+            </Badge>
+            <Badge variant="default" size="sm">
+              {t("retentionAppDays", { count: storageHealth.retentionDays.app })}
+            </Badge>
+            <Badge variant="default" size="sm">
+              {t("retentionRows", {
+                count: (storageHealth.tableMaxRows?.callLogs ?? 100000).toLocaleString(),
+              })}
+            </Badge>
+          </div>
+        </div>
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+          {retentionFields.map(([key, label, fallback]) => (
+            <Input
+              key={String(key)}
+              label={label}
+              type="number"
+              min="1"
+              max="365"
+              value={dbSettings.retention[key]}
+              onChange={(e) =>
+                setDbSettings({
+                  ...dbSettings,
+                  retention: {
+                    ...dbSettings.retention,
+                    [key]: parseInt(e.target.value) || fallback,
+                  },
+                })
+              }
+            />
+          ))}
+        </div>
+        <div className="mt-3">
+          <Button
+            variant="primary"
+            size="sm"
+            onClick={saveDatabaseSettings}
+            loading={dbSettingsSaving}
+          >
+            {t("saveRetentionSettings")}
+          </Button>
+        </div>
+        <div className="mt-5 border-t border-border/50 pt-4">
+          <DatabaseBackupRetentionCard
+            title={t("storageDatabaseBackups")}
+            className="mb-0"
+            storageHealth={storageHealth}
+            backupCleanupOptions={backupCleanupOptions}
+            setBackupCleanupOptions={setBackupCleanupOptions}
+            saveBackupRetentionLoading={saveBackupRetentionLoading}
+            backupRetentionStatus={backupRetentionStatus}
+            setBackupRetentionStatus={setBackupRetentionStatus}
+            cleanupBackupsLoading={cleanupBackupsLoading}
+            cleanupBackupsStatus={cleanupBackupsStatus}
+            onSaveRetention={handleSaveBackupRetention}
+            onCleanupBackups={handleCleanupBackups}
+          />
+        </div>
+      </div>
+    );
+  };
+
+  const renderOptimizationSettings = () => {
+    if (dbSettingsLoading || !dbSettings) return null;
+
+    return (
+      <div className="mt-6 p-4 rounded-lg border border-border bg-bg">
+        <h4 className="text-sm font-semibold mb-3 flex items-center gap-2">
+          <Icon name="tune" size={18} />
+          {t("storageOptimizationSettings")}
+        </h4>
+        <div className="space-y-4">
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+            <Select
+              label={t("storageAutoVacuumMode")}
+              value={dbSettings.optimization.autoVacuumMode}
+              onChange={(e) =>
+                setDbSettings({
+                  ...dbSettings,
+                  optimization: {
+                    ...dbSettings.optimization,
+                    autoVacuumMode: e.target.value as "NONE" | "FULL" | "INCREMENTAL",
+                  },
+                })
+              }
+              options={[
+                { value: "NONE", label: t("storageJournalModeNone") },
+                { value: "FULL", label: t("storageJournalModeFull") },
+                { value: "INCREMENTAL", label: t("storageJournalModeIncremental") },
+              ]}
+            />
+            <Select
+              label={t("storageScheduledVacuum")}
+              value={dbSettings.optimization.scheduledVacuum}
+              onChange={(e) =>
+                setDbSettings({
+                  ...dbSettings,
+                  optimization: {
+                    ...dbSettings.optimization,
+                    scheduledVacuum: e.target.value as "never" | "daily" | "weekly" | "monthly",
+                  },
+                })
+              }
+              options={[
+                { value: "never", label: t("storageVacuumNever") },
+                { value: "daily", label: t("storageVacuumDaily") },
+                { value: "weekly", label: t("storageVacuumWeekly") },
+                { value: "monthly", label: t("storageVacuumMonthly") },
+              ]}
+            />
+            <Input
+              label={t("storageVacuumHour")}
+              type="number"
+              min="0"
+              max="23"
+              value={dbSettings.optimization.vacuumHour}
+              onChange={(e) =>
+                setDbSettings({
+                  ...dbSettings,
+                  optimization: {
+                    ...dbSettings.optimization,
+                    vacuumHour: parseInt(e.target.value) || 2,
+                  },
+                })
+              }
+            />
+            <Input
+              label={t("storagePageSize")}
+              type="number"
+              min="512"
+              max="65536"
+              step="512"
+              value={dbSettings.optimization.pageSize}
+              onChange={(e) =>
+                setDbSettings({
+                  ...dbSettings,
+                  optimization: {
+                    ...dbSettings.optimization,
+                    pageSize: parseInt(e.target.value) || 4096,
+                  },
+                })
+              }
+            />
+            <Input
+              label={t("storageCacheSizeKb")}
+              type="number"
+              min="1"
+              step="1024"
+              value={dbSettings.optimization.cacheSize}
+              onChange={(e) =>
+                setDbSettings({
+                  ...dbSettings,
+                  optimization: {
+                    ...dbSettings.optimization,
+                    cacheSize: parseInt(e.target.value) || 16384,
+                  },
+                })
+              }
+            />
+          </div>
+          <Checkbox
+            id="optimize-on-startup"
+            label={t("storageOptimizeOnStartup")}
+            checked={dbSettings.optimization.optimizeOnStartup}
+            onChange={(e) =>
+              setDbSettings({
+                ...dbSettings,
+                optimization: {
+                  ...dbSettings.optimization,
+                  optimizeOnStartup: e.target.checked,
+                },
+              })
+            }
+          />
+        </div>
+        <div className="mt-3">
+          <Button
+            variant="primary"
+            size="sm"
+            onClick={saveDatabaseSettings}
+            loading={dbSettingsSaving}
+          >
+            {t("storageSaveOptimization")}
+          </Button>
+        </div>
+      </div>
+    );
+  };
+
+  const renderCompressionAggregationSettings = () => {
+    if (dbSettingsLoading || !dbSettings) return null;
+
+    return (
+      <div className="mt-6 p-4 rounded-lg border border-border bg-bg">
+        <h4 className="text-sm font-semibold mb-3 flex items-center gap-2">
+          <Icon name="compress" size={18} />
+          {t("storageCompressionAggregation")}
+        </h4>
+        <div className="space-y-4">
+          <Checkbox
+            id="aggregation-enabled"
+            label={t("storageEnableAggregation")}
+            checked={dbSettings.aggregation.enabled}
+            onChange={(e) =>
+              setDbSettings({
+                ...dbSettings,
+                aggregation: { ...dbSettings.aggregation, enabled: e.target.checked },
+              })
+            }
+          />
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+            <Input
+              label={t("storageRawDataRetention")}
+              type="number"
+              min="1"
+              max="365"
+              value={dbSettings.aggregation.rawDataRetentionDays}
+              onChange={(e) =>
+                setDbSettings({
+                  ...dbSettings,
+                  aggregation: {
+                    ...dbSettings.aggregation,
+                    rawDataRetentionDays: parseInt(e.target.value) || 30,
+                  },
+                })
+              }
+            />
+            <Select
+              label={t("storageGranularity")}
+              value={dbSettings.aggregation.granularity}
+              onChange={(e) =>
+                setDbSettings({
+                  ...dbSettings,
+                  aggregation: {
+                    ...dbSettings.aggregation,
+                    granularity: e.target.value as "hourly" | "daily" | "weekly",
+                  },
+                })
+              }
+              options={[
+                { value: "hourly", label: t("storageHourly") },
+                { value: "daily", label: t("storageDaily") },
+                { value: "weekly", label: t("storageWeekly") },
+              ]}
+            />
+          </div>
+        </div>
+        <div className="mt-3">
+          <Button
+            variant="primary"
+            size="sm"
+            onClick={saveDatabaseSettings}
+            loading={dbSettingsSaving}
+          >
+            {t("storageSaveAggregation")}
+          </Button>
+        </div>
+      </div>
+    );
+  };
+
   return (
     <Card>
       <div className="flex items-center gap-3 mb-4">
-        <div className="p-2 rounded-lg bg-green-500/10 text-green-500">
-          <span className="material-symbols-outlined text-[20px]" aria-hidden="true">
-            database
-          </span>
-        </div>
+        <span className="flex size-9 shrink-0 items-center justify-center rounded-control bg-bg-subtle text-text-muted">
+          <Icon name="database" size={20} />
+        </span>
         <div className="flex-1">
           <h3 className="text-lg font-semibold">{t("systemStorage")}</h3>
           <p className="text-xs text-text-muted">{t("allDataLocal")}</p>
+          <p className="text-xs text-text-muted mt-1">
+            Database backups are stored on this server in the db_backups folder under its data
+            directory.{" "}
+            <a href="/dashboard/endpoint" className="underline">
+              Cloud sync is a separate setting under Endpoints
+            </a>{" "}
+            and can upload credentials to a configured remote destination.
+          </p>
         </div>
         <Badge variant="success" size="sm">
           {storageHealth.driver || "json"}
         </Badge>
       </div>
 
-      {/* Storage info grid */}
-      <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 mb-4">
+      <div className="grid grid-cols-1 gap-3 mb-4">
         <div className="p-3 rounded-lg bg-bg border border-border">
           <p className="text-[11px] text-text-muted uppercase tracking-wide mb-1">
             {t("databasePath")}
@@ -363,339 +1229,234 @@ export default function SystemStorageTab() {
             {storageHealth.dbPath || "~/.omniroute/storage.sqlite"}
           </p>
         </div>
-        <div className="p-3 rounded-lg bg-bg border border-border">
-          <p className="text-[11px] text-text-muted uppercase tracking-wide mb-1">
-            {t("databaseSize")}
-          </p>
-          <p className="text-sm font-mono text-text-main">{formatBytes(storageHealth.sizeBytes)}</p>
+      </div>
+
+      {dbSettingsAuthRequired && !dbSettingsLoading && <AuthRequiredBanner t={t} />}
+      {renderDatabaseStatistics()}
+
+      <div className="pt-3 border-t border-border/50 mb-4">
+        <div className="flex items-center gap-2 mb-3">
+          <Icon name="file_export" size={18} className="text-success" />
+          <p className="font-medium">{t("export")}</p>
         </div>
-      </div>
-
-      <div className="p-3 rounded-lg bg-bg border border-border mb-4">
-        <div className="flex items-start justify-between gap-3 flex-wrap">
-          <div>
-            <p className="text-sm font-medium text-text-main">Log retention policy</p>
-            <p className="text-xs text-text-muted">
-              Request logs retain up to <code>CALL_LOGS_TABLE_MAX_ROWS</code> rows (default:
-              100,000). Proxy logs retain up to <code>PROXY_LOGS_TABLE_MAX_ROWS</code> rows. Older
-              entries auto-deleted.
-            </p>
-          </div>
-          <div className="flex items-center gap-2">
-            <Badge variant="default" size="sm">
-              Call {storageHealth.retentionDays.call}d
-            </Badge>
-            <Badge variant="default" size="sm">
-              App {storageHealth.retentionDays.app}d
-            </Badge>
-            <Badge variant="default" size="sm">
-              {storageHealth.tableMaxRows?.callLogs?.toLocaleString() || "100K"} rows
-            </Badge>
-          </div>
+        <div className="flex flex-wrap items-center gap-2">
+          <Button
+            icon="download"
+            variant="outline"
+            size="sm"
+            onClick={handleExport}
+            loading={exportLoading}
+          >
+            {t("exportDatabase")}
+          </Button>
+          <Button
+            icon="folder_zip"
+            variant="outline"
+            size="sm"
+            onClick={async () => {
+              setExportLoading(true);
+              try {
+                await fetchAndDownload(
+                  "/api/db-backups/exportAll",
+                  "omniroute-full-backup.tar.gz",
+                  t("exportFailed")
+                );
+              } catch (err) {
+                setImportStatus({
+                  type: "error",
+                  message: t("fullExportFailedWithError", { error: (err as Error).message }),
+                });
+              } finally {
+                setExportLoading(false);
+              }
+            }}
+            loading={exportLoading}
+          >
+            {t("exportAll")}
+          </Button>
+          <Button
+            icon="upload"
+            variant="outline"
+            size="sm"
+            onClick={handleImportClick}
+            loading={importLoading}
+          >
+            {t("importDatabase")}
+          </Button>
+          <Input
+            ref={fileInputRef}
+            type="file"
+            accept=".sqlite"
+            aria-label={t("importDatabase")}
+            tabIndex={-1}
+            className="hidden"
+            onChange={handleFileSelected}
+          />
+          <Button
+            icon="data_object"
+            variant="outline"
+            size="sm"
+            onClick={handleExportJson}
+            loading={exportLoading}
+          >
+            {t("exportJson")}
+          </Button>
+          <Button
+            icon="data_object"
+            variant="outline"
+            size="sm"
+            onClick={handleImportJsonClick}
+            loading={importLoading}
+          >
+            {t("importJson")}
+          </Button>
+          <Input
+            ref={jsonInputRef}
+            type="file"
+            accept=".json"
+            aria-label={t("importJson")}
+            tabIndex={-1}
+            className="hidden"
+            onChange={handleJsonSelected}
+          />
+          <ProviderTransferPanel />
         </div>
-      </div>
 
-      {/* Export / Import */}
-      <div className="flex flex-wrap items-center gap-2 mb-4">
-        <Button variant="outline" size="sm" onClick={handleExport} loading={exportLoading}>
-          <span className="material-symbols-outlined text-[14px] mr-1" aria-hidden="true">
-            download
-          </span>
-          {t("exportDatabase")}
-        </Button>
-        <Button
-          variant="outline"
-          size="sm"
-          onClick={async () => {
-            setExportLoading(true);
-            try {
-              await fetchAndDownload(
-                "/api/db-backups/exportAll",
-                "omniroute-full-backup.tar.gz",
-                t("exportFailed")
-              );
-            } catch (err) {
-              setImportStatus({
-                type: "error",
-                message: t("fullExportFailedWithError", { error: (err as Error).message }),
-              });
-            } finally {
-              setExportLoading(false);
-            }
-          }}
-          loading={exportLoading}
-        >
-          <span className="material-symbols-outlined text-[14px] mr-1" aria-hidden="true">
-            folder_zip
-          </span>
-          {t("exportAll")}
-        </Button>
-        <Button variant="outline" size="sm" onClick={handleImportClick} loading={importLoading}>
-          <span className="material-symbols-outlined text-[14px] mr-1" aria-hidden="true">
-            upload
-          </span>
-          {t("importDatabase")}
-        </Button>
-        <input
-          ref={fileInputRef}
-          type="file"
-          accept=".sqlite"
-          className="hidden"
-          onChange={handleFileSelected}
-        />
-        <Button variant="outline" size="sm" onClick={handleExportJson} loading={exportLoading}>
-          <span className="material-symbols-outlined text-[14px] mr-1" aria-hidden="true">
-            data_object
-          </span>
-          Export JSON
-        </Button>
-        <Button variant="outline" size="sm" onClick={handleImportJsonClick} loading={importLoading}>
-          <span className="material-symbols-outlined text-[14px] mr-1" aria-hidden="true">
-            data_object
-          </span>
-          Import JSON
-        </Button>
-        <input
-          ref={jsonInputRef}
-          type="file"
-          accept=".json"
-          className="hidden"
-          onChange={handleJsonSelected}
-        />
-      </div>
-
-      {/* Import confirmation dialog */}
-      {confirmImport && pendingImportFile && (
-        <div className="p-4 rounded-lg mb-4 bg-amber-500/10 border border-amber-500/30">
-          <div className="flex items-start gap-3">
-            <span
-              className="material-symbols-outlined text-[20px] text-amber-500 mt-0.5"
-              aria-hidden="true"
-            >
-              warning
-            </span>
-            <div className="flex-1">
-              <p className="text-sm font-medium text-amber-500 mb-1">{t("confirmDbImport")}</p>
-              <p className="text-xs text-text-muted mb-2">
-                {t("confirmDbImportDesc", { file: pendingImportFile.name })}
-              </p>
-              <div className="flex items-center gap-2">
-                <Button
-                  variant="primary"
-                  size="sm"
-                  onClick={handleImportConfirm}
-                  className="!bg-amber-500 hover:!bg-amber-600"
-                >
-                  {t("yesImport")}
-                </Button>
-                <Button variant="outline" size="sm" onClick={handleImportCancel}>
-                  {tc("cancel")}
-                </Button>
+        {confirmImport && pendingImportFile && (
+          <div className="p-4 rounded-lg mt-3 bg-warning/10 border border-warning/30">
+            <div className="flex items-start gap-3">
+              <Icon name="warning" size={20} className="text-warning mt-0.5" />
+              <div className="flex-1">
+                <p className="text-sm font-medium text-warning mb-1">{t("confirmDbImport")}</p>
+                <p className="text-xs text-text-muted mb-2">
+                  {t("confirmDbImportDesc", { file: pendingImportFile.name })}
+                </p>
+                <div className="flex items-center gap-2">
+                  <Button variant="warning" size="sm" onClick={handleImportConfirm}>
+                    {t("yesImport")}
+                  </Button>
+                  <Button variant="outline" size="sm" onClick={handleImportCancel}>
+                    {tc("cancel")}
+                  </Button>
+                </div>
               </div>
             </div>
           </div>
-        </div>
-      )}
+        )}
 
-      {/* Import status */}
-      {importStatus.message && (
-        <div
-          className={`p-3 rounded-lg mb-4 text-sm ${
-            importStatus.type === "success"
-              ? "bg-green-500/10 text-green-500 border border-green-500/20"
-              : "bg-red-500/10 text-red-500 border border-red-500/20"
-          }`}
-          role="alert"
-        >
-          <div className="flex items-center gap-2">
-            <span className="material-symbols-outlined text-[16px]" aria-hidden="true">
-              {importStatus.type === "success" ? "check_circle" : "error"}
-            </span>
-            {importStatus.message}
+        {importStatus.message && <div className="mt-3">{renderStatusAlert(importStatus, 0)}</div>}
+      </div>
+
+      <div className="pt-3 border-t border-border/50 mb-4">
+        <div className="flex items-center gap-2 mb-3">
+          <Icon name="build" size={18} className="text-info" />
+          <p className="font-medium">{t("maintenance")}</p>
+        </div>
+        <div className="flex flex-wrap items-center gap-2">
+          <Button
+            icon="delete_sweep"
+            variant="outline"
+            size="sm"
+            loading={clearCacheLoading}
+            onClick={handleClearCache}
+          >
+            {t("clearCache")}
+          </Button>
+          <Button
+            icon="auto_delete"
+            variant="outline"
+            size="sm"
+            loading={purgeLogsLoading}
+            onClick={handlePurgeExpiredLogs}
+          >
+            {t("purgeExpiredLogs")}
+          </Button>
+          <Button
+            icon="cleaning_services"
+            variant="outline"
+            size="sm"
+            loading={manualVacuumLoading}
+            onClick={handleManualVacuum}
+          >
+            {t("manualVacuum")}
+          </Button>
+          <Button
+            icon="delete_forever"
+            variant="outline"
+            size="sm"
+            loading={purgeQuotaSnapshotsLoading}
+            onClick={handlePurgeQuotaSnapshots}
+          >
+            {t("purgeQuotaSnapshots")}
+          </Button>
+          <Button
+            icon="delete_forever"
+            variant="outline"
+            size="sm"
+            loading={purgeCallLogsLoading}
+            onClick={handlePurgeCallLogs}
+          >
+            {t("purgeCallLogs")}
+          </Button>
+          <Button
+            icon="delete_forever"
+            variant="outline"
+            size="sm"
+            loading={purgeDetailedLogsLoading}
+            onClick={handlePurgeDetailedLogs}
+          >
+            {t("purgeDetailedLogs")}
+          </Button>
+          <Button
+            icon="restart_alt"
+            variant="danger"
+            size="sm"
+            loading={resetUsageLoading}
+            onClick={openResetUsageModal}
+          >
+            {t("resetUsageData")}
+          </Button>
+        </div>
+        <div className="mt-4 border-t border-border/50 pt-3">
+          <div className="flex flex-col gap-2">
+            {[
+              clearCacheStatus,
+              purgeLogsStatus,
+              manualVacuumStatus,
+              purgeQuotaSnapshotsStatus,
+              purgeCallLogsStatus,
+              purgeDetailedLogsStatus,
+              resetUsageStatus,
+            ].map(renderStatusAlert)}
           </div>
         </div>
-      )}
+      </div>
+
       <div className="flex items-center justify-between p-3 rounded-lg bg-bg border border-border mb-4">
         <div className="flex items-center gap-2">
-          <span className="material-symbols-outlined text-[16px] text-amber-500" aria-hidden="true">
-            schedule
-          </span>
+          <Icon name="schedule" size={16} className="text-warning" />
           <div>
             <p className="text-sm font-medium">{t("lastBackup")}</p>
             <p className="text-xs text-text-muted">
               {storageHealth.lastBackupAt
-                ? `${new Date(storageHealth.lastBackupAt).toLocaleString(locale)} (${formatRelativeTime(storageHealth.lastBackupAt)})`
+                ? new Date(storageHealth.lastBackupAt).toLocaleString(locale) +
+                  " (" +
+                  formatRelativeTime(storageHealth.lastBackupAt) +
+                  ")"
                 : t("noBackupYet")}
             </p>
           </div>
         </div>
-        <Button
-          variant="outline"
-          size="sm"
-          onClick={handleManualBackup}
-          loading={manualBackupLoading}
-        >
-          <span className="material-symbols-outlined text-[14px] mr-1" aria-hidden="true">
-            backup
-          </span>
-          {t("backupNow")}
-        </Button>
-      </div>
-
-      {manualBackupStatus.message && (
-        <div
-          className={`p-3 rounded-lg mb-4 text-sm ${
-            manualBackupStatus.type === "success"
-              ? "bg-green-500/10 text-green-500 border border-green-500/20"
-              : manualBackupStatus.type === "info"
-                ? "bg-blue-500/10 text-blue-500 border border-blue-500/20"
-                : "bg-red-500/10 text-red-500 border border-red-500/20"
-          }`}
-          role="alert"
-        >
-          <div className="flex items-center gap-2">
-            <span className="material-symbols-outlined text-[16px]" aria-hidden="true">
-              {manualBackupStatus.type === "success"
-                ? "check_circle"
-                : manualBackupStatus.type === "info"
-                  ? "info"
-                  : "error"}
-            </span>
-            {manualBackupStatus.message}
-          </div>
-        </div>
-      )}
-
-      {/* Maintenance */}
-      <div className="pt-3 border-t border-border/50 mb-4">
-        <div className="flex items-center gap-2 mb-3">
-          <span className="material-symbols-outlined text-[18px] text-blue-500" aria-hidden="true">
-            build
-          </span>
-          <p className="font-medium">{t("maintenance") || "Maintenance"}</p>
-        </div>
-        <div className="flex flex-wrap items-center gap-2 mb-3">
+        <div className="flex flex-wrap items-center justify-end gap-2">
           <Button
+            icon="backup"
             variant="outline"
             size="sm"
-            loading={clearCacheLoading}
-            onClick={async () => {
-              setClearCacheLoading(true);
-              setClearCacheStatus({ type: "", message: "" });
-              try {
-                const res = await fetch("/api/cache", { method: "DELETE" });
-                const data = await res.json();
-                if (res.ok) {
-                  setClearCacheStatus({
-                    type: "success",
-                    message: t("cacheCleared") || "Cache cleared successfully",
-                  });
-                } else {
-                  setClearCacheStatus({
-                    type: "error",
-                    message: data.error || t("clearCacheFailed") || "Failed to clear cache",
-                  });
-                }
-              } catch {
-                setClearCacheStatus({ type: "error", message: t("errorOccurred") });
-              } finally {
-                setClearCacheLoading(false);
-              }
-            }}
+            onClick={handleManualBackup}
+            loading={manualBackupLoading}
           >
-            <span className="material-symbols-outlined text-[14px] mr-1" aria-hidden="true">
-              delete_sweep
-            </span>
-            {t("clearCache") || "Clear Cache"}
+            {t("backupNow")}
           </Button>
-          <Button
-            variant="outline"
-            size="sm"
-            loading={purgeLogsLoading}
-            onClick={async () => {
-              setPurgeLogsLoading(true);
-              setPurgeLogsStatus({ type: "", message: "" });
-              try {
-                const res = await fetch("/api/settings/purge-logs", { method: "POST" });
-                const data = await res.json();
-                if (res.ok) {
-                  setPurgeLogsStatus({
-                    type: "success",
-                    message:
-                      t("logsDeleted", { count: data.deleted }) ||
-                      `Purged ${data.deleted} expired log(s)`,
-                  });
-                } else {
-                  setPurgeLogsStatus({
-                    type: "error",
-                    message: data.error || t("purgeLogsFailed") || "Failed to purge logs",
-                  });
-                }
-              } catch {
-                setPurgeLogsStatus({ type: "error", message: t("errorOccurred") });
-              } finally {
-                setPurgeLogsLoading(false);
-              }
-            }}
-          >
-            <span className="material-symbols-outlined text-[14px] mr-1" aria-hidden="true">
-              auto_delete
-            </span>
-            {t("purgeExpiredLogs") || "Purge Expired Logs"}
-          </Button>
-        </div>
-        {(clearCacheStatus.message || purgeLogsStatus.message) && (
-          <div className="flex flex-col gap-2">
-            {clearCacheStatus.message && (
-              <div
-                className={`p-3 rounded-lg text-sm ${
-                  clearCacheStatus.type === "success"
-                    ? "bg-green-500/10 text-green-500 border border-green-500/20"
-                    : "bg-red-500/10 text-red-500 border border-red-500/20"
-                }`}
-                role="alert"
-              >
-                <div className="flex items-center gap-2">
-                  <span className="material-symbols-outlined text-[16px]" aria-hidden="true">
-                    {clearCacheStatus.type === "success" ? "check_circle" : "error"}
-                  </span>
-                  {clearCacheStatus.message}
-                </div>
-              </div>
-            )}
-            {purgeLogsStatus.message && (
-              <div
-                className={`p-3 rounded-lg text-sm ${
-                  purgeLogsStatus.type === "success"
-                    ? "bg-green-500/10 text-green-500 border border-green-500/20"
-                    : "bg-red-500/10 text-red-500 border border-red-500/20"
-                }`}
-                role="alert"
-              >
-                <div className="flex items-center gap-2">
-                  <span className="material-symbols-outlined text-[16px]" aria-hidden="true">
-                    {purgeLogsStatus.type === "success" ? "check_circle" : "error"}
-                  </span>
-                  {purgeLogsStatus.message}
-                </div>
-              </div>
-            )}
-          </div>
-        )}
-      </div>
-
-      {/* Backup/Restore section */}
-      <div className="pt-3 border-t border-border/50">
-        <div className="flex items-center justify-between mb-3">
-          <div className="flex items-center gap-2">
-            <span
-              className="material-symbols-outlined text-[18px] text-amber-500"
-              aria-hidden="true"
-            >
-              restore
-            </span>
-            <p className="font-medium">{t("backupRestore")}</p>
-          </div>
           <Button
             variant="outline"
             size="sm"
@@ -707,143 +1468,44 @@ export default function SystemStorageTab() {
             {backupsExpanded ? t("hide") : t("viewBackups")}
           </Button>
         </div>
-        <p className="text-xs text-text-muted mb-3">{t("backupRetentionDesc")}</p>
-
-        {restoreStatus.message && (
-          <div
-            className={`p-3 rounded-lg mb-3 text-sm ${
-              restoreStatus.type === "success"
-                ? "bg-green-500/10 text-green-500 border border-green-500/20"
-                : "bg-red-500/10 text-red-500 border border-red-500/20"
-            }`}
-            role="alert"
-          >
-            <div className="flex items-center gap-2">
-              <span className="material-symbols-outlined text-[16px]" aria-hidden="true">
-                {restoreStatus.type === "success" ? "check_circle" : "error"}
-              </span>
-              {restoreStatus.message}
-            </div>
-          </div>
-        )}
-
-        {backupsExpanded && (
-          <div className="flex flex-col gap-2">
-            {backupsLoading ? (
-              <div className="flex items-center justify-center py-6 text-text-muted">
-                <span
-                  className="material-symbols-outlined animate-spin text-[20px] mr-2"
-                  aria-hidden="true"
-                >
-                  progress_activity
-                </span>
-                {t("loadingBackups")}
-              </div>
-            ) : backups.length === 0 ? (
-              <div className="text-center py-6 text-text-muted text-sm">
-                <span
-                  className="material-symbols-outlined text-[32px] mb-2 block opacity-40"
-                  aria-hidden="true"
-                >
-                  folder_off
-                </span>
-                {t("noBackupsYet")}
-              </div>
-            ) : (
-              <>
-                <div className="flex items-center justify-between mb-1">
-                  <span className="text-xs text-text-muted">
-                    {t("backupsAvailable", { count: backups.length })}
-                  </span>
-                  <button
-                    onClick={loadBackups}
-                    className="text-xs text-primary hover:underline flex items-center gap-1"
-                  >
-                    <span className="material-symbols-outlined text-[14px]" aria-hidden="true">
-                      refresh
-                    </span>
-                    {t("refresh")}
-                  </button>
-                </div>
-                {backups.map((backup) => (
-                  <div
-                    key={backup.id}
-                    className="flex items-center justify-between p-3 rounded-lg bg-black/[0.02] dark:bg-white/[0.02] border border-border/50 hover:border-border transition-colors"
-                  >
-                    <div className="flex-1 min-w-0">
-                      <div className="flex items-center gap-2 mb-1">
-                        <span
-                          className="material-symbols-outlined text-[16px] text-amber-500"
-                          aria-hidden="true"
-                        >
-                          description
-                        </span>
-                        <span className="text-sm font-medium truncate">
-                          {new Date(backup.createdAt).toLocaleString(locale)}
-                        </span>
-                        <Badge
-                          variant={
-                            backup.reason === "pre-restore"
-                              ? "warning"
-                              : backup.reason === "manual"
-                                ? "success"
-                                : "default"
-                          }
-                          size="sm"
-                        >
-                          {formatBackupReason(backup.reason)}
-                        </Badge>
-                      </div>
-                      <div className="flex items-center gap-3 text-xs text-text-muted ml-6">
-                        <span>{t("connectionsCount", { count: backup.connectionCount })}</span>
-                        <span>•</span>
-                        <span>{formatBytes(backup.size)}</span>
-                      </div>
-                    </div>
-                    <div className="flex items-center gap-2 ml-3">
-                      {confirmRestoreId === backup.id ? (
-                        <>
-                          <span className="text-xs text-amber-500 font-medium">{t("confirm")}</span>
-                          <Button
-                            variant="primary"
-                            size="sm"
-                            onClick={() => handleRestore(backup.id)}
-                            loading={restoringId === backup.id}
-                            className="!bg-amber-500 hover:!bg-amber-600"
-                          >
-                            {t("yes")}
-                          </Button>
-                          <Button
-                            variant="outline"
-                            size="sm"
-                            onClick={() => setConfirmRestoreId(null)}
-                          >
-                            {t("no")}
-                          </Button>
-                        </>
-                      ) : (
-                        <Button
-                          variant="outline"
-                          size="sm"
-                          onClick={() => setConfirmRestoreId(backup.id)}
-                        >
-                          <span
-                            className="material-symbols-outlined text-[14px] mr-1"
-                            aria-hidden="true"
-                          >
-                            restore
-                          </span>
-                          {t("restore")}
-                        </Button>
-                      )}
-                    </div>
-                  </div>
-                ))}
-              </>
-            )}
-          </div>
-        )}
       </div>
+
+      {manualBackupStatus.message && (
+        <div className="mb-4">{renderStatusAlert(manualBackupStatus, 0)}</div>
+      )}
+      {restoreStatus.message && <div className="mb-4">{renderStatusAlert(restoreStatus, 1)}</div>}
+      {renderBackupList()}
+
+      {renderRetentionSettings()}
+      {renderOptimizationSettings()}
+      {renderCompressionAggregationSettings()}
+
+      <ConfirmModal
+        isOpen={resetUsageModalOpen}
+        onClose={() => !resetUsageLoading && setResetUsageModalOpen(false)}
+        onConfirm={handleResetUsageHistory}
+        title={t("resetUsageData")}
+        message={
+          <div className="space-y-3">
+            <p className="text-text-muted">
+              {t("resetUsageDataDesc") ||
+                "Select how far back you want to delete usage, request logs, and analytics data. Provider configuration, connections, API keys, combos, and settings are preserved. This action cannot be undone."}
+            </p>
+            <Select
+              aria-label={t("resetUsageData")}
+              value={resetUsagePeriod}
+              onChange={(e) => setResetUsagePeriod(e.target.value)}
+              options={RESET_USAGE_PERIOD_VALUES.map((value) => ({
+                value,
+                label: t(`resetUsagePeriod_${value}`) || value,
+              }))}
+            />
+          </div>
+        }
+        confirmText={resetUsageLoading ? t("resetting") : t("reset")}
+        variant="danger"
+        loading={resetUsageLoading}
+      />
     </Card>
   );
 }

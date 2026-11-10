@@ -1,16 +1,22 @@
-import { CORS_ORIGIN } from "@/shared/utils/cors";
 import { errorResponse, unavailableResponse } from "@omniroute/open-sse/utils/error.ts";
 import { HTTP_STATUS } from "@omniroute/open-sse/config/constants.ts";
 import { getRegistryEntry } from "@omniroute/open-sse/config/providerRegistry.ts";
 import {
-  getProviderCredentials,
+  getProviderCredentialsWithQuotaPreflight,
   clearRecoveredProviderState,
   extractApiKey,
   isValidApiKey,
 } from "@/sse/services/auth";
 import { handleEmbedding } from "@omniroute/open-sse/handlers/embeddings.ts";
+import { getEmbeddingProvider } from "@omniroute/open-sse/config/embeddingRegistry.ts";
+import { ensureCopilotEmbeddingToken } from "@/lib/embeddings/copilotToken";
 import * as log from "@/sse/utils/logger";
 import { enforceApiKeyPolicy } from "@/shared/utils/apiKeyPolicy";
+import {
+  isKeyScopeBlockedCredentials,
+  keyScopeBlockedResponse,
+  resolveKeyConnectionScope,
+} from "@/sse/services/keyConnectionScope";
 import { v1EmbeddingsSchema } from "@/shared/validation/schemas";
 import { isValidationFailure, validateBody } from "@/shared/validation/helpers";
 
@@ -20,7 +26,6 @@ import { isValidationFailure, validateBody } from "@/shared/validation/helpers";
 export async function OPTIONS() {
   return new Response(null, {
     headers: {
-      "Access-Control-Allow-Origin": CORS_ORIGIN,
       "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
       "Access-Control-Allow-Headers": "*",
     },
@@ -53,14 +58,6 @@ export async function POST(request, { params }) {
   }
   const body = validation.data;
 
-  // Optional API key validation
-  if (process.env.REQUIRE_API_KEY === "true") {
-    const apiKey = extractApiKey(request);
-    if (!apiKey || !(await isValidApiKey(apiKey))) {
-      return errorResponse(HTTP_STATUS.UNAUTHORIZED, "Invalid API key");
-    }
-  }
-
   // Add provider prefix if missing
   if (body.model && !body.model.includes("/")) {
     body.model = `${providerAlias}/${body.model}`;
@@ -69,6 +66,10 @@ export async function POST(request, { params }) {
   // Enforce API key policies (model restrictions + budget limits)
   const policy = await enforceApiKeyPolicy(request, body.model);
   if (policy.rejection) return policy.rejection;
+  // GHSA-3w2r: credential selection stays inside the key's connection scope,
+  // the same scope chat applies.
+  const scope = await resolveKeyConnectionScope(policy.apiKeyInfo);
+  if (scope.rejection) return scope.rejection;
 
   // Validate provider match
   if (body.model) {
@@ -81,9 +82,16 @@ export async function POST(request, { params }) {
     }
   }
 
-  const credentials = await getProviderCredentials(providerEntry.id);
+  const credentials = await getProviderCredentialsWithQuotaPreflight(
+    providerEntry.id,
+    null,
+    scope.allowedConnections
+  );
   if (!credentials) {
     return errorResponse(HTTP_STATUS.BAD_REQUEST, `No credentials for provider: ${rawProvider}`);
+  }
+  if (isKeyScopeBlockedCredentials(credentials)) {
+    return keyScopeBlockedResponse(rawProvider, credentials);
   }
   if (credentials.allRateLimited) {
     return unavailableResponse(
@@ -94,7 +102,18 @@ export async function POST(request, { params }) {
     );
   }
 
-  const result = await handleEmbedding({ body, credentials, log });
+  const result = await handleEmbedding({
+    body,
+    credentials: await ensureCopilotEmbeddingToken(
+      getEmbeddingProvider(providerEntry.id),
+      providerEntry.id,
+      credentials
+    ),
+    log,
+    // #10347 — thread the selected connection id so a hard upstream failure cools
+    // the account instead of re-hitting it on every request.
+    connectionId: (credentials as { connectionId?: string } | null)?.connectionId ?? null,
+  });
 
   if (result.success) {
     await clearRecoveredProviderState(credentials);

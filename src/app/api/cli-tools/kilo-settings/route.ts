@@ -4,27 +4,29 @@ import { NextResponse } from "next/server";
 import fs from "fs/promises";
 import path from "path";
 import os from "os";
+import { requireCliToolsAuth } from "@/lib/api/requireCliToolsAuth";
 import { ensureCliConfigWriteAllowed, getCliRuntimeStatus } from "@/shared/services/cliRuntime";
 import { createBackup } from "@/shared/services/backupService";
 import { saveCliToolLastConfigured, deleteCliToolLastConfigured } from "@/lib/db/cliToolState";
 import { cliModelConfigSchema } from "@/shared/validation/schemas";
 import { isValidationFailure, validateBody } from "@/shared/validation/helpers";
-import { getApiKeyById } from "@/lib/localDb";
+import { resolveApiKey } from "@/shared/services/apiKeyResolver";
+import { readJsoncConfig } from "../_lib/jsoncConfig";
+import {
+  configClobberRefusalResponse,
+  parseJsoncObject,
+  readExistingConfig,
+} from "../_lib/readExistingConfig";
 
 const KILO_DATA_DIR = path.join(os.homedir(), ".local", "share", "kilo");
 const AUTH_PATH = path.join(KILO_DATA_DIR, "auth.json");
 const KILO_CONFIG_DIR = path.join(os.homedir(), ".config", "kilo");
 
-// Read auth.json
-const readAuth = async () => {
-  try {
-    const content = await fs.readFile(AUTH_PATH, "utf-8");
-    return JSON.parse(content);
-  } catch (error) {
-    if (error.code === "ENOENT") return null;
-    throw error;
-  }
-};
+// Read auth.json.
+// Ported from upstream decolua/9router@6c10edf8: tolerate JSONC (trailing
+// commas) and return null on any parse error so the dashboard renders
+// "installed but not configured" instead of a 500 misread as "not installed".
+const readAuth = async () => readJsoncConfig(AUTH_PATH);
 
 // Check if OmniRoute OpenAI-compatible provider is configured
 const hasOmniRouteConfig = (auth) => {
@@ -38,7 +40,10 @@ const hasOmniRouteConfig = (auth) => {
 };
 
 // GET - Check kilo CLI and read current settings
-export async function GET() {
+export async function GET(request: Request) {
+  const authError = await requireCliToolsAuth(request);
+  if (authError) return authError;
+
   try {
     const runtime = await getCliRuntimeStatus("kilo");
 
@@ -109,6 +114,9 @@ export async function GET() {
 
 // POST - Configure Kilo Code to use OmniRoute as OpenAI-compatible provider
 export async function POST(request) {
+  const authError = await requireCliToolsAuth(request);
+  if (authError) return authError;
+
   let rawBody;
   try {
     rawBody = await request.json();
@@ -130,25 +138,15 @@ export async function POST(request) {
       return NextResponse.json({ error: writeGuard }, { status: 403 });
     }
 
+    // (#549) Extract keyId BEFORE validation — Zod strips unknown fields!
+    const keyId = typeof rawBody?.keyId === "string" ? rawBody.keyId.trim() : null;
+
     const validation = validateBody(cliModelConfigSchema, rawBody);
     if (isValidationFailure(validation)) {
       return NextResponse.json({ error: validation.error }, { status: 400 });
     }
     const { baseUrl, model } = validation.data;
-    let { apiKey } = validation.data;
-
-    // (#549) Resolve real key from DB if keyId was provided.
-    const keyId = typeof rawBody?.keyId === "string" ? rawBody.keyId.trim() : null;
-    if (keyId) {
-      try {
-        const keyRecord = await getApiKeyById(keyId);
-        if (keyRecord?.key) {
-          apiKey = keyRecord.key as string;
-        }
-      } catch {
-        // Non-critical: fall back to whatever value was in apiKey
-      }
-    }
+    const apiKey = await resolveApiKey(keyId, validation.data.apiKey);
 
     // Ensure directories exist
     await fs.mkdir(KILO_DATA_DIR, { recursive: true });
@@ -156,14 +154,9 @@ export async function POST(request) {
     // Backup auth before modifying
     await createBackup("kilo", AUTH_PATH);
 
-    // Read existing auth
-    let auth = {};
-    try {
-      const existing = await fs.readFile(AUTH_PATH, "utf-8");
-      auth = JSON.parse(existing);
-    } catch {
-      /* No existing auth */
-    }
+    // Read existing auth — only a missing file starts fresh; an unreadable or
+    // unparsable one is refused (409) instead of being replaced.
+    const auth: Record<string, any> = (await readExistingConfig(AUTH_PATH, parseJsoncObject)) ?? {};
 
     // Normalize baseUrl
     const normalizedBaseUrl = baseUrl.endsWith("/v1") ? baseUrl : `${baseUrl}/v1`;
@@ -187,13 +180,11 @@ export async function POST(request) {
         "User",
         "settings.json"
       );
-      let vscodeSettings = {};
-      try {
-        const raw = await fs.readFile(vscodeSettingsPath, "utf-8");
-        vscodeSettings = JSON.parse(raw);
-      } catch {
-        /* no existing settings */
-      }
+      // VS Code settings.json is user-owned JSONC. If it cannot be parsed, the
+      // refusal lands in the catch below and the (optional) extension write is
+      // skipped — never replace the user's whole settings file.
+      const vscodeSettings: Record<string, any> =
+        (await readExistingConfig(vscodeSettingsPath, parseJsoncObject)) ?? {};
 
       // Set custom provider config for the extension
       vscodeSettings["kilocode.customProvider"] = {
@@ -221,13 +212,18 @@ export async function POST(request) {
       authPath: AUTH_PATH,
     });
   } catch (error) {
+    const refusal = configClobberRefusalResponse(error);
+    if (refusal) return refusal;
     console.log("Error updating kilo settings:", error);
     return NextResponse.json({ error: "Failed to update kilo settings" }, { status: 500 });
   }
 }
 
 // DELETE - Remove OmniRoute config from Kilo
-export async function DELETE() {
+export async function DELETE(request: Request) {
+  const authError = await requireCliToolsAuth(request);
+  if (authError) return authError;
+
   try {
     const writeGuard = ensureCliConfigWriteAllowed();
     if (writeGuard) {

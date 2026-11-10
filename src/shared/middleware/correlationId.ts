@@ -10,8 +10,11 @@
 
 import { AsyncLocalStorage } from "node:async_hooks";
 import crypto from "crypto";
+import { getProcessStore } from "@/shared/utils/processSingleton";
 
-const correlationStore = new AsyncLocalStorage();
+function getCorrelationStore(): AsyncLocalStorage<string | undefined> {
+  return getProcessStore("correlationId.store", () => new AsyncLocalStorage<string | undefined>());
+}
 
 /**
  * Generate a unique correlation ID.
@@ -26,7 +29,7 @@ function generateCorrelationId() {
  * @returns {string|undefined}
  */
 export function getCorrelationId() {
-  return correlationStore.getStore();
+  return getCorrelationStore().getStore();
 }
 
 /**
@@ -39,60 +42,5 @@ export function getCorrelationId() {
  */
 export function runWithCorrelation(correlationId, fn) {
   const id = correlationId || generateCorrelationId();
-  return correlationStore.run(id, fn);
-}
-
-/**
- * Express/Next.js middleware that injects correlation IDs.
- *
- * Usage:
- *   // In Next.js middleware or Express app
- *   import { correlationMiddleware } from './correlationId.js';
- *   app.use(correlationMiddleware);
- *
- * @param {Request} request
- * @param {Function} next
- * @returns {Promise<Response>}
- */
-export function correlationMiddleware(request, next) {
-  const requestId =
-    request.headers.get("x-request-id") ||
-    request.headers.get("x-correlation-id") ||
-    generateCorrelationId();
-
-  return runWithCorrelation(requestId, async () => {
-    const response = await next();
-
-    // Attach correlation ID to response
-    if (response && response.headers) {
-      response.headers.set("x-request-id", requestId);
-    }
-
-    return response;
-  });
-}
-
-/**
- * Create a logger wrapper that automatically includes correlation IDs.
- *
- * @param {Object} baseLogger - Base logger with info/warn/error methods
- * @returns {Object} Wrapped logger
- */
-export function createCorrelatedLogger(baseLogger) {
-  const withCorrelation = (level, ...args) => {
-    const correlationId = getCorrelationId();
-    if (correlationId) {
-      const meta = typeof args[args.length - 1] === "object" ? args.pop() : {};
-      meta.correlationId = correlationId;
-      args.push(meta);
-    }
-    baseLogger[level](...args);
-  };
-
-  return {
-    info: (...args) => withCorrelation("info", ...args),
-    warn: (...args) => withCorrelation("warn", ...args),
-    error: (...args) => withCorrelation("error", ...args),
-    debug: (...args) => withCorrelation("debug", ...args),
-  };
+  return getCorrelationStore().run(id, fn);
 }

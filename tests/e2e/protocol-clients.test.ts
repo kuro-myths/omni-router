@@ -1,4 +1,4 @@
-import { describe, it, expect } from "vitest";
+import { beforeAll, describe, it, expect } from "vitest";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 
@@ -87,12 +87,20 @@ async function consumeA2AStream(response: Response): Promise<{
 }
 
 describe("Protocol clients E2E", () => {
+  beforeAll(async () => {
+    const response = await apiFetch("/api/settings", {
+      method: "PATCH",
+      body: JSON.stringify({ a2aEnabled: true }),
+    });
+    expect([200, 401, 403]).toContain(response.status);
+  });
+
   it(
     "connects via MCP stdio and invokes required tools",
     async () => {
       const transport = new StdioClientTransport({
         command: process.execPath,
-        args: ["--import", "tsx/esm", "open-sse/mcp-server/server.ts"],
+        args: ["--import", "tsx", "open-sse/mcp-server/server.ts"],
         env: {
           ...process.env,
           OMNIROUTE_BASE_URL: BASE_URL,
@@ -126,11 +134,13 @@ describe("Protocol clients E2E", () => {
       }
 
       const auditRes = await apiFetch("/api/mcp/audit?limit=50&tool=omniroute_get_health");
-      if (auditRes.status === 401) {
-        console.warn("Skipping audit log verification (Auth required)");
-      } else {
+      // 403 = authenticated but the key lacks the manage scope — a valid
+      // authorization outcome for the management-plane audit endpoint
+      // (requireManagementAuth.ts returns 403 for scope-denied valid keys).
+      expect([200, 401, 403]).toContain(auditRes.status);
+      if (auditRes.status === 200) {
         expect(auditRes.ok).toBe(true);
-        const auditJson = await auditRes.json();
+        const auditJson = (await auditRes.json()) as any;
         const entries = Array.isArray(auditJson?.entries) ? auditJson.entries : [];
         expect(entries.some((entry: any) => entry.toolName === "omniroute_get_health")).toBe(true);
       }
@@ -143,7 +153,7 @@ describe("Protocol clients E2E", () => {
     async () => {
       const cardRes = await apiFetch("/.well-known/agent.json");
       expect(cardRes.ok).toBe(true);
-      const card = await cardRes.json();
+      const card = (await cardRes.json()) as any;
       expect(card).toHaveProperty("name");
       expect(Array.isArray(card?.skills)).toBe(true);
 
@@ -156,7 +166,8 @@ describe("Protocol clients E2E", () => {
         "protocol-send"
       );
       if (send.response.status === 401) {
-        console.warn("Skipping A2A message send (Auth required)");
+        expect(API_KEY).toBe("");
+        expect(send.json?.error).toBeTruthy();
         return;
       }
       expect(send.response.ok).toBe(true);
@@ -200,11 +211,10 @@ describe("Protocol clients E2E", () => {
       expect([200, 400, 401, 404]).toContain(cancelRes.status);
 
       const tasksRes = await apiFetch("/api/a2a/tasks?limit=50");
-      if (tasksRes.status === 401) {
-        console.warn("Skipping a2a tasks listing (Auth required)");
-      } else {
+      expect([200, 401]).toContain(tasksRes.status);
+      if (tasksRes.status === 200) {
         expect(tasksRes.ok).toBe(true);
-        const tasksJson = await tasksRes.json();
+        const tasksJson = (await tasksRes.json()) as any;
         const tasks = Array.isArray(tasksJson?.tasks) ? tasksJson.tasks : [];
         expect(tasks.some((task: any) => task.id === sendTaskId)).toBe(true);
       }

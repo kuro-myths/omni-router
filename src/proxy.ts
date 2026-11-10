@@ -1,172 +1,63 @@
-import { NextResponse } from "next/server";
-import { jwtVerify, SignJWT } from "jose";
-import { generateRequestId } from "./shared/utils/requestId";
-import { getSettings } from "./lib/localDb";
-import { isPublicRoute, verifyAuth, isAuthRequired } from "./shared/utils/apiAuth";
-import { checkBodySize, getBodySizeLimit } from "./shared/middleware/bodySizeGuard";
-import { isDraining } from "./lib/gracefulShutdown";
-import { isModelSyncInternalRequest } from "./shared/services/modelSyncScheduler";
+import type { NextRequest } from "next/server";
+import { runAuthzPipeline } from "./server/authz/pipeline";
+import { headlessGateResponse } from "./lib/system/headless";
 
-const SECRET = new TextEncoder().encode(process.env.JWT_SECRET || "");
-
-export async function proxy(request: any) {
-  const { pathname } = request.nextUrl;
-
-  // Pipeline: Add request ID header for end-to-end tracing
-  const requestId = generateRequestId();
-  const response = NextResponse.next();
-  response.headers.set("X-Request-Id", requestId);
-
-  // ──────────────── Pre-flight: Reject during shutdown drain ────────────────
-  if (isDraining() && pathname.startsWith("/api/")) {
-    return NextResponse.json(
-      {
-        error: {
-          code: "SERVICE_UNAVAILABLE",
-          message: "Server is shutting down",
-          correlation_id: requestId,
-        },
-      },
-      { status: 503 }
+// #10627: the proxy runs in its own Next.js runtime and never executes
+// instrumentation-node.ts's startup warm-ups, so its FIRST request used to
+// trigger a cold `import("@/lib/db/settings")` → native SQLite driver load ON
+// the request path. If that addon hangs (see driverFactory's #10627 probe),
+// every proxied request stalled indefinitely with 0 bytes and no logs.
+// Warm the settings cache here at boot instead: a driver failure now surfaces
+// as a logged startup error, and real requests start with a hot cache.
+// Fire-and-forget — never blocks proxy initialization, never rejects the
+// module (mirrors the `void warmModelCatalogCache()` pattern in
+// instrumentation-node.ts).
+void import("./lib/db/readCache")
+  .then(({ getCachedSettings }) => getCachedSettings())
+  .catch((err: unknown) => {
+    console.error(
+      "[proxy] DB settings warm failed; requests will use default limits:",
+      err instanceof Error ? err.message : err
     );
-  }
+  });
 
-  // ──────────────── Pre-flight: Reject oversized bodies ────────────────
-  if (pathname.startsWith("/api/") && request.method !== "GET" && request.method !== "OPTIONS") {
-    const bodySizeRejection = checkBodySize(request, getBodySizeLimit(pathname));
-    if (bodySizeRejection) return bodySizeRejection;
-  }
-
-  // ──────────────── Protect Management API Routes ────────────────
-  if (pathname.startsWith("/api/") && !pathname.startsWith("/api/v1/")) {
-    // Allow public routes (login, logout, health, etc.)
-    if (isPublicRoute(pathname)) {
-      return response;
-    }
-
-    // Allow the model auto-sync scheduler to reach only its internal provider routes.
-    if (
-      isModelSyncInternalRequest(request) &&
-      /^\/api\/providers\/[^/]+\/(sync-models|models)$/.test(pathname)
-    ) {
-      return response;
-    }
-
-    // Check if auth is required at all (respects requireLogin setting)
-    const authRequired = await isAuthRequired();
-    if (!authRequired) {
-      return response;
-    }
-
-    // Verify authentication (JWT cookie or Bearer API key)
-    const authError = await verifyAuth(request);
-    if (authError) {
-      return NextResponse.json(
-        {
-          error: {
-            code: "AUTH_001",
-            message: authError,
-            correlation_id: requestId,
-          },
-        },
-        { status: 401 }
-      );
-    }
-  }
-
-  // ──────────────── Protect Dashboard Routes ────────────────
-  if (pathname.startsWith("/dashboard")) {
-    // Always allow onboarding — it has its own setupComplete guard
-    if (pathname.startsWith("/dashboard/onboarding")) {
-      return response;
-    }
-
-    try {
-      // Direct import — no HTTP self-fetch overhead
-      const settings = await getSettings();
-      // Skip auth if login is not required
-      if (settings.requireLogin === false) {
-        return response;
-      }
-      // Skip auth ONLY for fresh installs (before onboarding) where no password exists yet.
-      // Once setupComplete is true, always require auth — prevents bypass if password row is lost (#151)
-      if (!settings.setupComplete && !settings.password && !process.env.INITIAL_PASSWORD) {
-        return response;
-      }
-    } catch (err) {
-      // FASE-01: Log settings fetch errors instead of silencing them
-      console.error("[Middleware] settings_error: Settings read failed:", err.message, {
-        path: pathname,
-        requestId,
-      });
-      // On error, require login (fall through to token check)
-    }
-
-    const token = request.cookies.get("auth_token")?.value;
-
-    if (token) {
-      try {
-        const { payload } = await jwtVerify(token, SECRET);
-
-        // Auto-refresh: if token expires within 7 days, issue a fresh 30-day token
-        const exp = payload.exp as number;
-        const now = Math.floor(Date.now() / 1000);
-        const REFRESH_WINDOW = 7 * 24 * 60 * 60; // 7 days in seconds
-        if (exp && exp - now < REFRESH_WINDOW) {
-          try {
-            const freshToken = await new SignJWT({ authenticated: true })
-              .setProtectedHeader({ alg: "HS256" })
-              .setExpirationTime("30d")
-              .sign(SECRET);
-
-            // Detect secure context
-            const fwdProto = (request.headers.get("x-forwarded-proto") || "")
-              .split(",")[0]
-              .trim()
-              .toLowerCase();
-            const isHttps = fwdProto === "https" || request.nextUrl?.protocol === "https:";
-            const useSecure = process.env.AUTH_COOKIE_SECURE === "true" || isHttps;
-
-            response.cookies.set("auth_token", freshToken, {
-              httpOnly: true,
-              secure: useSecure,
-              sameSite: "lax",
-              path: "/",
-            });
-            console.log(
-              `[Middleware] JWT auto-refreshed for ${pathname} (was expiring in ${Math.round((exp - now) / 3600)}h)`
-            );
-          } catch (refreshErr) {
-            // Refresh failed — continue with existing valid token
-            console.error("[Middleware] JWT auto-refresh failed:", refreshErr.message);
-          }
-        }
-
-        return response;
-      } catch (err) {
-        // FASE-01: Log auth errors instead of silently redirecting
-        console.error("[Middleware] auth_error: JWT verification failed:", err.message, {
-          path: pathname,
-          tokenPresent: true,
-          requestId,
-        });
-        const redirectResponse = NextResponse.redirect(new URL("/login", request.url));
-        redirectResponse.cookies.delete("auth_token");
-        return redirectResponse;
-      }
-    }
-
-    return NextResponse.redirect(new URL("/login", request.url));
-  }
-
-  // Redirect / to /dashboard if logged in, or /dashboard if it's the root
-  if (pathname === "/") {
-    return NextResponse.redirect(new URL("/dashboard", request.url));
-  }
-
-  return response;
+export async function proxy(request: NextRequest) {
+  // Headless mode (R0.1, OMNIROUTE_HEADLESS=1): dashboard pages answer 404 JSON
+  // before the pipeline runs; every other route is untouched. See
+  // src/lib/system/headless.ts and docs/guides/HEADLESS.md.
+  const headlessResponse = headlessGateResponse(request.nextUrl.pathname);
+  if (headlessResponse) return headlessResponse;
+  return runAuthzPipeline(request, { enforce: true });
 }
 
+// Next compiles the middleware/proxy matcher from `regexp.source` only, dropping
+// path-to-regexp's default case-insensitive flag — so a lowercase literal like
+// `/v1/:path*` never matches `/V1/...`, while the rewrite matcher (flag kept)
+// still routes it to the handler. That skipped the authz pipeline entirely
+// (GHSA-jvqc-mp9f-q936). Expressing the case-insensitivity inside a custom
+// path-to-regexp group (`([vV]1)`) survives the flag-drop because it needs no
+// flag. Keep these in sync with the client-API aliases in
+// next.config.mjs rewrites and src/server/authz/classify.ts.
 export const config = {
-  matcher: ["/", "/dashboard/:path*", "/api/:path*"],
+  matcher: [
+    "/",
+    "/dashboard/:path*",
+    "/home",
+    "/home/:path*",
+    "/api/:path*",
+    "/:v1seg([vV]1)/:path*",
+    "/:v1seg([vV]1)",
+    "/:v1betaseg([vV]1[bB][eE][tT][aA])/:path*",
+    "/:v1betaseg([vV]1[bB][eE][tT][aA])",
+    "/:chatseg([cC][hH][aA][tT])/:path*",
+    "/:respseg([rR][eE][sS][pP][oO][nN][sS][eE][sS])/:path*",
+    "/:respseg([rR][eE][sS][pP][oO][nN][sS][eE][sS])",
+    "/:codexseg([cC][oO][dD][eE][xX])/:path*",
+    "/:codexseg([cC][oO][dD][eE][xX])",
+    "/:modelsseg([mM][oO][dD][eE][lL][sS])",
+    // CLIProxyAPI management compatibility (/v0/management/* → /api/v0/management/*).
+    // Without this entry the rewrite would reach the handler with no authz pipeline run,
+    // so the trusted x-omniroute-auth-* stamps would not be stripped from the request.
+    "/:v0seg([vV]0)/:path*",
+  ],
 };

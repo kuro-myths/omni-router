@@ -1,9 +1,34 @@
-import { KIRO_CONFIG } from "../constants/oauth";
+import { KIRO_CONFIG, AWS_REGION_PATTERN, assertValidAwsRegion } from "../constants/oauth";
+import { discoverKiroProfileArnAcrossRegions } from "@omniroute/open-sse/services/kiroRegion.ts";
 
 export const kiro = {
   config: KIRO_CONFIG,
   flowType: "device_code",
   requestDeviceCode: async (config) => {
+    const regionMatch = String(config.tokenUrl || "").match(/oidc\.([a-z0-9-]+)\.amazonaws\.com/i);
+    const candidateRegion = regionMatch?.[1] || "us-east-1";
+    // Region is sourced from KIRO_CONFIG.tokenUrl (trusted constant) but defensively
+    // re-validate before letting it influence later fetches (GHSA-6mwv-4mrm-5p3m).
+    const resolvedRegion = AWS_REGION_PATTERN.test(candidateRegion) ? candidateRegion : "us-east-1";
+    const registerPayload: {
+      clientName: string;
+      clientType: string;
+      scopes: string[];
+      grantTypes: string[];
+      issuerUrl?: string;
+    } = {
+      clientName: config.clientName,
+      clientType: config.clientType,
+      scopes: config.scopes,
+      grantTypes: config.grantTypes,
+    };
+
+    // For enterprise IDC custom startUrl flows, issuerUrl can differ per tenant.
+    // Sending a fixed issuerUrl often causes invalid_request during device auth.
+    if (config.issuerUrl && !config.skipIssuerUrlForRegistration) {
+      registerPayload.issuerUrl = config.issuerUrl;
+    }
+
     // Step 1: Register client with AWS SSO OIDC
     const registerRes = await fetch(config.registerClientUrl, {
       method: "POST",
@@ -11,13 +36,7 @@ export const kiro = {
         "Content-Type": "application/json",
         Accept: "application/json",
       },
-      body: JSON.stringify({
-        clientName: config.clientName,
-        clientType: config.clientType,
-        scopes: config.scopes,
-        grantTypes: config.grantTypes,
-        issuerUrl: config.issuerUrl,
-      }),
+      body: JSON.stringify(registerPayload),
     });
 
     if (!registerRes.ok) {
@@ -57,10 +76,16 @@ export const kiro = {
       interval: deviceData.interval || 5,
       _clientId: clientInfo.clientId,
       _clientSecret: clientInfo.clientSecret,
+      _region: resolvedRegion,
+      _authMethod: config.skipIssuerUrlForRegistration ? "idc" : "builder-id",
     };
   },
   pollToken: async (config, deviceCode, codeVerifier, extraData) => {
-    const response = await fetch(config.tokenUrl, {
+    const tokenRegion = String(extraData?._region || "us-east-1").toLowerCase();
+    assertValidAwsRegion(tokenRegion);
+    const tokenUrl = `https://oidc.${tokenRegion}.amazonaws.com/token`;
+
+    const response = await fetch(tokenUrl, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -91,6 +116,8 @@ export const kiro = {
           expires_in: data.expiresIn,
           _clientId: extraData?._clientId,
           _clientSecret: extraData?._clientSecret,
+          _region: tokenRegion,
+          _authMethod: extraData?._authMethod || "builder-id",
         },
       };
     }
@@ -103,13 +130,33 @@ export const kiro = {
       },
     };
   },
-  mapTokens: (tokens) => ({
+  // Enterprise IAM Identity Center accounts require a region-bound Q Developer profileArn on every
+  // CodeWhisperer call; without it AWS returns 403 "User is not authorized to make this call". The
+  // device-code flow does not return one, so discover it here via ListAvailableProfiles.
+  //
+  // The IdC/token region (`_region`, e.g. eu-north-1) is NOT where the Q Developer profile lives —
+  // AWS only hosts the profile (and its runtime) in us-east-1 / eu-central-1. So probe those
+  // profile regions with the freshly-minted SSO token (which works cross-region against the
+  // profile's home region), NOT q.{idcRegion} which does not resolve. Best-effort: AWS Builder ID
+  // accounts have no profile and this simply yields none; failures never block login.
+  postExchange: async (tokenData) => {
+    const accessToken = tokenData?.access_token;
+    if (!accessToken) return null;
+    if (tokenData?._authMethod === "builder-id") return null;
+    const storedRegion = typeof tokenData?._region === "string" ? tokenData._region : undefined;
+    const arn = await discoverKiroProfileArnAcrossRegions(accessToken, storedRegion);
+    return arn ? { profileArn: arn } : null;
+  },
+  mapTokens: (tokens, extra) => ({
     accessToken: tokens.access_token,
     refreshToken: tokens.refresh_token,
     expiresIn: tokens.expires_in,
     providerSpecificData: {
       clientId: tokens._clientId,
       clientSecret: tokens._clientSecret,
+      region: tokens._region,
+      authMethod: tokens._authMethod || (extra?.profileArn ? "idc" : "builder-id"),
+      ...(extra?.profileArn ? { profileArn: extra.profileArn } : {}),
     },
   }),
 };

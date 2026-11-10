@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { getProviderConnections } from "@/lib/localDb";
+import { getProviderConnections } from "@/lib/db/providers";
 import {
   getLearnedLimits,
   getRateLimitStatus,
@@ -63,7 +63,8 @@ function buildQuotaEntry(
 
   let quotaTotal: number | null = null;
   let quotaUsed = 0;
-  let percentRemaining = 100;
+  // Stays null (unknown) unless a learned limit, cooldown or queue signal sets it.
+  let percentRemaining: number | null = null;
   const learned =
     learnedLimit && typeof learnedLimit === "object" && !Array.isArray(learnedLimit)
       ? (learnedLimit as Record<string, unknown>)

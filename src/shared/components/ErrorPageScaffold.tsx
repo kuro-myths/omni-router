@@ -1,4 +1,8 @@
+import { buttonVariants } from "@omniroute/ui-kit/button";
+import Icon from "@/shared/components/Icon";
+import { OmniRouteLockup } from "@/shared/components/OmniRouteLogo";
 import Link from "next/link";
+import { useTranslations } from "next-intl";
 
 interface PageAction {
   href: string;
@@ -11,8 +15,8 @@ interface ErrorPageScaffoldProps {
   description: string;
   icon?: string;
   suggestions?: string[];
-  primaryAction?: PageAction;
-  secondaryAction?: PageAction;
+  primaryAction?: PageAction | null;
+  secondaryAction?: PageAction | null;
 }
 
 export default function ErrorPageScaffold({
@@ -21,27 +25,29 @@ export default function ErrorPageScaffold({
   description,
   icon = "error",
   suggestions = [],
-  primaryAction = { href: "/dashboard", label: "Go to Dashboard" },
-  secondaryAction = { href: "/status", label: "Check System Status" },
+  primaryAction,
+  secondaryAction,
 }: ErrorPageScaffoldProps) {
+  const t = useTranslations("common");
+  const resolvedPrimary = primaryAction ?? { href: "/dashboard", label: t("goToDashboard") };
+  const resolvedSecondary = secondaryAction ?? { href: "/status", label: t("checkSystemStatus") };
+
   return (
     <main
-      className="min-h-screen bg-bg text-text-main flex items-center justify-center px-6 py-12"
+      className="min-h-screen text-text-main flex items-center justify-center px-6 py-12"
       role="main"
       aria-labelledby="error-page-title"
     >
       <section className="w-full max-w-2xl rounded-2xl border border-border bg-surface p-8 sm:p-10 shadow-soft">
         <header className="text-center">
-          <span className="material-symbols-outlined text-4xl text-primary mb-3" aria-hidden="true">
-            {icon}
-          </span>
-          <p
-            className="text-6xl sm:text-7xl font-bold leading-none bg-gradient-to-br from-primary to-primary-hover bg-clip-text text-transparent"
-            aria-hidden="true"
-          >
+          <div className="mb-4 flex justify-center">
+            <OmniRouteLockup />
+          </div>
+          <Icon name={icon} size={40} className="mx-auto mb-3 text-text-muted" />
+          <p className="ci-dashboard-display text-6xl sm:text-7xl" aria-hidden="true">
             {code}
           </p>
-          <h1 id="error-page-title" className="mt-4 text-2xl sm:text-3xl font-semibold">
+          <h1 id="error-page-title" className="ci-heading mt-4 text-2xl sm:text-3xl">
             {title}
           </h1>
           <p className="mt-3 text-text-muted leading-relaxed">{description}</p>
@@ -54,12 +60,7 @@ export default function ErrorPageScaffold({
           >
             {suggestions.map((item) => (
               <li key={item} className="flex items-start gap-2">
-                <span
-                  className="material-symbols-outlined text-base text-primary mt-0.5"
-                  aria-hidden="true"
-                >
-                  check_circle
-                </span>
+                <Icon name="check_circle" size={16} className="text-text-muted mt-0.5" />
                 <span>{item}</span>
               </li>
             ))}
@@ -67,17 +68,14 @@ export default function ErrorPageScaffold({
         )}
 
         <div className="mt-8 flex flex-col sm:flex-row gap-3">
-          <Link
-            href={primaryAction.href}
-            className="inline-flex items-center justify-center px-6 py-3 rounded-lg text-white text-sm font-semibold bg-gradient-to-br from-primary to-primary-hover hover:shadow-elevated transition-all duration-200 motion-reduce:transition-none"
-          >
-            {primaryAction.label}
+          <Link href={resolvedPrimary.href} className={buttonVariants({ size: "lg" })}>
+            {resolvedPrimary.label}
           </Link>
           <Link
-            href={secondaryAction.href}
-            className="inline-flex items-center justify-center px-6 py-3 rounded-lg text-sm font-semibold border border-border hover:bg-bg-alt transition-colors duration-200 motion-reduce:transition-none"
+            href={resolvedSecondary.href}
+            className={buttonVariants({ variant: "outline", size: "lg" })}
           >
-            {secondaryAction.label}
+            {resolvedSecondary.label}
           </Link>
         </div>
       </section>

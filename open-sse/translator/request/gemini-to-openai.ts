@@ -1,6 +1,11 @@
 import { register } from "../registry.ts";
+import { geminiMediaToOpenAI } from "../helpers/mediaContentParts.ts";
 import { FORMATS } from "../formats.ts";
 import { adjustMaxTokens } from "../helpers/maxTokensHelper.ts";
+import { createGeminiToolCallIdPairing } from "../helpers/geminiToolCallIds.ts";
+import { geminiFunctionParameters } from "../helpers/geminiFunctionParameters.ts";
+
+const newCallId = () => `call_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
 
 // Convert Gemini request to OpenAI format
 export function geminiToOpenAIRequest(model, body, stream) {
@@ -23,7 +28,7 @@ export function geminiToOpenAIRequest(model, body, stream) {
     const config = body.generationConfig;
     if (config.maxOutputTokens) {
       const tempBody = { max_tokens: config.maxOutputTokens, tools: body.tools };
-      result.max_tokens = adjustMaxTokens(tempBody);
+      result.max_tokens = adjustMaxTokens(tempBody, { honorExplicitCap: true });
     }
     if (config.temperature !== undefined) {
       result.temperature = config.temperature;
@@ -46,8 +51,10 @@ export function geminiToOpenAIRequest(model, body, stream) {
 
   // Convert contents to messages
   if (body.contents && Array.isArray(body.contents)) {
-    for (const content of body.contents) {
-      const converted = convertGeminiContent(content);
+    const toolCallIds = createGeminiToolCallIdPairing(newCallId);
+    for (const content of splitCoLocatedFunctionResponses(body.contents)) {
+      toolCallIds.beginContent(content);
+      const converted = convertGeminiContentWithReasoning(content, toolCallIds);
       if (converted) {
         result.messages.push(converted);
       }
@@ -65,7 +72,7 @@ export function geminiToOpenAIRequest(model, body, stream) {
             function: {
               name: func.name,
               description: func.description || "",
-              parameters: func.parameters || { type: "object", properties: {} },
+              parameters: geminiFunctionParameters(func) || { type: "object", properties: {} },
             },
           });
         }
@@ -77,7 +84,40 @@ export function geminiToOpenAIRequest(model, body, stream) {
 }
 
 // Convert Gemini content to OpenAI message
-function convertGeminiContent(content) {
+// convertGeminiContent() early-returns the tool message on the first
+// `functionResponse` part in a content, dropping any co-located parts
+// (another functionCall, or trailing text). Gemini clients can send those
+// co-located. Pre-split each such content into: one single-part content per
+// functionResponse (each early-returns cleanly as a tool message, emitted
+// first to keep tool-result-before-next-turn ordering) plus one content for
+// the remaining non-functionResponse parts.
+function splitCoLocatedFunctionResponses(contents) {
+  const out = [];
+  for (const content of contents) {
+    if (!content || !Array.isArray(content.parts)) {
+      out.push(content);
+      continue;
+    }
+    const hasFunctionResponse = content.parts.some((p) => p && p.functionResponse);
+    if (!hasFunctionResponse) {
+      out.push(content);
+      continue;
+    }
+    for (const part of content.parts) {
+      if (part && part.functionResponse) {
+        out.push({ ...content, parts: [part] });
+      }
+    }
+    const nonFRParts = content.parts.filter((p) => !(p && p.functionResponse));
+    if (nonFRParts.length > 0) {
+      out.push({ ...content, parts: nonFRParts });
+    }
+  }
+  return out;
+}
+
+/** Convert Gemini history to OpenAI messages with its tool calls and media intact. */
+function convertGeminiContent(content, toolCallIds) {
   const role = content.role === "user" ? "user" : "assistant";
 
   if (!content.parts || !Array.isArray(content.parts)) {
@@ -92,20 +132,12 @@ function convertGeminiContent(content) {
       parts.push({ type: "text", text: part.text });
     }
 
-    if (part.inlineData || part.inline_data) {
-      const data = part.inlineData || part.inline_data;
-      const mimeType = data.mimeType || data.mime_type || "image/png";
-      parts.push({
-        type: "image_url",
-        image_url: {
-          url: `data:${mimeType};base64,${data.data}`,
-        },
-      });
-    }
+    const media = geminiMediaToOpenAI(part);
+    if (media) parts.push(media);
 
     if (part.functionCall) {
       toolCalls.push({
-        id: `call_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+        id: toolCallIds.callId(part.functionCall),
         type: "function",
         function: {
           name: part.functionCall.name,
@@ -115,12 +147,13 @@ function convertGeminiContent(content) {
     }
 
     if (part.functionResponse) {
+      const resp = part.functionResponse.response;
+      const resultPayload =
+        resp && typeof resp === "object" && "result" in resp ? resp.result : (resp ?? {});
       return {
         role: "tool",
-        tool_call_id: part.functionResponse.id || part.functionResponse.name,
-        content: JSON.stringify(
-          part.functionResponse.response?.result || part.functionResponse.response || {}
-        ),
+        tool_call_id: toolCallIds.responseId(part.functionResponse),
+        content: JSON.stringify(resultPayload),
       };
     }
   }
@@ -148,6 +181,50 @@ function convertGeminiContent(content) {
   return null;
 }
 
+// Gemini marks thinking-mode output with `part.thought === true` on the model's own
+// `parts` array (no separate field on the content itself). Left alone,
+// convertGeminiContent() treats a thought part exactly like a visible text part —
+// merging the model's internal reasoning into the message's regular `content`, which
+// both leaks the private reasoning to whatever the OpenAI pivot forwards to next and
+// prevents Reasoning Replay Cache (docs/routing/REASONING_REPLAY.md) from ever seeing
+// it as `reasoning_content`. Split thought parts out first and re-attach the joined
+// text as `reasoning_content` on the resulting message instead.
+function convertGeminiContentWithReasoning(content, toolCallIds) {
+  if (!content || !Array.isArray(content.parts)) {
+    return convertGeminiContent(content, toolCallIds);
+  }
+
+  let reasoningContent = "";
+  const visibleParts = [];
+  for (const part of content.parts) {
+    if (part && part.thought === true) {
+      if (typeof part.text === "string") reasoningContent += part.text;
+    } else {
+      visibleParts.push(part);
+    }
+  }
+
+  if (!reasoningContent) {
+    return convertGeminiContent(content, toolCallIds);
+  }
+
+  const converted = convertGeminiContent({ ...content, parts: visibleParts }, toolCallIds);
+
+  if (converted && converted.role !== "tool") {
+    return { ...converted, reasoning_content: reasoningContent };
+  }
+
+  if (!converted) {
+    const role = content.role === "user" ? "user" : "assistant";
+    return { role, reasoning_content: reasoningContent };
+  }
+
+  // A `tool` message (functionResponse) can't carry reasoning_content — fall back to
+  // returning it unchanged rather than fabricating a field the tool-message schema
+  // doesn't expect.
+  return converted;
+}
+
 // Extract text from Gemini content
 function extractGeminiText(content) {
   if (typeof content === "string") return content;
@@ -159,4 +236,3 @@ function extractGeminiText(content) {
 
 // Register
 register(FORMATS.GEMINI, FORMATS.OPENAI, geminiToOpenAIRequest, null);
-register(FORMATS.GEMINI_CLI, FORMATS.OPENAI, geminiToOpenAIRequest, null);

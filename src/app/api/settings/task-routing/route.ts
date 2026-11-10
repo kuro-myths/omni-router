@@ -4,20 +4,25 @@ import {
   setTaskRoutingConfig,
   resetTaskRoutingStats,
   getDefaultTaskModelMap,
+  getDefaultTaskPatterns,
 } from "@omniroute/open-sse/services/taskAwareRouter.ts";
 import { updateSettings } from "@/lib/db/settings";
 import { taskRoutingActionSchema, updateTaskRoutingSchema } from "@/shared/validation/schemas";
 import { isValidationFailure, validateBody } from "@/shared/validation/helpers";
+import { requireManagementAuth } from "@/lib/api/requireManagementAuth";
 
 /**
  * GET /api/settings/task-routing
  * Returns the current task-aware routing configuration.
  */
-export async function GET() {
+export async function GET(request: Request) {
+  const authError = await requireManagementAuth(request);
+  if (authError) return authError;
   try {
     return NextResponse.json({
       ...getTaskRoutingConfig(),
       defaultTaskModelMap: getDefaultTaskModelMap(),
+      defaultTaskPatterns: getDefaultTaskPatterns(),
     });
   } catch (error) {
     console.error("[API ERROR] /api/settings/task-routing GET:", error);
@@ -28,9 +33,12 @@ export async function GET() {
 /**
  * PUT /api/settings/task-routing
  * Update the task-aware routing configuration.
- * Body: { enabled?: boolean, taskModelMap?: { coding?: "...", ... }, detectionEnabled?: boolean }
+ * Body: { enabled?: boolean, taskModelMap?: { coding?: "...", ... }, detectionEnabled?: boolean,
+ *          patternOverrides?: { coding?: { patterns?: string[], userPatterns?: string[] }, ... } }
  */
 export async function PUT(request: Request) {
+  const authError = await requireManagementAuth(request);
+  if (authError) return authError;
   let rawBody: unknown;
   try {
     rawBody = await request.json();
@@ -73,6 +81,8 @@ export async function PUT(request: Request) {
  * For "detect": pass { action: "detect", body: <request-body> } to test detection
  */
 export async function POST(request: Request) {
+  const authError = await requireManagementAuth(request);
+  if (authError) return authError;
   let rawBody: unknown;
   try {
     rawBody = await request.json();

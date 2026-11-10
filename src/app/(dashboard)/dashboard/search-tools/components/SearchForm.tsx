@@ -1,14 +1,29 @@
 "use client";
 
-import { useState } from "react";
+import { Disclosure, DisclosureContent, DisclosureTrigger } from "@omniroute/ui-kit/disclosure";
+import { useId, useState } from "react";
+import Link from "next/link";
 import { useTranslations } from "next-intl";
+import { Field } from "@omniroute/ui-kit/field";
+// Button/Select stay on the barrel (the search-tab test mocks it); the newly used adapters are
+// imported from their own modules.
 import { Button, Select } from "@/shared/components";
+import Badge from "@/shared/components/Badge";
+import Input from "@/shared/components/Input";
+import Textarea from "@/shared/components/Textarea";
+import type { SearchProviderCatalogItem } from "@/shared/schemas/searchTools";
 
 interface SearchProvider {
   id: string;
   name: string;
   status: "active" | "no_credentials";
   cost_per_query: number;
+}
+
+/** Extended provider info from the catalog (optional — shown if catalogProviders is supplied). */
+interface SearchFormExtendedProps {
+  /** If supplied, shows cost + quota + status badges next to the provider dropdown. */
+  catalogProviders?: SearchProviderCatalogItem[];
 }
 
 export interface SearchFormData {
@@ -24,16 +39,23 @@ export interface SearchFormData {
   safe_search?: string;
 }
 
-interface SearchFormProps {
+interface SearchFormProps extends SearchFormExtendedProps {
   onSearch: (data: SearchFormData) => void;
   loading: boolean;
   onCancel: () => void;
   providers: SearchProvider[];
 }
 
-export default function SearchForm({ onSearch, loading, onCancel, providers }: SearchFormProps) {
+export default function SearchForm({
+  onSearch,
+  loading,
+  onCancel,
+  providers,
+  catalogProviders,
+}: SearchFormProps) {
   const t = useTranslations("search");
   const tc = useTranslations("common");
+  const queryId = useId();
   const [query, setQuery] = useState("");
   const [provider, setProvider] = useState("auto");
   const [searchType, setSearchType] = useState("web");
@@ -50,6 +72,9 @@ export default function SearchForm({ onSearch, loading, onCancel, providers }: S
 
   const activeProviders = providers.filter((p) => p.status === "active");
   const noProviders = activeProviders.length === 0;
+
+  // Look up catalog metadata for the currently selected provider
+  const catalogInfo = catalogProviders?.find((cp) => cp.id === provider) ?? null;
 
   const handleSubmit = () => {
     const data: SearchFormData = {
@@ -87,33 +112,31 @@ export default function SearchForm({ onSearch, loading, onCancel, providers }: S
     <div className="flex flex-col h-full">
       {/* Query */}
       <div className="p-4 border-b border-border">
-        <label className="block text-[10px] font-semibold text-text-muted uppercase tracking-wider mb-2">
-          {t("searchQuery")}
-        </label>
-        <textarea
-          value={query}
-          onChange={(e) => setQuery(e.target.value)}
-          placeholder={t("queryPlaceholder")}
-          className="w-full bg-surface border border-border rounded-lg p-2.5 text-sm text-text-main resize-none h-16 focus:outline-none focus:ring-2 focus:ring-primary/30"
-          onKeyDown={(e) => {
-            if (e.key === "Enter" && !e.shiftKey) {
-              e.preventDefault();
-              if (!noProviders && query.trim()) handleSubmit();
-            }
-          }}
-        />
+        <Field label={t("searchQuery")} htmlFor={queryId}>
+          <Textarea
+            id={queryId}
+            value={query}
+            onChange={(e) => setQuery(e.target.value)}
+            placeholder={t("queryPlaceholder")}
+            className="resize-none h-16"
+            onKeyDown={(e) => {
+              if (e.key === "Enter" && !e.shiftKey) {
+                e.preventDefault();
+                if (!noProviders && query.trim()) handleSubmit();
+              }
+            }}
+          />
+        </Field>
       </div>
 
       {/* Provider + Type + Max Results */}
       <div className="p-4 border-b border-border space-y-2">
         <div className="flex gap-2">
           <div className="flex-1">
-            <label className="block text-[10px] text-text-muted uppercase tracking-wider mb-1">
-              {t("provider")}
-            </label>
             <Select
+              label={t("provider")}
               value={provider}
-              onChange={(e: any) => setProvider(e.target.value)}
+              onChange={(e: React.ChangeEvent<HTMLSelectElement>) => setProvider(e.target.value)}
               options={[
                 { value: "auto", label: t("providerAuto") },
                 ...activeProviders.map((p) => ({
@@ -123,12 +146,53 @@ export default function SearchForm({ onSearch, loading, onCancel, providers }: S
               ]}
               className="w-full"
             />
+            {/* Catalog metadata badge (F8 — provider cost/quota/status) */}
+            {catalogInfo && (
+              <div className="mt-1 flex flex-wrap gap-x-2 text-[10px] text-text-muted">
+                <span>
+                  <span className="font-medium text-text-main">
+                    ${catalogInfo.costPerQuery.toFixed(4)}
+                  </span>
+                  /query
+                </span>
+                {catalogInfo.freeMonthlyQuota > 0 && (
+                  <span>
+                    Free{" "}
+                    <span className="font-medium text-text-main">
+                      {catalogInfo.freeMonthlyQuota >= 1000
+                        ? `${(catalogInfo.freeMonthlyQuota / 1000).toFixed(0)}k`
+                        : catalogInfo.freeMonthlyQuota}
+                    </span>
+                    /mo
+                  </span>
+                )}
+                <span
+                  className={
+                    catalogInfo.status === "configured"
+                      ? "text-success"
+                      : catalogInfo.status === "rate_limited"
+                        ? "text-warning"
+                        : "text-text-muted"
+                  }
+                  data-testid="provider-status-badge"
+                >
+                  {catalogInfo.status === "configured"
+                    ? "● ok"
+                    : catalogInfo.status === "rate_limited"
+                      ? "● limited"
+                      : "● missing"}
+                </span>
+                {catalogInfo.status === "missing" && (
+                  <Link href={catalogInfo.configureHref} className="text-accent hover:underline">
+                    Configure →
+                  </Link>
+                )}
+              </div>
+            )}
           </div>
           <div className="flex-1">
-            <label className="block text-[10px] text-text-muted uppercase tracking-wider mb-1">
-              {t("searchType")}
-            </label>
             <Select
+              label={t("searchType")}
               value={searchType}
               onChange={(e: any) => setSearchType(e.target.value)}
               options={[
@@ -140,56 +204,46 @@ export default function SearchForm({ onSearch, loading, onCancel, providers }: S
           </div>
         </div>
         <div className="w-20">
-          <label className="block text-[10px] text-text-muted uppercase tracking-wider mb-1">
-            {t("maxResults")}
-          </label>
-          <input
+          <Input
+            label={t("maxResults")}
             type="number"
             value={maxResults}
             onChange={(e) => setMaxResults(parseInt(e.target.value) || 5)}
             min={1}
             max={100}
-            className="w-full bg-surface border border-border rounded-lg px-2.5 py-1.5 text-sm text-text-main focus:outline-none focus:ring-2 focus:ring-primary/30"
           />
         </div>
       </div>
 
       {/* Filters (collapsible) */}
       <div className="p-4 border-b border-border">
-        <button
-          className="flex justify-between items-center w-full"
-          onClick={() => setShowFilters(!showFilters)}
-        >
-          <span className="text-[10px] font-semibold text-text-muted uppercase tracking-wider">
-            {t("filters")}
-          </span>
-          <span className="text-text-muted text-xs">{showFilters ? "▼" : "▶"}</span>
-        </button>
-        {showFilters && (
-          <div className="mt-3 space-y-2">
+        <Disclosure open={showFilters} onOpenChange={setShowFilters}>
+          <DisclosureTrigger>
+            <span className="text-[10px] font-semibold text-text-muted uppercase tracking-wider">
+              {t("filters")}
+            </span>
+          </DisclosureTrigger>
+          {/* Unmounted while closed, as before: the filter values live in this form's state. */}
+          <DisclosureContent className="mt-3 space-y-2">
             <div className="flex gap-2">
-              <div className="flex-1">
-                <label className="block text-[10px] text-text-muted mb-1">{t("country")}</label>
-                <input
-                  value={country}
-                  onChange={(e) => setCountry(e.target.value)}
-                  placeholder={t("optionAny")}
-                  className="w-full bg-surface border border-border rounded-md px-2 py-1.5 text-xs text-text-main focus:outline-none"
-                />
-              </div>
-              <div className="flex-1">
-                <label className="block text-[10px] text-text-muted mb-1">{t("language")}</label>
-                <input
-                  value={language}
-                  onChange={(e) => setLanguage(e.target.value)}
-                  placeholder={t("optionAny")}
-                  className="w-full bg-surface border border-border rounded-md px-2 py-1.5 text-xs text-text-main focus:outline-none"
-                />
-              </div>
+              <Input
+                className="flex-1"
+                label={t("country")}
+                value={country}
+                onChange={(e) => setCountry(e.target.value)}
+                placeholder={t("optionAny")}
+              />
+              <Input
+                className="flex-1"
+                label={t("language")}
+                value={language}
+                onChange={(e) => setLanguage(e.target.value)}
+                placeholder={t("optionAny")}
+              />
             </div>
             <div>
-              <label className="block text-[10px] text-text-muted mb-1">{t("timeRange")}</label>
               <Select
+                label={t("timeRange")}
                 value={timeRange}
                 onChange={(e: any) => setTimeRange(e.target.value)}
                 options={[
@@ -203,75 +257,82 @@ export default function SearchForm({ onSearch, loading, onCancel, providers }: S
               />
             </div>
             <div>
-              <label className="block text-[10px] text-text-muted mb-1">
-                {t("includeDomains")}
-              </label>
-              <div className="flex gap-1">
-                <input
+              <div className="flex items-end gap-1">
+                <Input
+                  className="flex-1"
+                  label={t("includeDomains")}
                   value={domainInput}
                   onChange={(e) => setDomainInput(e.target.value)}
                   placeholder={t("domainPlaceholder")}
-                  className="flex-1 bg-surface border border-border rounded-md px-2 py-1.5 text-xs text-text-main focus:outline-none"
                   onKeyDown={(e) => e.key === "Enter" && addDomain("include")}
                 />
-                <button onClick={() => addDomain("include")} className="text-primary text-lg px-1">
-                  +
-                </button>
+                <Button
+                  variant="ghost"
+                  size="icon"
+                  icon="add"
+                  aria-label={`${tc("add")}: ${t("includeDomains")}`}
+                  title={`${tc("add")}: ${t("includeDomains")}`}
+                  onClick={() => addDomain("include")}
+                />
               </div>
               {includeDomains.length > 0 && (
                 <div className="flex flex-wrap gap-1 mt-1">
                   {includeDomains.map((d) => (
-                    <span
-                      key={d}
-                      className="text-[10px] bg-primary/10 text-primary px-2 py-0.5 rounded-full flex items-center gap-1"
-                    >
+                    <Badge key={d} size="sm" variant="primary">
                       {d}
-                      <button
+                      <Button
+                        variant="ghost"
+                        size="icon"
+                        icon="close"
+                        className="size-4 min-h-4 p-0"
+                        aria-label={`${tc("delete")}: ${d}`}
                         onClick={() => removeDomain(d, "include")}
-                        className="text-primary/60"
-                      >
-                        ×
-                      </button>
-                    </span>
+                      />
+                    </Badge>
                   ))}
                 </div>
               )}
             </div>
             <div>
-              <label className="block text-[10px] text-text-muted mb-1">
-                {t("excludeDomains")}
-              </label>
-              <div className="flex gap-1">
-                <input
+              <div className="flex items-end gap-1">
+                <Input
+                  className="flex-1"
+                  label={t("excludeDomains")}
                   value={excludeDomainInput}
                   onChange={(e) => setExcludeDomainInput(e.target.value)}
                   placeholder={t("domainPlaceholder")}
-                  className="flex-1 bg-surface border border-border rounded-md px-2 py-1.5 text-xs text-text-main focus:outline-none"
                   onKeyDown={(e) => e.key === "Enter" && addDomain("exclude")}
                 />
-                <button onClick={() => addDomain("exclude")} className="text-primary text-lg px-1">
-                  +
-                </button>
+                <Button
+                  variant="ghost"
+                  size="icon"
+                  icon="add"
+                  aria-label={`${tc("add")}: ${t("excludeDomains")}`}
+                  title={`${tc("add")}: ${t("excludeDomains")}`}
+                  onClick={() => addDomain("exclude")}
+                />
               </div>
               {excludeDomains.length > 0 && (
                 <div className="flex flex-wrap gap-1 mt-1">
                   {excludeDomains.map((d) => (
-                    <span
-                      key={d}
-                      className="text-[10px] bg-error/10 text-error px-2 py-0.5 rounded-full flex items-center gap-1"
-                    >
+                    <Badge key={d} size="sm" variant="error">
                       {d}
-                      <button onClick={() => removeDomain(d, "exclude")} className="text-error/60">
-                        ×
-                      </button>
-                    </span>
+                      <Button
+                        variant="ghost"
+                        size="icon"
+                        icon="close"
+                        className="size-4 min-h-4 p-0"
+                        aria-label={`${tc("delete")}: ${d}`}
+                        onClick={() => removeDomain(d, "exclude")}
+                      />
+                    </Badge>
                   ))}
                 </div>
               )}
             </div>
             <div>
-              <label className="block text-[10px] text-text-muted mb-1">{t("safeSearch")}</label>
               <Select
+                label={t("safeSearch")}
                 value={safeSearch}
                 onChange={(e: any) => setSafeSearch(e.target.value)}
                 options={[
@@ -282,8 +343,8 @@ export default function SearchForm({ onSearch, loading, onCancel, providers }: S
                 className="w-full"
               />
             </div>
-          </div>
-        )}
+          </DisclosureContent>
+        </Disclosure>
       </div>
 
       {/* Search button */}

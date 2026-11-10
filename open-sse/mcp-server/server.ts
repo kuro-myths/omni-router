@@ -1,29 +1,24 @@
-/**
- * OmniRoute MCP Server — Model Context Protocol server exposing
- * OmniRoute gateway intelligence as tools for AI agents.
- *
- * Supports two transports:
- *   1. stdio  — for IDE integration (VS Code, Cursor, Claude Desktop)
- *   2. HTTP   — for remote/programmatic access
- *
- * Tools wrap existing OmniRoute API endpoints and add intelligence
- * such as routing simulation, budget guards, and session snapshots.
- */
-
+import { realpathSync } from "node:fs";
+import { resolve as resolvePath } from "node:path";
+import { fileURLToPath } from "node:url";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-
+import { APP_CONFIG } from "@/shared/constants/appConfig";
+import { registerToolSearchTool } from "./toolSearch/register.ts";
 import {
   MCP_TOOLS,
   getHealthInput,
   listCombosInput,
   getComboMetricsInput,
   switchComboInput,
+  createComboInput,
   checkQuotaInput,
   routeRequestInput,
   costReportInput,
   listModelsCatalogInput,
-  webSearchInput,
+  buildWebSearchInputSchema,
+  xSearchInput,
+  webFetchInput,
   simulateRouteInput,
   setBudgetGuardInput,
   setRoutingStrategyInput,
@@ -32,18 +27,28 @@ import {
   getProviderMetricsInput,
   bestComboForTaskInput,
   explainRouteInput,
+  pickFastestModelInput,
   getSessionSnapshotInput,
+  dbHealthCheckInput,
   syncPricingInput,
+  cacheStatsInput,
+  cacheFlushInput,
+  oneproxyFetchInput,
+  oneproxyRotateInput,
+  oneproxyStatsInput,
 } from "./schemas/tools.ts";
 import { startMcpHeartbeat } from "./runtimeHeartbeat.ts";
-
-import { logToolCall } from "./audit.ts";
+import { countUniqueMcpTools } from "./toolCount.ts";
+import { z } from "zod";
+import { closeAuditDb, logToolCall } from "./audit.ts";
 import {
+  buildScopeDenialMessage,
   evaluateToolScopes,
   resolveCallerScopeContext,
+  shouldForceScopeEnforcement,
   type McpToolExtraLike,
 } from "./scopeEnforcement.ts";
-
+import { resolveMcpToolOwnerId } from "./mcpCallerIdentity.ts";
 import {
   handleSimulateRoute,
   handleSetBudgetGuard,
@@ -54,102 +59,149 @@ import {
   handleBestComboForTask,
   handleExplainRoute,
   handleGetSessionSnapshot,
+  handleDbHealthCheck,
   handleSyncPricing,
+  handleCacheStats,
+  handleCacheFlush,
+  handleOneproxyFetch,
+  handleOneproxyRotate,
+  handleOneproxyStats,
 } from "./tools/advancedTools.ts";
+import { handlePickFastestModel } from "./tools/pickFastestModel.ts";
+import { registerPerplexityResearchTool } from "./tools/perplexityResearch.ts";
+// #15159 M-01 — "file = register + wrap. handle* -> tools/canonical/*.ts".
+// These twelve handlers used to be defined inline below `withScopeEnforcement`,
+// which made this file a 784-line registration-and-implementation mix. They are
+// unchanged in behaviour; they just live where the other thirteen tool modules
+// already live. `coercions.ts` holds the helpers both sides need, so neither
+// direction imports the other and graph cycles 193/194 stay closed (M-06).
+import {
+  handleCheckQuota,
+  handleCreateCombo,
+  handleGetComboMetrics,
+  handleGetHealth,
+  handleListCombos,
+  handleSwitchCombo,
+} from "./tools/opsTools.ts";
+import {
+  handleCostReport,
+  handleListModelsCatalog,
+  handleRouteRequest,
+} from "./tools/inferenceTools.ts";
+import { handleWebFetch, handleWebSearch, handleXSearch } from "./tools/webTools.ts";
+import { toRecord } from "./coercions.ts";
 import { memoryTools } from "./tools/memoryTools.ts";
 import { skillTools } from "./tools/skillTools.ts";
-import { normalizeQuotaResponse } from "../../src/shared/contracts/quota.ts";
-import { resolveOmniRouteBaseUrl } from "../../src/shared/utils/resolveOmniRouteBaseUrl.ts";
+import { agentSkillTools } from "./tools/agentSkillTools.ts";
+import { githubSkillTools } from "./tools/githubSkillTools.ts";
+import { skillRegistry } from "../../src/lib/skills/registry.ts";
+import { skillExecutor } from "../../src/lib/skills/executor.ts";
+import { pluginTools } from "./tools/pluginTools.ts";
+import { compressionTools } from "./tools/compressionTools.ts";
+import { poolTools } from "./tools/poolTools.ts";
+import { gamificationTools } from "./tools/gamificationTools.ts";
+import { notionTools } from "./tools/notionTools.ts";
+import { obsidianTools } from "./tools/obsidianTools.ts";
+import { localCorpusTools } from "./tools/localCorpusTools.ts";
+import { compressMcpRegistryMetadata } from "./descriptionCompressor.ts";
+import { reduceToolManifest, readMcpToolProfileFromEnv } from "./toolCardinality.ts";
+import { smartFilterText } from "../services/compression/engines/mcpAccessibility/index.ts";
+import {
+  DEFAULT_MCP_ACCESSIBILITY_CONFIG,
+  clampMcpAccessibilityConfig,
+  type McpAccessibilityConfig,
+} from "../services/compression/engines/mcpAccessibility/constants.ts";
+import { getDbInstance, ensureDbInitialized } from "../../src/lib/db/core.ts";
+import { isMcpScopeEnforcementEnabled } from "../../src/shared/utils/featureFlags.ts";
+import { toSafeMcpErrorMessage } from "./errorMessage.ts";
+import { registerRadarCatalogTool } from "./radarCatalog.ts";
+import type { TextToolResult } from "./toolResult.ts";
+export { getMcpModelsCatalog } from "./catalog.ts";
 
-// ============ Configuration ============
-
-const OMNIROUTE_BASE_URL = resolveOmniRouteBaseUrl();
-const OMNIROUTE_API_KEY = process.env.OMNIROUTE_API_KEY || "";
-const MCP_ENFORCE_SCOPES = process.env.OMNIROUTE_MCP_ENFORCE_SCOPES === "true";
 const MCP_ALLOWED_SCOPES = new Set(
   (process.env.OMNIROUTE_MCP_SCOPES || "")
     .split(",")
     .map((s) => s.trim())
     .filter(Boolean)
 );
+const TOTAL_MCP_TOOL_COUNT = countUniqueMcpTools({
+  MCP_TOOLS,
+  memoryTools,
+  skillTools,
+  agentSkillTools,
+  githubSkillTools,
+  poolTools,
+  gamificationTools,
+  pluginTools,
+  notionTools,
+  obsidianTools,
+  localCorpusTools,
+  compressionTools,
+});
 
-type JsonRecord = Record<string, unknown>;
-
-type TextToolResult = {
-  content: Array<{ type: "text"; text: string }>;
-  isError?: boolean;
-};
-
-function toRecord(value: unknown): JsonRecord {
-  return value && typeof value === "object" && !Array.isArray(value) ? (value as JsonRecord) : {};
-}
-
-function toArray(value: unknown): unknown[] {
-  return Array.isArray(value) ? value : [];
-}
-
-function toString(value: unknown, fallback = ""): string {
-  return typeof value === "string" ? value : fallback;
-}
-
-function toNumber(value: unknown, fallback = 0): number {
-  return typeof value === "number" && Number.isFinite(value) ? value : fallback;
-}
-
-function toStringArray(value: unknown, fallback: string[] = []): string[] {
-  const values = toArray(value).filter((entry): entry is string => typeof entry === "string");
-  return values.length > 0 ? values : fallback;
-}
-
-function normalizeComboModels(
-  rawModels: unknown
-): Array<{ provider: string; model: string; priority: number }> {
-  return toArray(rawModels).map((rawModel, index) => {
-    const model = toRecord(rawModel);
-    return {
-      provider: toString(model.provider, "unknown"),
-      model: toString(model.model, "unknown"),
-      priority: toNumber(model.priority, index + 1),
-    };
-  });
-}
-
-/**
- * Internal fetch helper that calls OmniRoute API endpoints.
- */
-async function omniRouteFetch(path: string, options: RequestInit = {}): Promise<unknown> {
-  const url = `${OMNIROUTE_BASE_URL}${path}`;
-  const headers: Record<string, string> = {
-    "Content-Type": "application/json",
-    ...(OMNIROUTE_API_KEY ? { Authorization: `Bearer ${OMNIROUTE_API_KEY}` } : {}),
-    ...((options.headers as Record<string, string>) || {}),
-  };
-
-  const response = await fetch(url, { ...options, headers, signal: AbortSignal.timeout(10000) });
-
-  if (!response.ok) {
-    const errorText = await response.text().catch(() => "Unknown error");
-    throw new Error(`OmniRoute API error [${response.status}]: ${errorText}`);
+function readMcpDescriptionCompressionEnabled(): boolean {
+  try {
+    const row = getDbInstance()
+      .prepare("SELECT value FROM key_value WHERE namespace = ? AND key = ?")
+      .get("compression", "mcpDescriptionCompressionEnabled") as { value?: string } | undefined;
+    if (!row?.value) return true;
+    return JSON.parse(row.value) !== false;
+  } catch {
+    return true;
   }
-
-  return response.json();
 }
+
+function readMcpAccessibilityConfig(): McpAccessibilityConfig {
+  try {
+    const row = getDbInstance()
+      .prepare("SELECT value FROM key_value WHERE namespace = ? AND key = ?")
+      .get("compression", "mcpAccessibility") as { value?: string } | undefined;
+    if (!row?.value) return { ...DEFAULT_MCP_ACCESSIBILITY_CONFIG };
+    // clampMcpAccessibilityConfig bounds every field (and folds in the non-object guard), so a
+    // persisted out-of-range maxTextChars can't make smartFilterText truncate the whole text.
+    return clampMcpAccessibilityConfig(JSON.parse(row.value));
+  } catch {
+    return { ...DEFAULT_MCP_ACCESSIBILITY_CONFIG };
+  }
+}
+
+// #15159 M-01: toRecord / toArray / toString / toFiniteNumber / isLaneFlagOn /
+// toUptimeString / normalizeComboModels moved to `./coercions.ts`. They are pure
+// and import nothing, so both this file and the extracted `tools/*` modules can
+// depend on them without either depending on the other — which is what keeps
+// the `server.ts -> tools/*` edge one-directional. `toRecord` is still used here,
+// by `withScopeEnforcement` below; the rest are imported only by the handlers.
+/**
+ * Re-exported rather than defined here, and imported (not just re-exported) because the
+ * tool handlers below call it by name — a bare `export … from` creates no local binding.
+ *
+ * #15159 M-06: the hop moved to its own leaf module so that `catalog.ts` and
+ * `radarCatalog.ts` can import it directly instead of reaching back into this file
+ * through `import("./server.ts")`, which closed two cycles in the dependency graph.
+ */
+import { omniRouteFetch } from "./internalFetch.ts";
+
+export { omniRouteFetch };
 
 function withScopeEnforcement(
   toolName: string,
-  handler: (args: unknown, extra?: McpToolExtraLike) => Promise<TextToolResult>
+  handler: (args: unknown, extra?: McpToolExtraLike) => Promise<TextToolResult>,
+  toolScopes?: readonly string[]
 ) {
   return async (args: unknown, extra?: McpToolExtraLike): Promise<TextToolResult> => {
     const scopeContext = resolveCallerScopeContext(extra, Array.from(MCP_ALLOWED_SCOPES));
-    const scopeCheck = evaluateToolScopes(toolName, scopeContext.scopes, MCP_ENFORCE_SCOPES);
+    const scopeCheck = evaluateToolScopes(
+      toolName,
+      scopeContext.scopes,
+      isMcpScopeEnforcementEnabled() || shouldForceScopeEnforcement(scopeContext),
+      toolScopes
+    );
     if (!scopeCheck.allowed) {
-      const missingScopes =
-        scopeCheck.missing.length > 0 ? scopeCheck.missing.join(", ") : "unavailable";
       const reason = scopeCheck.reason || "scope_check_failed";
-      const msg =
-        `Insufficient MCP scopes for ${toolName}. ` +
-        `Missing: ${missingScopes}. ` +
-        `Caller=${scopeContext.callerId}, source=${scopeContext.source}.`;
+      // S-04 (#15159): no Caller=/source= here — see buildScopeDenialMessage. The
+      // identity is still recorded in the _scopeCheck audit payload below, which is
+      // where an operator needs it.
+      const msg = buildScopeDenialMessage(toolName, scopeCheck.missing);
       const safeArgs = args && typeof args === "object" ? toRecord(args) : { rawArgs: args };
       await logToolCall(
         toolName,
@@ -178,375 +230,95 @@ function withScopeEnforcement(
   };
 }
 
-// ============ Tool Handlers ============
-
-async function handleGetHealth() {
-  const start = Date.now();
-  try {
-    const [healthRaw, resilienceRaw, rateLimitsRaw] = await Promise.allSettled([
-      omniRouteFetch("/api/monitoring/health"),
-      omniRouteFetch("/api/resilience"),
-      omniRouteFetch("/api/rate-limits"),
-    ]);
-
-    const health = healthRaw.status === "fulfilled" ? toRecord(healthRaw.value) : {};
-    const resilience = resilienceRaw.status === "fulfilled" ? toRecord(resilienceRaw.value) : {};
-    const rateLimits = rateLimitsRaw.status === "fulfilled" ? toRecord(rateLimitsRaw.value) : {};
-    const memoryUsageRaw = toRecord(health.memoryUsage);
-    const cacheStatsRaw = toRecord(health.cacheStats);
-    const resilienceCircuitBreakers = toArray(resilience.circuitBreakers);
-    const rateLimitEntries = toArray(rateLimits.limits);
-
-    const result = {
-      uptime: toString(health.uptime, "unknown"),
-      version: toString(health.version, "unknown"),
-      memoryUsage: {
-        heapUsed: toNumber(memoryUsageRaw.heapUsed, 0),
-        heapTotal: toNumber(memoryUsageRaw.heapTotal, 0),
-      },
-      circuitBreakers: resilienceCircuitBreakers,
-      rateLimits: rateLimitEntries,
-      cacheStats:
-        Object.keys(cacheStatsRaw).length > 0
-          ? {
-              hits: toNumber(cacheStatsRaw.hits, 0),
-              misses: toNumber(cacheStatsRaw.misses, 0),
-              hitRate: toNumber(cacheStatsRaw.hitRate, 0),
-            }
-          : undefined,
-      cryptography: health.cryptography
-        ? {
-            status: toString(toRecord(health.cryptography).status, "missing_or_invalid"),
-            provider: toString(toRecord(health.cryptography).provider, "unknown"),
-          }
-        : undefined,
-    };
-
-    await logToolCall("omniroute_get_health", {}, result, Date.now() - start, true);
-    return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    await logToolCall("omniroute_get_health", {}, null, Date.now() - start, false, msg);
-    return { content: [{ type: "text" as const, text: `Error: ${msg}` }], isError: true };
-  }
+export interface CreateMcpServerOptions {
+  blockedProviders?: string[] | (() => string[]);
 }
 
-async function handleListCombos(args: { includeMetrics?: boolean }) {
-  const start = Date.now();
-  try {
-    const combosRaw = await omniRouteFetch("/api/combos");
-    const combosRecord = toRecord(combosRaw);
-    const combos = Array.isArray(combosRecord.combos)
-      ? combosRecord.combos
-      : Array.isArray(combosRaw)
-        ? combosRaw
-        : [];
-    let metrics: JsonRecord = {};
-    if (args.includeMetrics) {
-      metrics = toRecord(await omniRouteFetch("/api/combos/metrics").catch(() => ({})));
+export function createMcpServer(options?: CreateMcpServerOptions): McpServer {
+  const resolveBlockedProviders = (): string[] => {
+    if (typeof options?.blockedProviders === "function") {
+      return options.blockedProviders();
     }
-
-    const result = {
-      combos: toArray(combos).map((rawCombo) => {
-        const combo = toRecord(rawCombo);
-        const comboData = toRecord(combo.data);
-        const comboId = toString(combo.id, "");
-        const modelsSource =
-          Array.isArray(combo.models) && combo.models.length > 0 ? combo.models : comboData.models;
-        return {
-          id: comboId,
-          name: toString(combo.name, comboId || "unnamed"),
-          models: normalizeComboModels(modelsSource),
-          strategy: toString(combo.strategy, toString(comboData.strategy, "priority")),
-          enabled: combo.enabled !== false,
-          ...(args.includeMetrics ? { metrics: metrics[comboId] ?? null } : {}),
-        };
-      }),
-    };
-
-    await logToolCall("omniroute_list_combos", args, result, Date.now() - start, true);
-    return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    await logToolCall("omniroute_list_combos", args, null, Date.now() - start, false, msg);
-    return { content: [{ type: "text" as const, text: `Error: ${msg}` }], isError: true };
-  }
-}
-
-async function handleGetComboMetrics(args: { comboId: string }) {
-  const start = Date.now();
-  try {
-    const result = await omniRouteFetch(
-      `/api/combos/metrics?comboId=${encodeURIComponent(args.comboId)}`
-    );
-    await logToolCall("omniroute_get_combo_metrics", args, result, Date.now() - start, true);
-    return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    await logToolCall("omniroute_get_combo_metrics", args, null, Date.now() - start, false, msg);
-    return { content: [{ type: "text" as const, text: `Error: ${msg}` }], isError: true };
-  }
-}
-
-async function handleSwitchCombo(args: { comboId: string; active: boolean }) {
-  const start = Date.now();
-  try {
-    const result = await omniRouteFetch(`/api/combos/${encodeURIComponent(args.comboId)}`, {
-      method: "PUT",
-      body: JSON.stringify({ isActive: args.active }),
-    });
-    await logToolCall("omniroute_switch_combo", args, result, Date.now() - start, true);
-    return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    await logToolCall("omniroute_switch_combo", args, null, Date.now() - start, false, msg);
-    return { content: [{ type: "text" as const, text: `Error: ${msg}` }], isError: true };
-  }
-}
-
-async function handleCheckQuota(args: { provider?: string; connectionId?: string }) {
-  const start = Date.now();
-  try {
-    let path = "/api/usage/quota";
-    if (args.connectionId) path += `?connectionId=${encodeURIComponent(args.connectionId)}`;
-    else if (args.provider) path += `?provider=${encodeURIComponent(args.provider)}`;
-
-    const result = normalizeQuotaResponse(await omniRouteFetch(path), {
-      provider: args.provider || null,
-      connectionId: args.connectionId || null,
-    });
-
-    await logToolCall("omniroute_check_quota", args, result, Date.now() - start, true);
-    return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    await logToolCall("omniroute_check_quota", args, null, Date.now() - start, false, msg);
-    return { content: [{ type: "text" as const, text: `Error: ${msg}` }], isError: true };
-  }
-}
-
-async function handleRouteRequest(args: {
-  model: string;
-  messages: Array<{ role: string; content: string }>;
-  combo?: string;
-  budget?: number;
-  role?: string;
-  stream?: boolean;
-}) {
-  const start = Date.now();
-  try {
-    const body: Record<string, unknown> = {
-      model: args.model,
-      messages: args.messages,
-      stream: false, // MCP tool always returns non-streaming
-    };
-    if (args.combo) {
-      body["x-combo"] = args.combo;
+    if (Array.isArray(options?.blockedProviders)) {
+      return options.blockedProviders;
     }
+    return [];
+  };
 
-    const raw = (await omniRouteFetch("/v1/chat/completions", {
-      method: "POST",
-      body: JSON.stringify(body),
-    })) as JsonRecord;
-    const choices = toArray(raw.choices);
-    const firstChoice = toRecord(choices[0]);
-    const firstMessage = toRecord(firstChoice.message);
-    const usage = toRecord(raw.usage);
+  const blockedProviders = resolveBlockedProviders();
+  const dynamicWebSearchInput = buildWebSearchInputSchema(blockedProviders);
 
-    const result = {
-      response: {
-        content: toString(firstMessage.content, ""),
-        model: toString(raw.model, args.model),
-        tokens: {
-          prompt: toNumber(usage.prompt_tokens, 0),
-          completion: toNumber(usage.completion_tokens, 0),
-        },
-      },
-      routing: {
-        provider: toString(raw.provider, "unknown"),
-        combo: raw.combo ?? null,
-        fallbacksTriggered: toNumber(raw.fallbacksTriggered, 0),
-        cost: toNumber(raw.cost, 0),
-        latencyMs: Date.now() - start,
-        routingExplanation: toString(
-          raw.routingExplanation,
-          "Request routed through primary provider"
-        ),
-      },
-    };
-
-    await logToolCall(
-      "omniroute_route_request",
-      { model: args.model, messageCount: args.messages.length },
-      result.routing,
-      Date.now() - start,
-      true
-    );
-    return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    await logToolCall(
-      "omniroute_route_request",
-      { model: args.model },
-      null,
-      Date.now() - start,
-      false,
-      msg
-    );
-    return { content: [{ type: "text" as const, text: `Error: ${msg}` }], isError: true };
-  }
-}
-
-async function handleCostReport(args: { period?: string }) {
-  const start = Date.now();
-  try {
-    const period = args.period || "session";
-    const rangeMap: Record<string, string> = {
-      session: "1d",
-      day: "1d",
-      week: "7d",
-      month: "30d",
-    };
-    const range = rangeMap[period] || "30d";
-    const raw = toRecord(
-      await omniRouteFetch(`/api/usage/analytics?range=${encodeURIComponent(range)}`)
-    );
-    const tokenCount = toRecord(raw.tokenCount);
-    const budget = toRecord(raw.budget);
-
-    const result = {
-      period,
-      totalCost: toNumber(raw.totalCost, 0),
-      requestCount: toNumber(raw.requestCount, 0),
-      tokenCount: {
-        prompt: toNumber(tokenCount.prompt, 0),
-        completion: toNumber(tokenCount.completion, 0),
-      },
-      byProvider: toArray(raw.byProvider),
-      byModel: toArray(raw.byModel),
-      budget: {
-        limit: budget.limit ?? null,
-        remaining: budget.remaining ?? null,
-      },
-    };
-
-    await logToolCall("omniroute_cost_report", args, result, Date.now() - start, true);
-    return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    await logToolCall("omniroute_cost_report", args, null, Date.now() - start, false, msg);
-    return { content: [{ type: "text" as const, text: `Error: ${msg}` }], isError: true };
-  }
-}
-
-async function handleListModelsCatalog(args: { provider?: string; capability?: string }) {
-  const start = Date.now();
-  try {
-    let path = "/v1/models";
-    let isProviderSpecific = false;
-    let source = "local_catalog";
-    let warning: string | undefined;
-
-    if (args.provider && !args.capability) {
-      // Use direct provider fetch to get real-time API status
-      path = `/api/providers/${encodeURIComponent(args.provider)}/models?excludeHidden=true`;
-      isProviderSpecific = true;
-    } else {
-      const params = new URLSearchParams();
-      if (args.provider) params.set("provider", args.provider);
-      if (args.capability) params.set("capability", args.capability);
-      if (params.toString()) path += `?${params.toString()}`;
-    }
-
-    const raw = toRecord(await omniRouteFetch(path));
-
-    // If we used the direct provider endpoint
-    let rawModels: unknown[] = [];
-    if (isProviderSpecific) {
-      rawModels = Array.isArray(raw.models) ? raw.models : [];
-      source = typeof raw.source === "string" ? raw.source : "api";
-      if (raw.warning) warning = String(raw.warning);
-    } else {
-      rawModels = Array.isArray(raw.data) ? raw.data : [];
-      source = "local_catalog";
-      // OmniRoute's global /v1/models is always a cached/local catalog
-    }
-
-    const result = {
-      models: rawModels.map((rawModel) => {
-        const model = toRecord(rawModel);
-        return {
-          id: toString(model.id, ""),
-          provider: toString(model.owned_by, toString(model.provider, args.provider || "unknown")),
-          capabilities: toStringArray(model.capabilities, ["chat"]),
-          status: toString(model.status, "available"),
-          pricing: model.pricing,
-        };
-      }),
-      source,
-      ...(warning ? { warning } : {}),
-    };
-
-    await logToolCall(
-      "omniroute_list_models_catalog",
-      args,
-      { modelCount: result.models.length },
-      Date.now() - start,
-      true
-    );
-    return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    await logToolCall("omniroute_list_models_catalog", args, null, Date.now() - start, false, msg);
-    return { content: [{ type: "text" as const, text: `Error: ${msg}` }], isError: true };
-  }
-}
-
-async function handleWebSearch(args: {
-  query: string;
-  max_results?: number;
-  search_type?: "web" | "news";
-  provider?:
-    | "serper-search"
-    | "brave-search"
-    | "perplexity-search"
-    | "exa-search"
-    | "tavily-search";
-}) {
-  const start = Date.now();
-  try {
-    const body: Record<string, unknown> = {
-      query: args.query,
-      max_results: args.max_results ?? 5,
-      search_type: args.search_type ?? "web",
-    };
-    if (args.provider) body.provider = args.provider;
-
-    const result = await omniRouteFetch("/v1/search", {
-      method: "POST",
-      body: JSON.stringify(body),
-    });
-    await logToolCall("omniroute_web_search", args, result, Date.now() - start, true);
-    return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    await logToolCall("omniroute_web_search", args, null, Date.now() - start, false, msg);
-    return { content: [{ type: "text" as const, text: `Error: ${msg}` }], isError: true };
-  }
-}
-
-// ============ MCP Server Setup ============
-
-/**
- * Create and configure the OmniRoute MCP Server with all essential tools.
- */
-export function createMcpServer(): McpServer {
   const server = new McpServer({
     name: "omniroute",
-    version: process.env.npm_package_version || "1.8.1",
+    version: APP_CONFIG.version,
   });
+  const mcpDescriptionCompressionEnabled = readMcpDescriptionCompressionEnabled();
+  const mcpAccessibilityConfig = readMcpAccessibilityConfig();
+  // F4.3 tool-cardinality: opt-in tool profile (MCP_TOOL_DENY / MCP_TOOL_ALLOW). null = no filter.
+  const toolProfile = readMcpToolProfileFromEnv(process.env);
+  const registerTool = server.registerTool.bind(server);
+  server.registerTool = ((name: string, config: Record<string, unknown>, handler: unknown) => {
+    const metadata = compressMcpRegistryMetadata(config, {
+      enabled: mcpDescriptionCompressionEnabled,
+    });
+    const filteredHandler = mcpAccessibilityConfig.enabled
+      ? async (args: unknown, extra?: unknown) => {
+          const result = await (handler as (a: unknown, e?: unknown) => Promise<TextToolResult>)(
+            args,
+            extra
+          );
+          if (Array.isArray(result?.content)) {
+            for (const block of result.content) {
+              if (block && block.type === "text" && typeof block.text === "string") {
+                block.text = smartFilterText(block.text, mcpAccessibilityConfig);
+              }
+            }
+          }
+          return result;
+        }
+      : handler;
+    const registered = registerTool(name, metadata, filteredHandler as never);
+    if (toolProfile && reduceToolManifest([{ name, scopes: [] }], toolProfile).length === 0) {
+      // Denied by the cardinality profile: keep the registration valid but disable it so the tool
+      // is not announced in tools/list (token savings). The default profile never reaches here.
+      const disablable = registered as unknown as { disable?: () => void };
+      if (typeof disablable?.disable === "function") disablable.disable();
+    }
+    return registered;
+  }) as typeof server.registerTool;
+  const registerPrompt = server.registerPrompt.bind(server);
+  server.registerPrompt = ((name: string, config: Record<string, unknown>, handler: unknown) => {
+    const metadata = compressMcpRegistryMetadata(config, {
+      enabled: mcpDescriptionCompressionEnabled,
+    });
+    return registerPrompt(name, metadata as never, handler as never);
+  }) as typeof server.registerPrompt;
+  const registerResource = server.registerResource.bind(server);
+  server.registerResource = ((
+    name: string,
+    uriOrTemplate: unknown,
+    config: Record<string, unknown>,
+    readCallback: unknown
+  ) => {
+    const metadata = compressMcpRegistryMetadata(config, {
+      enabled: mcpDescriptionCompressionEnabled,
+    });
+    return registerResource(name, uriOrTemplate as never, metadata as never, readCallback as never);
+  }) as typeof server.registerResource;
 
-  // Register essential tools
+  const RESERVED_MCP_NAMES = new Set([
+    ...MCP_TOOLS.map((t) => t.name),
+    ...Object.keys(memoryTools),
+    ...Object.keys(skillTools),
+    ...Object.keys(compressionTools),
+    ...Object.keys(poolTools),
+    ...pluginTools.map((t) => t.name),
+    ...gamificationTools.map((t) => t.name),
+    ...obsidianTools.map((t) => t.name),
+    ...notionTools.map((t) => t.name),
+    ...localCorpusTools.map((t) => t.name),
+  ]);
+
   server.registerTool(
     "omniroute_get_health",
     {
@@ -595,6 +367,17 @@ export function createMcpServer(): McpServer {
   );
 
   server.registerTool(
+    "omniroute_create_combo",
+    {
+      description: "Registers a new combo (model chain) with name, models, and strategy",
+      inputSchema: createComboInput,
+    },
+    withScopeEnforcement("omniroute_create_combo", (args) =>
+      handleCreateCombo(createComboInput.parse(args))
+    )
+  );
+
+  server.registerTool(
     "omniroute_check_quota",
     {
       description: "Checks remaining API quota for one or all providers",
@@ -638,7 +421,7 @@ export function createMcpServer(): McpServer {
     )
   );
 
-  // ── Advanced Tools (Phase 3) ──────────────────────────────
+  registerRadarCatalogTool(server, withScopeEnforcement);
 
   server.registerTool(
     "omniroute_simulate_route",
@@ -736,6 +519,17 @@ export function createMcpServer(): McpServer {
   );
 
   server.registerTool(
+    "omniroute_pick_fastest_model",
+    {
+      description: "Picks the fastest reliable provider-model pair from live telemetry.",
+      inputSchema: pickFastestModelInput,
+    },
+    withScopeEnforcement("omniroute_pick_fastest_model", (args) =>
+      handlePickFastestModel(pickFastestModelInput.parse(args))
+    )
+  );
+
+  server.registerTool(
     "omniroute_get_session_snapshot",
     {
       description:
@@ -746,6 +540,18 @@ export function createMcpServer(): McpServer {
       getSessionSnapshotInput.parse(args ?? {});
       return handleGetSessionSnapshot();
     })
+  );
+
+  server.registerTool(
+    "omniroute_db_health_check",
+    {
+      description:
+        "Diagnoses or repairs OmniRoute database drift, including broken combo references and orphan quota/domain rows",
+      inputSchema: dbHealthCheckInput,
+    },
+    withScopeEnforcement("omniroute_db_health_check", (args) =>
+      handleDbHealthCheck(dbHealthCheckInput.parse(args ?? {}))
+    )
   );
 
   server.registerTool(
@@ -765,15 +571,101 @@ export function createMcpServer(): McpServer {
     {
       description:
         "Performs a web search using OmniRoute's search gateway. Supports multiple providers (Serper, Brave, Perplexity, Exa, Tavily) with automatic failover. Returns search results with titles, URLs, snippets, and position data.",
-      inputSchema: webSearchInput,
+      inputSchema: dynamicWebSearchInput,
     },
     withScopeEnforcement("omniroute_web_search", (args) =>
-      handleWebSearch(webSearchInput.parse(args))
+      // Resolve per invocation (not the startup snapshot above) so a resolver
+      // function passed via CreateMcpServerOptions sees policy changes without
+      // a server rebuild. The advertised inputSchema stays a creation-time
+      // snapshot — MCP clients fetch it once at tools/list.
+      handleWebSearch(buildWebSearchInputSchema(resolveBlockedProviders()).parse(args))
     )
   );
 
+  registerPerplexityResearchTool(server, withScopeEnforcement);
+
+  server.registerTool(
+    "omniroute_x_search",
+    {
+      description:
+        "Search X (Twitter) through OmniRoute using SuperGrok / xAI server-side x_search. Requires xai-oauth or an xAI API key. Not web search.",
+      inputSchema: xSearchInput,
+    },
+    withScopeEnforcement("omniroute_x_search", (args) => handleXSearch(xSearchInput.parse(args)))
+  );
+
+  server.registerTool(
+    "omniroute_web_fetch",
+    {
+      description:
+        "Fetches and extracts content from a URL using OmniRoute's web fetch gateway. Supports multiple providers (Firecrawl, Jina Reader, Tavily) with automatic failover. Returns the page content as markdown, HTML, links, or screenshot, along with metadata.",
+      inputSchema: webFetchInput,
+    },
+    withScopeEnforcement("omniroute_web_fetch", (args) => handleWebFetch(webFetchInput.parse(args)))
+  );
+
+  server.registerTool(
+    "omniroute_cache_stats",
+    {
+      description:
+        "Returns cache statistics including semantic cache hit rate, prompt cache metrics by provider, and idempotency layer stats.",
+      inputSchema: cacheStatsInput,
+    },
+    withScopeEnforcement("omniroute_cache_stats", () => handleCacheStats())
+  );
+
+  server.registerTool(
+    "omniroute_cache_flush",
+    {
+      description:
+        "Flush cache entries. Provide signature to invalidate a single entry, model to invalidate all entries for a model, or omit both to clear all.",
+      inputSchema: cacheFlushInput,
+    },
+    withScopeEnforcement("omniroute_cache_flush", (args) =>
+      handleCacheFlush(cacheFlushInput.parse(args))
+    )
+  );
+
+  server.registerTool(
+    "omniroute_oneproxy_fetch",
+    {
+      description:
+        "Fetch free proxies from the 1proxy marketplace with optional filters for protocol, country, and quality. Returns validated proxies with quality scores.",
+      inputSchema: oneproxyFetchInput,
+    },
+    withScopeEnforcement("omniroute_oneproxy_fetch", (args) =>
+      handleOneproxyFetch(oneproxyFetchInput.parse(args))
+    )
+  );
+
+  server.registerTool(
+    "omniroute_oneproxy_rotate",
+    {
+      description:
+        "Get the next available free proxy from the 1proxy pool using the specified rotation strategy.",
+      inputSchema: oneproxyRotateInput,
+    },
+    withScopeEnforcement("omniroute_oneproxy_rotate", (args) =>
+      handleOneproxyRotate(oneproxyRotateInput.parse(args))
+    )
+  );
+
+  server.registerTool(
+    "omniroute_oneproxy_stats",
+    {
+      description:
+        "Returns 1proxy sync status and statistics: total proxies, average quality, sync history, and distribution by protocol and country.",
+      inputSchema: oneproxyStatsInput,
+    },
+    withScopeEnforcement("omniroute_oneproxy_stats", (args) =>
+      handleOneproxyStats(oneproxyStatsInput.parse(args))
+    )
+  );
+
+  registerToolSearchTool(server, withScopeEnforcement);
+
   // ── Memory Tools ──────────────────────────────
-  Object.values(memoryTools).forEach((toolDef) => {
+  Object.values(memoryTools).forEach((toolDef: any) => {
     server.registerTool(
       toolDef.name,
       {
@@ -781,22 +673,26 @@ export function createMcpServer(): McpServer {
         // @ts-ignore: dynamic zod access
         inputSchema: toolDef.inputSchema,
       },
-      withScopeEnforcement(toolDef.name, async (args) => {
-        try {
-          const parsedArgs = toolDef.inputSchema.parse(args ?? {});
-          // @ts-ignore: handler expected specific object
-          const result = await toolDef.handler(parsedArgs);
-          return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
-        } catch (err) {
-          const msg = err instanceof Error ? err.message : String(err);
-          return { content: [{ type: "text" as const, text: `Error: ${msg}` }], isError: true };
-        }
-      })
+      withScopeEnforcement(
+        toolDef.name,
+        async (args, extra) => {
+          try {
+            const parsedArgs = toolDef.inputSchema.parse(args ?? {});
+            // @ts-ignore - handler type lost through dynamic Object.values() access
+            const result = await toolDef.handler(parsedArgs, extra);
+            return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
+          } catch (err) {
+            const msg = toSafeMcpErrorMessage(err, "Memory tool execution failed");
+            return { content: [{ type: "text" as const, text: `Error: ${msg}` }], isError: true };
+          }
+        },
+        toolDef.scopes
+      )
     );
   });
 
   // ── Skill Tools ──────────────────────────────
-  Object.values(skillTools).forEach((toolDef) => {
+  Object.values(skillTools).forEach((toolDef: any) => {
     server.registerTool(
       toolDef.name,
       {
@@ -804,19 +700,326 @@ export function createMcpServer(): McpServer {
         // @ts-ignore: dynamic zod access
         inputSchema: toolDef.inputSchema,
       },
-      withScopeEnforcement(toolDef.name, async (args) => {
-        try {
-          const parsedArgs = toolDef.inputSchema.parse(args ?? {});
-          // @ts-ignore: handler expected specific object
-          const result = await toolDef.handler(parsedArgs);
-          return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
-        } catch (err) {
-          const msg = err instanceof Error ? err.message : String(err);
-          return { content: [{ type: "text" as const, text: `Error: ${msg}` }], isError: true };
-        }
-      })
+      withScopeEnforcement(
+        toolDef.name,
+        async (args, extra) => {
+          try {
+            const parsedArgs = toolDef.inputSchema.parse(args ?? {});
+            // @ts-ignore - handler type lost through dynamic Object.values() access
+            const result = await toolDef.handler(parsedArgs, extra);
+            return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
+          } catch (err) {
+            const msg = toSafeMcpErrorMessage(err, "Skill tool execution failed");
+            return { content: [{ type: "text" as const, text: `Error: ${msg}` }], isError: true };
+          }
+        },
+        toolDef.scopes
+      )
     );
   });
+
+  // ── Agent Skill Tools ─────────────────────────
+  Object.values(agentSkillTools).forEach((toolDef) => {
+    server.registerTool(
+      toolDef.name,
+      {
+        description: toolDef.description,
+        // @ts-ignore: dynamic zod access
+        inputSchema: toolDef.inputSchema,
+      },
+      withScopeEnforcement(
+        toolDef.name,
+        async (args, extra) => {
+          try {
+            const parsedArgs = toolDef.inputSchema.parse(args ?? {});
+            // @ts-expect-error - handler type lost through dynamic Object.values() access
+            const result = await toolDef.handler(parsedArgs, extra);
+            return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
+          } catch (err) {
+            const msg = toSafeMcpErrorMessage(err, "Agent skill tool execution failed");
+            return { content: [{ type: "text" as const, text: `Error: ${msg}` }], isError: true };
+          }
+        },
+        toolDef.scopes
+      )
+    );
+  });
+
+  // ── GitHub Skill Tools ──────────────────────────
+  Object.values(githubSkillTools).forEach((toolDef) => {
+    server.registerTool(
+      toolDef.name,
+      {
+        description: toolDef.description,
+        // @ts-ignore: dynamic zod access
+        inputSchema: toolDef.inputSchema,
+      },
+      withScopeEnforcement(
+        toolDef.name,
+        async (args) => {
+          try {
+            const parsedArgs = toolDef.inputSchema.parse(args ?? {});
+            // @ts-expect-error - handler type lost through dynamic Object.values() access
+            const result = await toolDef.handler(parsedArgs);
+            return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
+          } catch (err) {
+            const msg = toSafeMcpErrorMessage(err, "GitHub skill tool execution failed");
+            return { content: [{ type: "text" as const, text: `Error: ${msg}` }], isError: true };
+          }
+        },
+        toolDef.scopes
+      )
+    );
+  });
+
+  // ── Plugin Tools ──────────────────────────────
+  pluginTools.forEach((toolDef) => {
+    server.registerTool(
+      toolDef.name,
+      {
+        description: toolDef.description,
+        // @ts-ignore: dynamic zod access
+        inputSchema: toolDef.inputSchema,
+      },
+      withScopeEnforcement(
+        toolDef.name,
+        async (args, extra) => {
+          try {
+            const parsedArgs = toolDef.inputSchema.parse(args ?? {});
+            // @ts-ignore: handler expected specific object
+            const result = await toolDef.handler(parsedArgs, extra);
+            return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
+          } catch (err) {
+            const msg = toSafeMcpErrorMessage(err, "Plugin tool execution failed");
+            return { content: [{ type: "text" as const, text: `Error: ${msg}` }], isError: true };
+          }
+        },
+        toolDef.scopes
+      )
+    );
+  });
+
+  // ── Compression Tools ─────────────────────────
+  Object.values(compressionTools).forEach((toolDef: any) => {
+    server.registerTool(
+      toolDef.name,
+      {
+        description: toolDef.description,
+        // @ts-ignore: dynamic zod access
+        inputSchema: toolDef.inputSchema,
+      },
+      withScopeEnforcement(
+        toolDef.name,
+        async (args, extra) => {
+          try {
+            const parsedArgs = toolDef.inputSchema.parse(args ?? {});
+            // @ts-ignore - handler type lost through dynamic Object.values() access
+            const result = await toolDef.handler(parsedArgs, extra);
+            return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
+          } catch (err) {
+            const msg = toSafeMcpErrorMessage(err, "Compression tool execution failed");
+            return { content: [{ type: "text" as const, text: `Error: ${msg}` }], isError: true };
+          }
+        },
+        toolDef.scopes
+      )
+    );
+  });
+
+  // ── Web-Session Pool Tools (#3368 observability) ─
+  // Typed structurally (not `any`) — the shape is pinned by
+  // tests/unit/mcp-tool-collections-shape.test.ts, so the loop can stay strict.
+  Object.values(poolTools).forEach(
+    (toolDef: {
+      name: string;
+      description: string;
+      scopes: readonly string[];
+      inputSchema: { parse: (input: unknown) => unknown };
+      handler: (parsedArgs: unknown, extra?: unknown) => Promise<unknown>;
+    }) => {
+      server.registerTool(
+        toolDef.name,
+        {
+          description: toolDef.description,
+          // @ts-ignore: dynamic zod access
+          inputSchema: toolDef.inputSchema,
+        },
+        withScopeEnforcement(
+          toolDef.name,
+          async (args, extra) => {
+            try {
+              const parsedArgs = toolDef.inputSchema.parse(args ?? {});
+              const result = await toolDef.handler(parsedArgs, extra);
+              return {
+                content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }],
+              };
+            } catch (err) {
+              const msg = toSafeMcpErrorMessage(err, "Pool tool execution failed");
+              return { content: [{ type: "text" as const, text: `Error: ${msg}` }], isError: true };
+            }
+          },
+          toolDef.scopes
+        )
+      );
+    }
+  );
+
+  // ── Gamification Tools ────────────────────────
+  gamificationTools.forEach((toolDef) => {
+    server.registerTool(
+      toolDef.name,
+      {
+        description: toolDef.description,
+        // @ts-ignore: dynamic zod access
+        inputSchema: toolDef.inputSchema,
+      },
+      withScopeEnforcement(
+        toolDef.name,
+        async (args, extra) => {
+          try {
+            const parsedArgs = toolDef.inputSchema.parse(args ?? {});
+            // @ts-ignore: handler expected specific object
+            const result = await toolDef.handler(parsedArgs, extra);
+            return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
+          } catch (err) {
+            const msg = toSafeMcpErrorMessage(err, "Gamification tool execution failed");
+            return { content: [{ type: "text" as const, text: `Error: ${msg}` }], isError: true };
+          }
+        },
+        toolDef.scopes
+      )
+    );
+  });
+
+  // ── Notion Context Source Tools ───────────────
+  notionTools.forEach((toolDef) => {
+    server.registerTool(
+      toolDef.name,
+      {
+        description: toolDef.description,
+        // @ts-ignore: dynamic zod access
+        inputSchema: toolDef.inputSchema,
+      },
+      withScopeEnforcement(
+        toolDef.name,
+        async (args, extra) => {
+          try {
+            const parsedArgs = toolDef.inputSchema.parse(args ?? {});
+            // @ts-ignore: handler expected specific object
+            const result = await toolDef.handler(parsedArgs, extra);
+            return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
+          } catch (err) {
+            const msg = toSafeMcpErrorMessage(err, "Notion tool execution failed");
+            return { content: [{ type: "text" as const, text: `Error: ${msg}` }], isError: true };
+          }
+        },
+        toolDef.scopes
+      )
+    );
+  });
+
+  // ── Local Corpus Context Source Tools ─────────
+  localCorpusTools.forEach((toolDef) => {
+    server.registerTool(
+      toolDef.name,
+      {
+        description: toolDef.description,
+        // @ts-ignore: dynamic zod access
+        inputSchema: toolDef.inputSchema,
+      },
+      withScopeEnforcement(
+        toolDef.name,
+        async (args, extra) => {
+          try {
+            const parsedArgs = toolDef.inputSchema.parse(args ?? {});
+            // @ts-ignore: handler expected specific object
+            const result = await toolDef.handler(parsedArgs, extra);
+            return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
+          } catch (error) {
+            const msg = toSafeMcpErrorMessage(error, "Local corpus tool execution failed");
+            return {
+              content: [{ type: "text" as const, text: `Error: ${msg}` }],
+              isError: true,
+            };
+          }
+        },
+        toolDef.scopes
+      )
+    );
+  });
+
+  // ── Obsidian Context Source Tools ─────────────
+  obsidianTools.forEach((toolDef) => {
+    server.registerTool(
+      toolDef.name,
+      {
+        description: toolDef.description,
+        // @ts-ignore: dynamic zod access
+        inputSchema: toolDef.inputSchema,
+      },
+      withScopeEnforcement(
+        toolDef.name,
+        async (args, extra) => {
+          try {
+            const parsedArgs = toolDef.inputSchema.parse(args ?? {});
+            // @ts-ignore: handler expected specific object
+            const result = await toolDef.handler(parsedArgs, extra);
+            return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
+          } catch (err) {
+            const msg = toSafeMcpErrorMessage(err, "Obsidian tool execution failed");
+            return { content: [{ type: "text" as const, text: `Error: ${msg}` }], isError: true };
+          }
+        },
+        toolDef.scopes
+      )
+    );
+  });
+
+  // ── Dynamic Skill Tools (from skills table) ──
+  const skillToMcpToolName = (skill: { name: string }) =>
+    `skill_${skill.name.replace(/[^a-z0-9_-]/gi, "_")}`;
+  try {
+    const enabledSkills = skillRegistry.list().filter((s) => s.enabled);
+    for (const skill of enabledSkills) {
+      const toolName = skillToMcpToolName(skill);
+      if (RESERVED_MCP_NAMES.has(toolName)) continue;
+
+      server.registerTool(
+        toolName,
+        {
+          description: skill.description,
+          inputSchema: z.object({}).passthrough(),
+        },
+        withScopeEnforcement(
+          toolName,
+          async (args, extra) => {
+            const apiKeyId = (await resolveMcpToolOwnerId(extra)) ?? "mcp";
+            try {
+              const execution = await skillExecutor.execute(
+                skill.name,
+                (args ?? {}) as Record<string, unknown>,
+                { apiKeyId }
+              );
+              return {
+                content: [
+                  { type: "text" as const, text: JSON.stringify(execution.output, null, 2) },
+                ],
+              };
+            } catch (err) {
+              const msg = toSafeMcpErrorMessage(err, "Skill execution failed");
+              return {
+                content: [{ type: "text" as const, text: `Error: ${msg}` }],
+                isError: true,
+              };
+            }
+          },
+          ["execute:skills"]
+        )
+      );
+    }
+  } catch {
+    // Skills not loaded yet — skip dynamic registration until next reconnect
+  }
 
   return server;
 }
@@ -828,14 +1031,18 @@ export function createMcpServer(): McpServer {
  * Called when `omniroute --mcp` is used.
  */
 export async function startMcpStdio(): Promise<void> {
+  await ensureDbInitialized();
+  // Stdout is reserved for JSON-RPC — bin/mcpStdioConsoleGuard.mjs is preloaded via
+  // `node --import` (see bin/mcp-server.mjs) so console.log/warn already redirect to
+  // stderr before this module's own imports evaluate.
   const server = createMcpServer();
   const transport = new StdioServerTransport();
-  const version = process.env.npm_package_version || "1.8.1";
+  const version = APP_CONFIG.version;
   const stopHeartbeat = startMcpHeartbeat({
     version,
-    scopesEnforced: MCP_ENFORCE_SCOPES,
+    scopesEnforced: isMcpScopeEnforcementEnabled,
     allowedScopes: Array.from(MCP_ALLOWED_SCOPES),
-    toolCount: MCP_TOOLS.length,
+    toolCount: TOTAL_MCP_TOOL_COUNT,
   });
   const stopHeartbeatOnce = () => {
     stopHeartbeat();
@@ -849,6 +1056,9 @@ export async function startMcpStdio(): Promise<void> {
     await server.connect(transport);
     console.error("[MCP] OmniRoute MCP Server connected and ready.");
   } finally {
+    if (closeAuditDb()) {
+      console.error("[MCP] Audit database checkpointed and closed.");
+    }
     stopHeartbeatOnce();
     process.off("exit", stopHeartbeatOnce);
     process.off("SIGINT", stopHeartbeatOnce);
@@ -856,8 +1066,22 @@ export async function startMcpStdio(): Promise<void> {
   }
 }
 
-// If this file is run directly, start stdio server
-if (process.argv[1] && import.meta.url.endsWith(process.argv[1].replace(/\\/g, "/"))) {
+// If this file is run directly, start stdio server. Compare real filesystem
+// paths — a raw `import.meta.url.endsWith(argv[1])` never matches once the path
+// needs percent-encoding in the file: URL (any space, e.g. macOS "Application
+// Support"), and symlinked installs resolve elsewhere (#18556).
+function isMcpStdioEntryRunDirectly(): boolean {
+  if (!process.argv[1]) return false;
+  try {
+    return (
+      realpathSync(fileURLToPath(import.meta.url)) === realpathSync(resolvePath(process.argv[1]))
+    );
+  } catch {
+    return false;
+  }
+}
+
+if (isMcpStdioEntryRunDirectly()) {
   startMcpStdio().catch((err) => {
     console.error("[MCP] Fatal error:", err);
     process.exit(1);

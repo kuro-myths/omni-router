@@ -9,9 +9,11 @@
  */
 
 import { NextResponse } from "next/server";
+import type { NextRequest } from "next/server";
 
-const PACKAGE_VERSION = process.env.npm_package_version || "1.8.1";
-const BASE_URL = process.env.OMNIROUTE_BASE_URL || "http://localhost:20128";
+import { buildAgentCardMetadata } from "@/lib/a2a/agentCardMetadata";
+import { getFleetSkills } from "@/lib/conductor/fleetSkills";
+import { getBaseUrl } from "@/lib/wellKnown";
 
 /**
  * GET /.well-known/agent.json
@@ -19,77 +21,13 @@ const BASE_URL = process.env.OMNIROUTE_BASE_URL || "http://localhost:20128";
  * Returns the OmniRoute Agent Card that describes this gateway's
  * capabilities as an A2A agent.
  */
-export async function GET() {
+export async function GET(request?: NextRequest) {
+  // Conductor PRD RF2: fleet skills from the OmniConductor hub (cached ~60s; [] when
+  // the hub is unset/offline — the card stays valid without the fleet section).
+  const fleetSkills = await getFleetSkills();
+  const baseUrl = getBaseUrl(request);
   const agentCard = {
-    name: "OmniRoute AI Gateway",
-    description:
-      "Intelligent AI routing gateway with 36+ providers, smart fallback, " +
-      "quota tracking, format translation, and auto-managed combos. " +
-      "Routes AI requests to the optimal provider based on cost, latency, " +
-      "quota availability, and task requirements.",
-    url: `${BASE_URL}/a2a`,
-    version: PACKAGE_VERSION,
-    capabilities: {
-      streaming: true,
-      pushNotifications: false,
-    },
-    skills: [
-      {
-        id: "smart-routing",
-        name: "Smart Request Routing",
-        description:
-          "Routes AI requests to the optimal provider based on quota, cost, " +
-          "latency, and reliability. Supports combo-based routing with " +
-          "multiple strategies: priority, weighted, round-robin, cost-optimized.",
-        tags: ["routing", "llm", "optimization", "fallback"],
-        examples: [
-          "Route this coding task to the fastest available model",
-          "Send this review to an analytical model under $0.50 budget",
-          "Find the cheapest provider with available quota",
-        ],
-      },
-      {
-        id: "quota-management",
-        name: "Quota & Cost Management",
-        description:
-          "Tracks and manages API quotas across 36+ providers with " +
-          "auto-fallback when quotas are exhausted. Provides real-time " +
-          "cost tracking and budget enforcement.",
-        tags: ["quota", "cost", "monitoring", "budget"],
-        examples: [
-          "Check remaining quota for all providers",
-          "Which provider has the most available quota?",
-          "Generate a cost report for today",
-        ],
-      },
-      {
-        id: "auto-combo",
-        name: "Auto-Managed Model Combos",
-        description:
-          "Self-healing model chains that dynamically adapt to provider " +
-          "health and quota availability. Uses a scoring function based on " +
-          "quota, health, cost, latency, task fitness, and stability.",
-        tags: ["combo", "auto", "self-healing", "adaptive"],
-        examples: [
-          "Create an auto-managed combo for coding tasks",
-          "Switch to cost-saver mode",
-          "Show the Auto-Combo scoring breakdown",
-        ],
-      },
-      {
-        id: "format-translation",
-        name: "Format Translation",
-        description:
-          "Transparently translates between OpenAI, Claude (Anthropic), " +
-          "Gemini (Google), and Responses API formats. Supports streaming " +
-          "translation for all format pairs.",
-        tags: ["translation", "openai", "claude", "gemini", "responses"],
-        examples: [
-          "Send an OpenAI-format request to Claude",
-          "Translate this Gemini response to OpenAI format",
-        ],
-      },
-    ],
+    ...buildAgentCardMetadata(baseUrl, fleetSkills),
     authentication: {
       schemes: ["api-key"],
       apiKeyHeader: "Authorization",

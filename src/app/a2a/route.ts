@@ -12,18 +12,84 @@
 
 import { NextRequest, NextResponse } from "next/server";
 import { getTaskManager } from "@/lib/a2a/taskManager";
-import { executeSmartRouting } from "@/lib/a2a/skills/smartRouting";
-import { executeQuotaManagement } from "@/lib/a2a/skills/quotaManagement";
 import { logRoutingDecision } from "@/lib/a2a/routingLogger";
+import { resolveA2AComboAttribution } from "@/lib/a2a/resolveComboAttribution";
 import { createA2AStream, SSE_HEADERS } from "@/lib/a2a/streaming";
-import { executeA2ATaskWithState } from "@/lib/a2a/taskExecution";
+import {
+  A2A_SKILL_HANDLERS,
+  executeA2ATaskWithState,
+  type A2ASkillHandler,
+} from "@/lib/a2a/taskExecution";
+import { getSettings } from "@/lib/db/settings";
+import { authenticateA2ARequest, resolveA2AOwner } from "@/lib/a2a/authenticate";
+import type { A2ACallerContext } from "@/lib/a2a/selfLoopAuth";
+import { extractApiKey } from "@/sse/services/auth";
 
-// ============ Skill Registry ============
+// ============ A2A v1.0 ↔ v0.3 compatibility layer ============
+// A2A 1.0 renamed the JSON-RPC methods (message/send → SendMessage,
+// message/stream → SendStreamingMessage) and changed the synchronous
+// response shape: a 1.0 client reads the reply from
+// `task.status.message.parts[].text` (and `task.artifacts`), whereas OmniRoute's
+// v0.3 server returns top-level `artifacts`/`metadata`. This layer aliases the
+// 1.0 method names and reshapes the synchronous response so 1.0 clients
+// (a2a-sdk 1.x, Hermes, …) can call the endpoint unchanged. v0.3 clients are
+// unaffected.
 
-const SKILL_HANDLERS: Record<string, (task: any) => Promise<any>> = {
-  "smart-routing": executeSmartRouting,
-  "quota-management": executeQuotaManagement,
+/**
+ * Explicit allowlist of dispatchable skills. `params.skill` is caller-controlled, so it is
+ * looked up in a Map rather than as an object index: a name such as "constructor" or
+ * "toString" must never resolve to an Object.prototype member and be invoked as a handler.
+ */
+const SKILL_HANDLERS: ReadonlyMap<string, A2ASkillHandler> = new Map(
+  Object.entries(A2A_SKILL_HANDLERS)
+);
+
+const V1_METHOD_ALIASES: Record<string, string> = {
+  SendMessage: "message/send",
+  SendStreamingMessage: "message/stream",
 };
+
+/** Map a v0.3 task state to the v1.0 TASK_STATE_* enum string. */
+function toV1State(state: string): string {
+  const s = state.toUpperCase();
+  return s.startsWith("TASK_STATE_") ? s : `TASK_STATE_${s}`;
+}
+
+/**
+ * Rebuild a v1.0 Task from a v0.3 task + skill result. v0.3 carries the reply in
+ * `artifacts[].content` (type: "text"); v1.0 expects the text inside
+ * `task.status.message.parts[].text` and `task.artifacts` as Message parts.
+ */
+function buildV1Task(
+  task: { id: string; state: string },
+  result: { artifacts?: unknown },
+  contextId?: unknown
+): Record<string, unknown> {
+  const text = Array.isArray(result.artifacts)
+    ? result.artifacts
+        .map((a) =>
+          a && typeof a === "object" && typeof (a as { content?: unknown }).content === "string"
+            ? (a as { content: string }).content
+            : ""
+        )
+        .filter((s) => s.length > 0)
+        .join("\n")
+    : "";
+
+  const v1Task: Record<string, unknown> = {
+    id: task.id,
+    status: {
+      state: toV1State(task.state),
+      message: {
+        role: "ROLE_AGENT",
+        parts: [{ text, mediaType: "text/plain" }],
+      },
+    },
+    artifacts: [{ role: "ROLE_AGENT", parts: [{ text, mediaType: "text/plain" }] }],
+  };
+  if (typeof contextId === "string" && contextId) v1Task.contextId = contextId;
+  return v1Task;
+}
 
 type A2AMessage = { role: string; content: string };
 
@@ -72,14 +138,13 @@ function toMessageArray(raw: unknown): A2AMessage[] | null {
 
 // ============ Auth ============
 
-function authenticate(req: NextRequest): boolean {
-  // If no API key is configured, allow all requests
-  const configuredKey = process.env.OMNIROUTE_API_KEY;
-  if (!configuredKey) return true;
-
-  const authHeader = req.headers.get("authorization") || "";
-  const token = authHeader.replace(/^Bearer\s+/i, "");
-  return token === configuredKey;
+async function authenticate(req: NextRequest): Promise<boolean> {
+  // /a2a is outside the authz proxy matcher, so the REQUIRE_API_KEY posture the
+  // pipeline enforces for /v1 never ran here — the route accepted every caller
+  // whenever OMNIROUTE_API_KEY was unset, which is the shipped default
+  // (GHSA-v54m-6rm3-p565). The shared helper applies the same posture on both
+  // the JSON-RPC and the REST task surfaces (GHSA-jcm5-6wpp-wjj8).
+  return authenticateA2ARequest(req);
 }
 
 // ============ JSON-RPC Helpers ============
@@ -95,11 +160,27 @@ function jsonRpcResult(id: string | number | null, result: unknown) {
   return NextResponse.json({ jsonrpc: "2.0", id, result });
 }
 
+async function rejectIfA2ADisabled(id: string | number | null) {
+  const settings = await getSettings();
+  if (settings.a2aEnabled === true) return null;
+  return NextResponse.json(
+    {
+      jsonrpc: "2.0",
+      id,
+      error: {
+        code: -32000,
+        message: "A2A endpoint is disabled. Enable it from the Endpoints page.",
+      },
+    },
+    { status: 503 }
+  );
+}
+
 // ============ Route Handler ============
 
 export async function POST(req: NextRequest) {
   // Auth check
-  if (!authenticate(req)) {
+  if (!(await authenticate(req))) {
     return jsonRpcError(null, -32600, "Unauthorized: missing or invalid API key");
   }
 
@@ -116,9 +197,22 @@ export async function POST(req: NextRequest) {
     return jsonRpcError(id || null, -32600, "Invalid request: missing jsonrpc or method");
   }
 
-  const tm = getTaskManager();
+  const disabledResponse = await rejectIfA2ADisabled(id ?? null);
+  if (disabledResponse) return disabledResponse;
 
-  switch (method) {
+  const tm = getTaskManager();
+  // GHSA-jcm5-6wpp-wjj8: scope every task read/mutation below to the caller's
+  // owner id (hashed API key; undefined under the keyless local-first posture).
+  const callerOwner = await resolveA2AOwner(req);
+  // Skills that call back into OmniRoute send this caller's API key. Only a
+  // caller without one (a dashboard session) gets OMNIROUTE_API_KEY instead.
+  const caller: A2ACallerContext = { apiKey: extractApiKey(req) };
+
+  // A2A 1.0 method-name compatibility (SendMessage → message/send, etc.)
+  const isV1Method = method in V1_METHOD_ALIASES;
+  const normalizedMethod = V1_METHOD_ALIASES[method] ?? method;
+
+  switch (normalizedMethod) {
     // ── message/send ──────────────────────────────────────
     case "message/send": {
       const skill = params?.skill || "smart-routing";
@@ -131,31 +225,54 @@ export async function POST(req: NextRequest) {
         );
       }
 
-      const handler = SKILL_HANDLERS[skill];
+      const handler = SKILL_HANDLERS.get(skill);
       if (!handler) {
         return jsonRpcError(id, -32601, `Unknown skill: ${skill}`);
       }
 
-      const task = tm.createTask({ skill, messages, metadata: params?.metadata });
+      const task = tm.createTask({ skill, messages, metadata: params?.metadata }, callerOwner);
       try {
         tm.updateTask(task.id, "working");
-        const result = await handler(task);
+        const result = await handler(task, caller);
         tm.updateTask(task.id, "completed", result.artifacts);
 
         // Log routing decision
         if (skill === "smart-routing" && result.metadata) {
+          const smartMetadata = result.metadata as {
+            routing_explanation?: string;
+            requested_combo?: string | null;
+            confirmed_combo?: string | null;
+            dispatched_model?: string;
+            response_model?: string;
+            cost_envelope?: { actual?: number };
+          };
+          const attribution = resolveA2AComboAttribution(smartMetadata);
           logRoutingDecision({
             taskType: (params?.metadata?.role as string) || "general",
-            comboId: (params?.metadata?.combo as string) || "default",
+            comboId: attribution.comboId,
+            requestedCombo: attribution.requestedCombo,
             providerSelected:
-              result.metadata?.routing_explanation?.match(/"([^"]+)"/)?.[1] || "unknown",
-            modelUsed: (params?.metadata?.model as string) || "auto",
+              smartMetadata.routing_explanation?.match(/"([^"]+)"/)?.[1] || "unknown",
+            modelUsed:
+              smartMetadata.response_model ||
+              smartMetadata.dispatched_model ||
+              (params?.metadata?.model as string) ||
+              "auto",
             score: 1,
             factors: [],
             fallbacksTriggered: [],
             success: true,
             latencyMs: 0,
-            cost: result.metadata?.cost_envelope?.actual || 0,
+            cost: smartMetadata.cost_envelope?.actual || 0,
+          });
+        }
+
+        if (isV1Method) {
+          // A2A 1.0 SendMessageResponse — the reply text lives in
+          // task.status.message.parts (1.0 clients read it there; the v0.3
+          // top-level artifacts/metadata are not part of the 1.0 shape).
+          return jsonRpcResult(id, {
+            task: buildV1Task(task, result, params?.message?.contextId),
           });
         }
 
@@ -165,6 +282,7 @@ export async function POST(req: NextRequest) {
           metadata: result.metadata,
         });
       } catch (err) {
+        console.error("A2A ERROR TRACE:", err);
         const msg = err instanceof Error ? err.message : String(err);
         tm.updateTask(task.id, "failed", [{ type: "error", content: msg }], msg);
         return jsonRpcError(id, -32603, `Skill execution failed: ${msg}`);
@@ -183,17 +301,17 @@ export async function POST(req: NextRequest) {
         );
       }
 
-      const handler = SKILL_HANDLERS[skill];
+      const handler = SKILL_HANDLERS.get(skill);
       if (!handler) {
         return jsonRpcError(id, -32601, `Unknown skill: ${skill}`);
       }
 
-      const task = tm.createTask({ skill, messages, metadata: params?.metadata });
+      const task = tm.createTask({ skill, messages, metadata: params?.metadata }, callerOwner);
       tm.updateTask(task.id, "working");
 
       const stream = createA2AStream(
         task,
-        async (t) => executeA2ATaskWithState(tm, t, handler),
+        async (t) => executeA2ATaskWithState(tm, t, (st) => handler(st, caller)),
         req.signal,
         {
           onStart: () => tm.beginStream(),
@@ -209,7 +327,7 @@ export async function POST(req: NextRequest) {
       const taskId = params?.taskId || params?.id;
       if (!taskId) return jsonRpcError(id, -32602, "Invalid params: taskId required");
 
-      const task = tm.getTask(taskId);
+      const task = tm.getTask(taskId, callerOwner);
       if (!task) return jsonRpcError(id, -32601, `Task not found: ${taskId}`);
 
       return jsonRpcResult(id, { task });
@@ -221,7 +339,7 @@ export async function POST(req: NextRequest) {
       if (!taskId) return jsonRpcError(id, -32602, "Invalid params: taskId required");
 
       try {
-        const task = tm.cancelTask(taskId);
+        const task = tm.cancelTask(taskId, callerOwner);
         return jsonRpcResult(id, { task: { id: task.id, state: task.state } });
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);

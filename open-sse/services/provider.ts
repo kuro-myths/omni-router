@@ -1,12 +1,25 @@
+// @ts-nocheck
 import { PROVIDERS } from "../config/constants.ts";
 import { getRegistryEntry } from "../config/providerRegistry.ts";
+import { resolveAlternateFormat } from "../config/providers/alternateFormats.ts";
 import {
   buildClaudeCodeCompatibleHeaders,
   CLAUDE_CODE_COMPATIBLE_DEFAULT_CHAT_PATH,
   joinClaudeCodeCompatibleUrl,
+  maybeAppendSkillsBeta,
 } from "./claudeCodeCompatible.ts";
+import { getClaudeCodeCompatibleRequestDefaults } from "@/lib/providers/requestDefaults";
+import { buildClinepassHeaders } from "@/shared/utils/clineAuth";
+import { usesCcWireImage } from "./ccWireImageBuiltins.ts";
 
 const OPENAI_COMPATIBLE_PREFIX = "openai-compatible-";
+const OPENAI_COMPATIBLE_ID_TYPES = [
+  "responses",
+  "embeddings",
+  "audio-transcriptions",
+  "audio-speech",
+  "images-generations",
+] as const;
 const OPENAI_COMPATIBLE_DEFAULTS = {
   baseUrl: "https://api.openai.com/v1",
 };
@@ -26,10 +39,18 @@ function isAnthropicCompatible(provider) {
 }
 
 export function isClaudeCodeCompatible(provider) {
-  return typeof provider === "string" && provider.startsWith(CLAUDE_CODE_COMPATIBLE_PREFIX);
+  return (
+    (typeof provider === "string" && provider.startsWith(CLAUDE_CODE_COMPATIBLE_PREFIX)) ||
+    // Built-in providers (e.g. agentrouter) that adopt the dynamic CC wire image
+    // while keeping their own registry baseUrl + auth (#6056).
+    usesCcWireImage(provider)
+  );
 }
 
-export function getOpenAICompatibleType(provider, providerSpecificData = null) {
+export function getOpenAICompatibleType(
+  provider,
+  providerSpecificData: Record<string, unknown> | null = null
+) {
   if (!isOpenAICompatible(provider)) return "chat";
   const configuredType =
     providerSpecificData &&
@@ -37,15 +58,40 @@ export function getOpenAICompatibleType(provider, providerSpecificData = null) {
     typeof providerSpecificData.apiType === "string"
       ? providerSpecificData.apiType
       : null;
-  if (configuredType === "responses" || configuredType === "chat") {
+  if (
+    configuredType === "responses" ||
+    configuredType === "chat" ||
+    configuredType === "embeddings" ||
+    configuredType === "audio-transcriptions" ||
+    configuredType === "audio-speech" ||
+    configuredType === "images-generations"
+  ) {
     return configuredType;
   }
-  return provider.includes("responses") ? "responses" : "chat";
+  // Legacy fallback: the type is the fixed segment right after the prefix
+  // (`openai-compatible-<type>-<suffix>`, or the bare `openai-compatible-<type>`).
+  // Anchored so an operator-chosen suffix (e.g. `-chat-my-responses`) never flips it.
+  const marker = provider.slice(OPENAI_COMPATIBLE_PREFIX.length);
+  const legacyType = OPENAI_COMPATIBLE_ID_TYPES.find(
+    (type) => marker === type || marker.startsWith(`${type}-`)
+  );
+  return legacyType || "chat";
 }
 
 function buildOpenAICompatibleUrl(baseUrl, apiType) {
   const normalized = baseUrl.replace(/\/$/, "");
-  const path = apiType === "responses" ? "/responses" : "/chat/completions";
+  let path = "/chat/completions";
+  if (apiType === "responses") {
+    path = "/responses";
+  } else if (apiType === "embeddings") {
+    path = "/embeddings";
+  } else if (apiType === "audio-transcriptions") {
+    path = "/audio/transcriptions";
+  } else if (apiType === "audio-speech") {
+    path = "/audio/speech";
+  } else if (apiType === "images-generations") {
+    path = "/images/generations";
+  }
   return `${normalized}${path}`;
 }
 
@@ -59,17 +105,6 @@ function buildAnthropicCompatibleUrl(baseUrl) {
 // contain max_tokens or Claude model names.
 export function detectFormatFromEndpoint(body, endpointPath = "") {
   const path = String(endpointPath || "");
-  const hasInputField =
-    body &&
-    typeof body === "object" &&
-    Object.prototype.hasOwnProperty.call(body, "input") &&
-    body.input !== undefined;
-  const hasResponsesSpecificFields =
-    body &&
-    typeof body === "object" &&
-    (body.max_output_tokens !== undefined ||
-      body.previous_response_id !== undefined ||
-      body.reasoning !== undefined);
 
   if (/\/responses(?=\/|$)/i.test(path) || /^responses(?=\/|$)/i.test(path)) {
     return "openai-responses";
@@ -79,17 +114,61 @@ export function detectFormatFromEndpoint(body, endpointPath = "") {
     return "claude";
   }
 
+  // Antigravity/cloudcode-compatible inbound endpoint (D4): the AgentBridge
+  // proxy forwards the IDE's cloudcode envelope here. Path-based detection
+  // (mirrors /messages → claude) makes the pipeline translate the request
+  // antigravity→openai and the response openai→antigravity, so the IDE gets
+  // a cloudcode reply regardless of which provider actually served it.
+  if (/\/antigravity(?=\/|:|$)/i.test(path) || /^antigravity(?=\/|:|$)/i.test(path)) {
+    return "antigravity";
+  }
+
+  // #14165: the /v1beta Gemini ingress converts gemini -> openai chat format
+  // before re-entering handleChat while the request URL keeps its /v1beta
+  // path. With no path branch, detectFormat's `max_tokens` heuristic misread
+  // the converted body (messages + max_tokens) as claude, so non-streaming
+  // replies came back anthropic-shaped and streaming replies were empty. The
+  // ingress always produces an openai chat body; a body that still carries
+  // the raw gemini `contents` envelope keeps the body-based detection below.
+  if (/\/v1beta(?:\/|$)/i.test(path) || /^v1beta(?:\/|$)/i.test(path)) {
+    if (!(body && typeof body === "object" && body.contents && Array.isArray(body.contents))) {
+      return "openai";
+    }
+  }
+
   if (
     /\/(?:chat\/completions|completions)(?=\/|$)/i.test(path) ||
     /^(?:chat\/completions|completions)(?=\/|$)/i.test(path)
   ) {
-    if (hasInputField || hasResponsesSpecificFields) {
+    if (
+      body &&
+      typeof body === "object" &&
+      !Array.isArray(body) &&
+      body.input !== undefined &&
+      body.messages === undefined
+    ) {
       return "openai-responses";
     }
     return "openai";
   }
 
   return detectFormat(body);
+}
+
+// Thin wrapper for call sites that only have the full request URL (not the bare endpoint
+// path chatCore already threads) — single source of truth stays detectFormatFromEndpoint.
+export function detectFormatFromUrl(body, requestUrl) {
+  const rawUrl = typeof requestUrl === "string" ? requestUrl : "";
+  let pathname = rawUrl;
+  try {
+    // Supplying a base URL keeps relative client endpoints (for example,
+    // `/v1/messages`) valid while preserving pathname-only detection.
+    pathname = new URL(rawUrl || "/", "http://omniroute.local").pathname;
+  } catch {
+    // Fall back to the raw value; detectFormatFromEndpoint is intentionally
+    // safe for unknown or malformed paths.
+  }
+  return detectFormatFromEndpoint(body, pathname);
 }
 
 // Detect request format from body structure
@@ -147,7 +226,7 @@ export function detectFormat(body) {
       if (firstContent?.type === "text" && !body.model?.includes("/")) {
         // Could be Claude or OpenAI multimodal
         // Check for Claude-specific fields
-        if (body.system || body.anthropic_version) {
+        if (body.system || body.anthropic_version || body["anthropic-version"]) {
           return "claude";
         }
         // Check if image format is Claude (source.type) vs OpenAI (image_url.url)
@@ -170,7 +249,7 @@ export function detectFormat(body) {
 
     // If content is string, it's likely OpenAI (Claude also supports this)
     // Check for other Claude-specific indicators
-    if (body.system !== undefined || body.anthropic_version) {
+    if (body.system !== undefined || body.anthropic_version || body["anthropic-version"]) {
       return "claude";
     }
 
@@ -223,6 +302,15 @@ export function buildProviderUrl(
     providerSpecificData?: Record<string, unknown> | null;
   } = {}
 ) {
+  // Built-in CC-wire-image providers (e.g. agentrouter): keep the registry's
+  // OWN baseUrl (NOT the CC family's anthropic default) but adopt the CC chat
+  // path so the request still targets `<registry-baseUrl>?beta=true` (#6056).
+  if (usesCcWireImage(provider)) {
+    const entry = getRegistryEntry(provider);
+    const config = getProviderConfig(provider);
+    const baseUrl = options?.baseUrl || entry?.baseUrl || config.baseUrl;
+    return joinClaudeCodeCompatibleUrl(baseUrl, CLAUDE_CODE_COMPATIBLE_DEFAULT_CHAT_PATH);
+  }
   if (isOpenAICompatible(provider)) {
     const providerSpecificData = options?.providerSpecificData || null;
     const apiType = getOpenAICompatibleType(provider, providerSpecificData);
@@ -252,9 +340,12 @@ export function buildProviderUrl(
       if (entry.urlBuilder) return entry.urlBuilder(baseUrl, model, stream);
       return baseUrl;
     }
-    // Custom URL builder (e.g. gemini, gemini-cli)
+    // Custom URL builder (e.g. gemini, antigravity)
     if (entry.urlBuilder) {
-      return entry.urlBuilder(entry.baseUrl, model, stream);
+      const baseUrl = entry.baseUrl || config.baseUrl;
+      if (baseUrl) {
+        return entry.urlBuilder(baseUrl, model, stream);
+      }
     }
     // URL suffix (e.g. claude: ?beta=true)
     if (entry.urlSuffix) {
@@ -267,7 +358,6 @@ export function buildProviderUrl(
 
 // Build provider headers
 export function buildProviderHeaders(provider, credentials, stream = true, body = null) {
-  void body;
   const config = getProviderConfig(provider);
   const entry = getRegistryEntry(provider);
   const headers = {
@@ -279,11 +369,33 @@ export function buildProviderHeaders(provider, credentials, stream = true, body 
   // Specific override for Anthropic Compatible
   if (isClaudeCodeCompatible(provider)) {
     const token = credentials.apiKey || credentials.accessToken || "";
-    return buildClaudeCodeCompatibleHeaders(
+    const ccRequestDefaults = getClaudeCodeCompatibleRequestDefaults(
+      credentials?.providerSpecificData
+    );
+    const ccHeaders = buildClaudeCodeCompatibleHeaders(
       token,
       stream,
-      credentials?.providerSpecificData?.ccSessionId
+      credentials?.providerSpecificData?.ccSessionId,
+      { redactThinking: ccRequestDefaults.redactThinking === true }
     );
+    // Built-in CC-wire-image providers (e.g. agentrouter): adopt the CC wire
+    // image headers but keep the registry's OWN auth scheme (e.g. x-api-key)
+    // instead of the CC family's Bearer auth (#6056).
+    if (usesCcWireImage(provider)) {
+      delete ccHeaders["Authorization"];
+      const authHeader = entry?.authHeader || "bearer";
+      if (authHeader === "x-api-key") {
+        if (token) ccHeaders["x-api-key"] = token;
+      } else if (authHeader === "key") {
+        if (token) ccHeaders["Authorization"] = `Key ${token}`;
+      } else {
+        ccHeaders["Authorization"] = `Bearer ${token}`;
+      }
+    }
+    // For CC-compatible providers returning early, ensure skills beta is conditionally applied
+    // (within this block, isClaudeCodeCompatible(provider) is guaranteed true):
+    maybeAppendSkillsBeta(ccHeaders, provider, body, true);
+    return ccHeaders;
   }
   if (isAnthropicCompatible(provider)) {
     if (credentials.apiKey) {
@@ -308,6 +420,26 @@ export function buildProviderHeaders(provider, credentials, stream = true, body 
     if (!stream) {
       headers["Accept"] = "application/json";
     }
+  } else if (provider === "cline" || provider === "clinepass") {
+    // Cline is dual-auth (#16298): an OAuth connection carries a WorkOS token in
+    // `accessToken` and MUST be sent as `Bearer workos:<token>`; a BYOK connection
+    // carries an `sk_...` key in `apiKey` and MUST be sent as a plain
+    // `Bearer <key>` — the `workos:` prefix is rejected upstream for BYOK keys.
+    //
+    // The decision is keyed off the CREDENTIAL SHAPE (`accessToken` present or not),
+    // not off `authType`, which can diverge from the real stored credential. The
+    // previous `credentials.apiKey || credentials.accessToken` order sent a BYOK key
+    // through buildClineHeaders() and prefixed it with `workos:`, so every BYOK
+    // Cline request was rejected. The `apiKey ||` order was copied generic
+    // boilerplate from the sibling branches (b9fdcfc006 / #4787), back when Cline
+    // was OAuth-only and had no BYOK path; it never meant an OAuth token lives in
+    // `apiKey` — every Cline OAuth write site persists to `accessToken` (see
+    // src/lib/oauth/providers/cline.ts mapTokens and
+    // src/lib/oauth/connectionPersistence.ts).
+    //
+    // buildClinepassHeaders() is the single source of truth for that decision and
+    // also emits the Cline client-identification headers.
+    Object.assign(headers, buildClinepassHeaders(credentials, credentials.apiKey));
   } else if (entry) {
     // Registry-driven auth
     const authHeader = entry.authHeader || "bearer";
@@ -315,6 +447,11 @@ export function buildProviderHeaders(provider, credentials, stream = true, body 
       const token = credentials.apiKey || credentials.accessToken;
       if (token) {
         headers["x-api-key"] = token;
+      }
+    } else if (authHeader === "key") {
+      const token = credentials.apiKey || credentials.accessToken;
+      if (token) {
+        headers["Authorization"] = `Key ${token}`;
       }
     } else if (authHeader === "x-goog-api-key") {
       if (credentials.apiKey) {
@@ -336,6 +473,9 @@ export function buildProviderHeaders(provider, credentials, stream = true, body 
     headers["Accept"] = "text/event-stream";
   }
 
+  // For standard/compatible provider paths, ensure skills beta is conditionally applied
+  maybeAppendSkillsBeta(headers, provider, body);
+
   return headers;
 }
 
@@ -351,7 +491,13 @@ export function getTargetFormat(provider, providerSpecificData = null) {
   }
   // Registry-driven format lookup
   const entry = getRegistryEntry(provider);
-  if (entry) return entry.format || "openai";
+  if (entry) {
+    // Per-connection override (providerSpecificData.targetFormat), only valid
+    // when it matches an alternate declared by the provider.
+    const alternate = resolveAlternateFormat(entry, providerSpecificData);
+    if (alternate) return alternate.format;
+    return entry.format || "openai";
+  }
   const config = getProviderConfig(provider);
   return config.format || "openai";
 }
@@ -370,11 +516,16 @@ export function hasThinkingConfig(body) {
 }
 
 // Normalize thinking config based on last message role
-// - If lastMessage is not user → remove thinking config
-// - If lastMessage is user AND has thinking config → keep it (force enable)
+// - Only an assistant/model prefill (last turn) removes Claude/Gemini-style thinking config
+// - Tool-result turns (OpenAI role "tool", Claude user tool_result, Gemini role "function")
+//   keep thinking, so agentic loops do not silently degrade to non-thinking mode
+// - Preserve an explicit Claude opt-out; it is request-level intent, not a thinking turn
+// - Keep OpenAI Chat Completions reasoning_effort as a request-level option.
 export function normalizeThinkingConfig(body) {
-  if (!isLastMessageFromUser(body)) {
-    delete body.reasoning_effort;
+  const messages = body.messages || body.contents;
+  const lastRole = messages?.length ? messages[messages.length - 1]?.role : undefined;
+  const isPrefill = lastRole === "assistant" || lastRole === "model";
+  if (isPrefill && body.thinking?.type !== "disabled") {
     delete body.thinking;
   }
   return body;
