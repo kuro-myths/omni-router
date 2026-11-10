@@ -505,6 +505,33 @@ const SCHEMA_SQL = `
   CREATE INDEX IF NOT EXISTS idx_quota_snapshots_created_at ON quota_snapshots(created_at);
 `;
 
+// Defensive schema repair for quota history. The table is part of SCHEMA_SQL and
+// migration 013, but cloud/serverless cold starts can create a fresh in-memory
+// adapter. Ensure the table exists on every initialized adapter before background
+// quota pollers can write to it.
+function ensureQuotaSnapshotsTable(db: SqliteDatabase): void {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS quota_snapshots (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      provider TEXT NOT NULL,
+      connection_id TEXT NOT NULL,
+      window_key TEXT NOT NULL,
+      remaining_percentage REAL,
+      is_exhausted INTEGER DEFAULT 0,
+      next_reset_at TEXT,
+      window_duration_ms INTEGER,
+      raw_data TEXT,
+      created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+    CREATE INDEX IF NOT EXISTS idx_quota_snapshots_provider_time
+      ON quota_snapshots(provider, created_at);
+    CREATE INDEX IF NOT EXISTS idx_quota_snapshots_connection_time
+      ON quota_snapshots(connection_id, created_at);
+    CREATE INDEX IF NOT EXISTS idx_quota_snapshots_created_at
+      ON quota_snapshots(created_at);
+  `);
+}
+
 // `CREATE TABLE IF NOT EXISTS` is a no-op against a legacy database that already owns the
 // table with an older column set — but the `CREATE INDEX` statements that follow it are
 // not: they still reference columns the ensure*Columns() healers have yet to backfill, so
@@ -1025,6 +1052,7 @@ export function getDbInstance(): SqliteDatabase {
     const memoryDb = openSqliteDatabase(":memory:");
     memoryDb.pragma("journal_mode = WAL");
     memoryDb.exec(SCHEMA_SQL);
+    ensureQuotaSnapshotsTable(memoryDb);
     ensureUsageHistoryColumns(memoryDb);
     ensureUsageHistoryAccountIndex(memoryDb);
     ensureCallLogsColumns(memoryDb);
@@ -1300,6 +1328,7 @@ export function getDbInstance(): SqliteDatabase {
     ensureUsageHistoryColumns(db);
     ensureCallLogsColumns(db);
     db.exec(SCHEMA_INDEXES_SQL);
+    ensureQuotaSnapshotsTable(db);
 
     // ── Versioned Migrations ──
     // Auto-seed 001 as applied (the inline SCHEMA_SQL already created these tables)
