@@ -18,9 +18,9 @@ export async function generateMetadata() {
   const customFaviconUrl = settings?.customFaviconUrl || settings?.customFaviconBase64;
 
   return {
-    title: `${instanceName} — AI Gateway for Multi-Provider LLMs`,
+    title: `${instanceName} — Gerbang AI Multi-Penyedia`,
     description:
-      "OmniRoute is an AI gateway for multi-provider LLMs. One endpoint for all your AI providers.",
+      "Gerbang AI terpadu untuk mengelola banyak penyedia, model, endpoint, dan perutean melalui satu dasbor.",
     icons: {
       icon: customFaviconUrl ? "/api/settings/favicon" : "/favicon.svg",
       apple: "/apple-touch-icon.svg",
