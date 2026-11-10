@@ -43,7 +43,7 @@ export default function DashboardLayout({ children }) {
   };
 
   return (
-    <div className="comic-shell flex h-dvh min-h-0 w-full overflow-hidden bg-bg">
+    <div className="flex h-dvh min-h-0 w-full overflow-hidden bg-bg">
       {/* Mobile sidebar overlay */}
       {sidebarOpen && (
         <div
