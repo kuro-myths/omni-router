@@ -29,6 +29,9 @@ jobs:
           rsync -a --delete \
             --exclude='.git' \
             --exclude='.github/workflows/***' \
+            --exclude='src/app/globals.css' \
+            --exclude='src/i18n/config.ts' \
+            --exclude='docs/i18n/id/README.md' \
             /tmp/omniroute-upstream/ ./
 
       - name: Remove credential-like values from upstream fixtures
